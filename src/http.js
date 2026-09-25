@@ -11,11 +11,17 @@
  * @module src/http.js
  */
 
-import { ProxyAgent } from 'undici'
+import { ProxyAgent, fetch as undiciFetch } from 'undici'
 import { CLIENT_UA, UPSTREAM_BASE, gatewayHeaders, truncateSession } from './upstream.js'
 import { CODE, UpstreamError, classifyFailure, retryAfter } from './errors.js'
 
 export { CODE, UpstreamError, classifyFailure }
+
+/**
+ * All fetches go through undici's own fetch, not the global one: the global
+ * fetch is Node's internal undici, whose dispatcher protocol rejects an
+ * npm-undici ProxyAgent ("invalid onRequestStart method" — measured).
+ */
 
 /**
  * Proxy dispatchers, one per exit address, cached for the process lifetime.
@@ -65,7 +71,7 @@ export async function postStreamed({ path, body, session, requestId, exitAddr, a
   headers['user-agent'] = userAgentWith(attributionUserAgent)
   let response
   try {
-    response = await fetch(`${UPSTREAM_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body), redirect: 'error', signal, dispatcher: dispatcherFor(exitAddr) })
+    response = await undiciFetch(`${UPSTREAM_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body), redirect: 'error', signal, dispatcher: dispatcherFor(exitAddr) })
   } catch (error) {
     if (error?.name === 'AbortError') throw new UpstreamError('request aborted', CODE.aborted)
     throw new UpstreamError(`our-free-model: upstream request failed: ${error?.message ?? error}`, CODE.transport)
@@ -146,7 +152,7 @@ export async function getJson(path, { session, requestId, exitAddr, attributionU
   timer.unref?.()
   signal?.addEventListener('abort', () => controller.abort(), { once: true })
   try {
-    const response = await fetch(`${UPSTREAM_BASE}${path}`, { headers, redirect: 'error', signal: controller.signal, dispatcher: dispatcherFor(exitAddr) })
+    const response = await undiciFetch(`${UPSTREAM_BASE}${path}`, { headers, redirect: 'error', signal: controller.signal, dispatcher: dispatcherFor(exitAddr) })
     const text = await response.text()
     let payload
     try { payload = JSON.parse(text) } catch { payload = { error: { message: text.slice(0, 200) } } }

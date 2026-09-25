@@ -22,6 +22,7 @@
  * @module src/nodeprobe.js
  */
 
+import { fetch as undiciFetch } from 'undici'
 import { dispatcherFor } from './http.js'
 
 export const LIVENESS_URLS = ['https://1.1.1.1/cdn-cgi/trace', 'https://cp.cloudflare.com/generate_204']
@@ -35,16 +36,18 @@ export const ECHO_URLS = [
 async function fetchVia(addr, url, timeoutMs) {
   const init = { signal: AbortSignal.timeout(timeoutMs), redirect: 'error', headers: { accept: 'application/json', 'user-agent': 'lite-gateway-probe/0.2' } }
   if (addr !== 'direct') init.dispatcher = dispatcherFor(addr)
-  return fetch(url, init)
+  return undiciFetch(url, init)
 }
 
 async function drain(response) {
   try { await response.body?.cancel() } catch { /* already closed */ }
 }
 
-/** Concurrent shots, first fulfilled non-undefined wins; all-fail -> undefined. */
+/** Concurrent shots; judges THROW on a non-verdict, so Promise.any resolves
+ * with the first *good* value — resolving `undefined` would win the race
+ * instantly and mark every node dead (measured incident). All-fail -> undefined. */
 async function firstSuccess(urls, addr, judge, timeoutMs) {
-  const shots = urls.map(async url => judge(await fetchVia(addr, url, timeoutMs)))
+  const shots = urls.map(async url => judge(await fetchVia(addr, url, timeoutMs), url))
   try {
     return await Promise.any(shots)
   } catch {
@@ -68,17 +71,21 @@ export async function probeNode(addr, { timeoutMs = 12000 } = {}) {
   const t0 = Date.now()
   const lat = await firstSuccess(LIVENESS_URLS, addr, async r => {
     await drain(r)
-    return r.status === 204 || r.status === 200 ? Date.now() - t0 : undefined
+    if (r.status !== 204 && r.status !== 200) throw new Error(`liveness HTTP ${r.status}`)
+    return Date.now() - t0
   }, timeoutMs)
   if (lat === undefined) return { state: 'dead', latencyMs: Date.now() - t0 }
   const gate = await firstSuccess([UPSTREAM_GATE_URL], addr, async r => {
     await drain(r)
-    return r.status >= 200 && r.status < 300 ? true : undefined
+    if (r.status < 200 || r.status >= 300) throw new Error(`upstream gate HTTP ${r.status}`)
+    return true
   }, timeoutMs)
   if (gate === undefined) return { state: 'dead', latencyMs: Date.now() - t0 }
   const echo = await firstSuccess(ECHO_URLS, addr, async r => {
     const text = await r.text()
-    try { return exitInfoOf(JSON.parse(text)) } catch { return undefined }
+    const info = exitInfoOf(JSON.parse(text))
+    if (!info) throw new Error('echo response missing ip')
+    return info
   }, 8000)
   return { state: 'alive', latencyMs: lat, ...(echo ?? {}) }
 }

@@ -1,3 +1,6 @@
 node_modules/
 bin/
 data/
+runtime/
+lite-gateway.exe
+*.log

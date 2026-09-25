@@ -8,6 +8,7 @@
 
 import { applyFingerprint, endpointFor, mintRequestId, sessionForConversation, wireFor } from './upstream.js'
 import { CODE, getJson, postStreamed, dispatcherFor } from './http.js'
+import { fetch as undiciFetch } from 'undici'
 
 /** Public-echo sources, tried in order; any one answering is enough. */
 const ECHO_SOURCES = [
@@ -110,7 +111,7 @@ export async function detectEgress({ exitAddr, signal, timeoutMs = 8000 } = {}) 
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       timer.unref?.()
       signal?.addEventListener('abort', () => controller.abort(), { once: true })
-      const response = await fetch(source.url, { signal: controller.signal, redirect: 'error', headers: { accept: 'application/json' }, dispatcher: dispatcherFor(exitAddr) })
+      const response = await undiciFetch(source.url, { signal: controller.signal, redirect: 'error', headers: { accept: 'application/json' }, dispatcher: dispatcherFor(exitAddr) })
       clearTimeout(timer)
       if (!response.ok) continue
       const payload = await response.json()
