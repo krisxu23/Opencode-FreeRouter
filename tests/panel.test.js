@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import vm from 'node:vm'
 import { startPanel } from '../src/panel.js'
 import { JsonStore, SETTINGS_INITIAL } from '../src/store.js'
 
@@ -26,7 +27,13 @@ test('settings roundtrip and status/actions wiring', async () => {
 
     const page = await fetch(base)
     assert.equal(page.status, 200)
-    assert.match(await page.text(), /Opencode-FreeRouter/)
+    const html = await page.text()
+    assert.match(html, /Opencode-FreeRouter/)
+    // 回归：PAGE 是模板字符串，源码里写 `\n` 会被求值成真实换行，让浏览器脚本报
+    // SyntaxError、整个控制台静默变空板（实测事故）。这里对"模板求值后"的成品脚本
+    // 做语法检查，堵死这一类错误。
+    const script = html.split('<script>')[1].split('</' + 'script>')[0]
+    assert.doesNotThrow(() => new vm.Script(script), '面板内联脚本必须能通过语法检查')
 
     const initial = await (await fetch(`${base}/api/settings`)).json()
     assert.deepEqual(initial.countries, SETTINGS_INITIAL.countries)

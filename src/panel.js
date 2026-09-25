@@ -304,7 +304,7 @@ function renderStatus(s) {
 async function loadLogs() {
   try {
     const j = await j('/api/logs');
-    document.getElementById('logs').textContent = (j.lines ?? []).map(l => new Date(l.t).toLocaleTimeString() + ' [' + l.level + '] ' + l.msg).join('\n');
+    document.getElementById('logs').textContent = (j.lines ?? []).map(l => new Date(l.t).toLocaleTimeString() + ' [' + l.level + '] ' + l.msg).join('\\n');
     const box = document.getElementById('logs');
     box.scrollTop = box.scrollHeight;
   } catch {}
