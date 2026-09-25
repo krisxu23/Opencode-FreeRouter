@@ -20,12 +20,13 @@
 
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
 import { generateKey, startForwardServer } from './forward.js'
 import { createEngine } from './engine.js'
 import { startPanel } from './panel.js'
 import { JsonStore, SETTINGS_INITIAL } from './store.js'
 import { fetchSub, filterByCountries, loadCache, saveCache, countryOf } from './sub.js'
-import { assignPorts, sanitizeOutbound, buildConfig, writeConfig, startSingbox, watchSingbox, waitPort } from './singbox.js'
+import { assignPorts, sanitizeOutbound, buildConfig, writeConfig, startSingbox, watchSingbox, waitPort, waitPortFree } from './singbox.js'
 import { fetchUpstreamIds, probeModel } from './probe.js'
 import { probeAll } from './nodeprobe.js'
 import { buildCatalog } from './catalog.js'
@@ -98,7 +99,9 @@ async function refreshCatalog(attempt = 0) {
 
 // ---- rebuild ----------------------------------------------------------------
 
-async function rebuild() {
+const portBlacklist = new Set() // ports that made sing-box FATAL (bind conflict); never reused this session
+
+async function rebuild(attempt = 0) {
   if (rebuilding) { rebuildAgain = true; return }
   rebuilding = true
   try {
@@ -121,39 +124,75 @@ async function rebuild() {
       log(`parsed 0 nodes for countries [${s.countries.join(',')}] — check the country list in the panel`)
       return
     }
-    ports = assignPorts(picked, ports)
-    pool = picked.map(o => ({ tag: o.tag, country: countryOf(o.tag) }))
+    ports = assignPorts(picked, ports, { base: s.portBase, span: s.portSpan, avoid: portBlacklist })
+    const ported = picked.filter(o => ports[o.tag] != null)
+    if (ported.length < picked.length) {
+      log(`端口段 ${s.portBase}+${s.portSpan} 已满：${picked.length - ported.length} 个节点本轮未启用 — 可在面板调大"端口段容量"`)
+    }
+    if (ported.length === 0 && singboxProc !== null) {
+      log('no node fits the port range — keeping the serving instance')
+      return
+    }
+    if (ported.length === 0) {
+      log('no node fits the port range — enlarge 端口段容量 in the panel')
+      return
+    }
+    pool = ported.map(o => ({ tag: o.tag, country: countryOf(o.tag) }))
     const configPath = path.join(DATA, 'singbox.json')
-    writeConfig(configPath, buildConfig(picked, ports, { catchAllPort: s.catchAllPort }))
+    writeConfig(configPath, buildConfig(ported, ports, { catchAllPort: s.catchAllPort }))
 
+    // Static validation BEFORE touching the serving instance: a bad config
+    // must cost nothing. (Sidecar reality, measured: the new instance cannot
+    // bind the same stable ports while the old one lives — unlike the in-process
+    // Free-Router rebuild — so the swap itself is stop-the-world once the
+    // config is known-good.)
+    const previous0 = singboxProc
+    try {
+      execFileSync(path.join(ROOT, 'bin', 'sing-box.exe'), ['check', '-c', configPath], { stdio: 'pipe' })
+    } catch (error) {
+      log('新配置未通过 sing-box check — 保留当前实例继续服务:', String(error?.stderr ?? error?.message ?? error).slice(0, 300))
+      return
+    }
+    previous0?.kill()
+    await waitPortFree(s.catchAllPort, 3000).catch(() => {})
     const proc = startSingbox(path.join(ROOT, 'bin', 'sing-box.exe'), configPath)
+    let stderrTail = ''
     proc.stderr?.on('data', chunk => {
       const line = String(chunk).trim()
+      stderrTail = (stderrTail + '\n' + line).slice(-4000)
       if (/ERROR|FATAL/.test(line)) log('sing-box:', line)
     })
     proc.stdout?.on('data', () => {})
-    // Settle window: a config error exits within ms. Only a survivor replaces
-    // the serving instance (failKeepOld).
     const alive = await new Promise(resolve => {
       if (proc.exitCode !== null) return resolve(false)
       const timer = setTimeout(() => resolve(true), 2000)
       proc.once('exit', () => { clearTimeout(timer); resolve(false) })
     })
     if (!alive) {
-      log('new sing-box instance failed to start — keeping the previous one')
+      // Self-heal (Free-Router purgeStablePortsFromError): a bind conflict names
+      // the port — blacklist it, free its node for a new port, retry once.
+      const m = /listen tcp [^:]*:(\d+): bind/.exec(stderrTail)
+      if (m && attempt < 2) {
+        const port = Number(m[1])
+        const tag = Object.keys(ports).find(k => ports[k] === port)
+        portBlacklist.add(port)
+        if (tag) delete ports[tag]
+        log(`端口 ${port} 被外部占用（${tag ? '节点 ' + tag.slice(0, 30) : '未知'}），已拉黑并换端口重试`)
+        return void rebuild(attempt + 1)
+      }
+      log('新实例启动失败且无法自愈 — 网关空闲；可在面板点"刷新订阅并重建"重试')
       return
     }
-    const previous = singboxProc
     singboxProc = proc
-    previous?.kill()
     await waitPort(s.catchAllPort, 15000).catch(() => log('catch-all port not accepting yet — watchdog will re-check'))
     watchSingbox(proc, s.catchAllPort, () => {
       log('sing-box died — rebuilding in 5s')
       setTimeout(() => void rebuild().catch(() => {}), 5000)
     })
-    health.pruneStale(picked.map(o => o.tag))
+    health.pruneStale(ported.map(o => o.tag))
     health.persistHealth()
-    log(`rebuild ok: ${picked.length} nodes, ports ${Math.min(...Object.values(ports))}-${Math.max(...Object.values(ports))}`)
+    const portValues = Object.values(ports)
+    log(`rebuild ok: ${ported.length} nodes${ported.length < picked.length ? ` (共 ${picked.length}，端口段不够)` : ''}, ports ${Math.min(...portValues)}-${Math.max(...portValues)}`)
     void refreshCatalog()
     setTimeout(() => void probeNow(), 12000)
   } finally {
@@ -172,9 +211,12 @@ async function probeNow() {
     if (pool.length === 0) return
     const t0 = Date.now()
     let alive = 0
+    // Workers scale with the pool: fixed 10 over 800+ nodes took longer than a
+    // cycle (measured in Free-Router); floor = user setting, ceiling = 128.
+    const workers = Math.min(128, Math.max(settingsOf().probeWorkers, Math.ceil(pool.length / 4)))
     await probeAll(pool, {
       addrOf: node => `http://127.0.0.1:${ports[node.tag]}`,
-      workers: Math.max(4, settingsOf().probeWorkers),
+      workers,
       onResult: (node, result) => {
         health.markProbe(node.tag, result)
         if (result.state === 'alive') alive += 1

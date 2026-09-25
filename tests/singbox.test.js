@@ -56,6 +56,21 @@ test('sanitize: base64("method:password") shadowsocks method restored', () => {
   assert.equal(ob.password, 'secretpw')
 })
 
+test('ports: span exhaustion leaves later nodes without a port (no duplicates)', () => {
+  const t = assignPorts([{ tag: 'a' }, { tag: 'b' }, { tag: 'c' }], {}, { base: 21000, span: 2 })
+  assert.deepEqual(t, { a: 21000, b: 21001 }) // c: no port — buildConfig omits it
+})
+
+test('ports: avoid set is skipped (bind-conflict blacklist)', () => {
+  const t = assignPorts([{ tag: 'a' }, { tag: 'b' }], {}, { base: 21000, span: 10, avoid: new Set([21000]) })
+  assert.deepEqual(t, { a: 21001, b: 21002 })
+})
+
+test('ports: span clamps at the 65535 ceiling', () => {
+  const t = assignPorts([{ tag: 'x' }], {}, { base: 65530, span: 100 })
+  assert.deepEqual(t, { x: 65530 })
+})
+
 test('buildConfig: per-node inbounds, one rule each, catch-all final direct', () => {
   const outbounds = [{ tag: 'n1', type: 'vless' }, { tag: 'n2', type: 'ss' }]
   const ports = assignPorts(outbounds, {}, { base: 21000 })
@@ -71,4 +86,13 @@ test('buildConfig: per-node inbounds, one rule each, catch-all final direct', ()
   assert.equal(cfg.route.default_domain_resolver, 'local-dns')
   assert.deepEqual(cfg.dns.servers, [{ type: 'local', tag: 'local-dns' }])
   assert.equal(cfg.outbounds.at(-1).type, 'direct')
+})
+
+test('buildConfig: nodes without a port are omitted entirely', () => {
+  const outbounds = [{ tag: 'n1' }, { tag: 'n2' }, { tag: 'n3' }]
+  const ports = { n1: 21000, n3: 21001 } // n2 got no port (range exhausted)
+  const cfg = buildConfig(outbounds, ports, { catchAllPort: 20900 })
+  assert.equal(cfg.inbounds.length, 3) // 2 node inbounds + catch-all
+  assert.deepEqual(cfg.route.rules.map(r => r.outbound), ['n1', 'n3'])
+  assert.ok(!cfg.outbounds.some(o => o.tag === 'n2'))
 })

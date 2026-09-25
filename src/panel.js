@@ -189,6 +189,11 @@ label { font-size:13.5px }
     <label>探测周期(分) <input id="probeIntervalMin" type="number" style="width:64px"></label>
     <button id="save">保存并应用</button><span id="msg"></span>
   </div>
+  <div class="row" style="margin-top:10px">
+    <label>端口起始 <input id="portBase" type="number" style="width:88px"></label>
+    <label>端口段容量 <input id="portSpan" type="number" style="width:88px"></label>
+    <span class="muted" style="font-size:12.5px">每节点占一个端口；容量应 ≥ 节点数，起始+容量保持在 49152 以下</span>
+  </div>
 </section>
 <section class="row">
   <button id="probeNow">立即探测</button>
@@ -266,6 +271,8 @@ async function loadSettings() {
   document.getElementById('probeEnabled').checked = s.probeEnabled !== false;
   document.getElementById('probeWorkers').value = s.probeWorkers ?? 24;
   document.getElementById('probeIntervalMin').value = s.probeIntervalMin ?? 30;
+  document.getElementById('portBase').value = s.portBase ?? 21000;
+  document.getElementById('portSpan').value = s.portSpan ?? 8000;
 }
 function save() {
   const body = {
@@ -274,6 +281,8 @@ function save() {
     probeEnabled: document.getElementById('probeEnabled').checked,
     probeWorkers: Number(document.getElementById('probeWorkers').value) || 24,
     probeIntervalMin: Number(document.getElementById('probeIntervalMin').value) || 30,
+    portBase: Number(document.getElementById('portBase').value) || 21000,
+    portSpan: Number(document.getElementById('portSpan').value) || 8000,
   };
   j('/api/settings', { method: 'PUT', headers: {'content-type':'application/json'}, body: JSON.stringify(body) })
     .then(() => { document.getElementById('msg').textContent = '已保存并应用'; setTimeout(() => document.getElementById('msg').textContent = '', 4000); loadStatus(); })

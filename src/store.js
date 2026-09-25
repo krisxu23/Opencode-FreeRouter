@@ -86,6 +86,11 @@ export const SETTINGS_INITIAL = {
   forwardPort: 3457,
   panelPort: 3458,
   catchAllPort: 20900,
+  /** Per-node local inbound range: [portBase, portBase + portSpan). Keep it
+   *  below 49152 (Windows ephemeral client ports start there) and span >= the
+   *  largest node count you expect — a few thousand needs span ~10000. */
+  portBase: 21000,
+  portSpan: 8000,
   probeEnabled: true,
   probeWorkers: 24,
   probeIntervalMin: 30,

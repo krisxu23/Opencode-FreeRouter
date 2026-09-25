@@ -31,17 +31,25 @@ const SS_METHODS = new Set([
  * Stable port table: existing keys keep their port (no drift across rebuilds),
  * new keys take the next free slot, vanished keys are pruned (an ever-growing
  * table was a measured incident in Free-Router: 27k stale entries).
+ *
+ * `base`/`span` come from settings (panel-editable) so large node counts fit —
+ * never hardcode the range. When the range is exhausted, remaining nodes get
+ * NO port (buildConfig omits them and the caller warns) instead of a duplicate
+ * assignment that would make sing-box FATAL on bind.
+ * Keep the range below 49152: Windows hands out ephemeral client ports from
+ * 49152 up, and an ephemeral grab racing the bind means intermittent FATALs.
  */
-export function assignPorts(outbounds, prev = {}, { base = 21000, max = 29000 } = {}) {
+export function assignPorts(outbounds, prev = {}, { base = 21000, span = 8000, avoid = new Set() } = {}) {
+  const end = Math.min(Math.trunc(base) + Math.max(1, Math.trunc(span)) - 1, 65535)
   const table = { ...prev }
-  const used = new Set(Object.values(table))
+  const used = new Set([...Object.values(table), ...avoid])
   let next = base
   for (const o of outbounds) {
-    if (table[o.tag] == null) {
-      while (used.has(next) && next < max) next += 1
-      table[o.tag] = next
-      used.add(next)
-    }
+    if (table[o.tag] != null) continue
+    while (next <= end && used.has(next)) next += 1
+    if (next > end) break
+    table[o.tag] = next
+    used.add(next)
   }
   const keep = new Set(outbounds.map(o => o.tag))
   for (const k of Object.keys(table)) if (!keep.has(k)) delete table[k]
@@ -101,11 +109,14 @@ export function sanitizeOutbound(ob) {
 }
 
 /**
- * Full config: one mixed inbound per node (tags `in-0…in-N`), the catch-all
- * inbound, node outbounds + direct, and one inbound->outbound rule per node.
+ * Full config: one mixed inbound per PORTED node (tags `in-0…in-N`), the
+ * catch-all inbound, the matching outbounds, and one inbound->outbound rule
+ * per node. Nodes without a port (port range exhausted) are omitted entirely.
  */
 export function buildConfig(outbounds, ports, { catchAllPort }) {
-  const list = outbounds.map((o, i) => ({ tag: o.tag, port: ports[o.tag], inTag: `in-${i}` }))
+  const list = outbounds
+    .filter(o => ports[o.tag] != null)
+    .map((o, i) => ({ tag: o.tag, port: ports[o.tag], inTag: `in-${i}` }))
   return {
     log: { level: 'warn' },
     // Local DNS + explicit resolver: direct-outbound domains (catch-all traffic)
@@ -116,7 +127,7 @@ export function buildConfig(outbounds, ports, { catchAllPort }) {
       ...list.map(e => ({ type: 'mixed', tag: e.inTag, listen: '127.0.0.1', listen_port: e.port })),
       { type: 'mixed', tag: CATCHALL_TAG, listen: '127.0.0.1', listen_port: catchAllPort },
     ],
-    outbounds: [...outbounds, { type: 'direct', tag: 'direct' }],
+    outbounds: [...list.map(e => outbounds.find(o => o.tag === e.tag)), { type: 'direct', tag: 'direct' }],
     route: {
       rules: list.map(e => ({ inbound: [e.inTag], outbound: e.tag })),
       final: 'direct',
@@ -149,6 +160,23 @@ export function waitPort(port, timeoutMs = 15000) {
         if (Date.now() - t0 > timeoutMs) reject(new Error(`port ${port} not accepting after ${timeoutMs}ms`))
         else setTimeout(tryOnce, 250)
       })
+    }
+    tryOnce()
+  })
+}
+
+/** Wait until a local TCP port stops accepting (freed by a killed process). */
+export function waitPortFree(port, timeoutMs = 3000) {
+  return new Promise(resolve => {
+    const t0 = Date.now()
+    const tryOnce = () => {
+      const sock = net.connect({ port, host: '127.0.0.1' })
+      sock.once('connect', () => {
+        sock.destroy()
+        if (Date.now() - t0 > timeoutMs) return resolve(false)
+        setTimeout(tryOnce, 150)
+      })
+      sock.once('error', () => { sock.destroy(); resolve(true) })
     }
     tryOnce()
   })
