@@ -35,6 +35,18 @@ OpenAI 兼容路由：`GET /v1/models`、`POST /v1/chat/completions`（流式/�
 
 设计细节与出处见 `../Free-Router/docs/superpowers/plans/2026-09-26-lite-gateway-singbox-plan.md`（含 Free-Router 机制对照表）。
 
+## 发布（给别人用）
+
+```bash
+node scripts/build-release.mjs
+```
+
+产出 `release/Opencode-FreeRouter-v<版本>-windows-x64.zip`（约 62MB），内含全部运行组件：
+托盘 exe（嵌图标）、自带 Node 运行时（`runtime/node.exe`，对方无需安装 Node）、网关源码、
+undici 依赖、sing-box v1.14.0 内核、运行说明。**解压后双击 exe 即可用**，数据都在解压目录的
+`data/` 下，删除文件夹即卸载。上传 GitHub：Releases → New release → 拖入 zip 附件。
+首次运行 SmartScreen 会提示未签名程序，点"更多信息 → 仍要运行"（消除需代码签名证书）。
+
 ## 开发
 
 ```bash
@@ -42,7 +54,7 @@ npm install            # 唯一第三方依赖 undici
 npm test               # node:test 全量
 npm run fetch-singbox  # 下载 sing-box v1.14.0 内核到 bin/
 node src/index.js      # 前台跑网关（托盘 exe 的等价物）
-cd launcher && go build -ldflags="-s -w -H=windowsgui" -o ../Opencode-FreeRouter.exe .   # 图标资源 launcher/rsrc_windows_amd64.syso 自动链接   # 构建托盘 exe
+cd launcher && go build -ldflags="-s -w -H=windowsgui" -o ../Opencode-FreeRouter.exe .   # 图标资源 launcher/rsrc_windows_amd64.syso 自动链接
 ```
 
 目录：`src/` 网关（upstream/http/catalog/forward 等照抄上游 1:1，singbox/health/engine/panel/nodeprobe 为新增）；

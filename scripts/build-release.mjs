@@ -10,7 +10,7 @@
 //   bin/sing-box.exe          sing-box v1.14.0 内核
 //   package.json              ESM 标记 + 元数据
 //   LICENSE / NOTICE / README.md
-import { cpSync, mkdirSync, rmSync, statSync, existsSync, writeFileSync, readFileSync } from 'node:fs'
+import { cpSync, mkdirSync, rmSync, statSync, existsSync, writeFileSync, readFileSync, readdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -76,6 +76,9 @@ console.log('完整性校验通过（' + required.length + ' 项）')
 // 6. 压缩
 rmSync(zipPath, { force: true })
 execFileSync('powershell', ['-Command', `Compress-Archive -Force -Path "${stage}" -DestinationPath "${zipPath}"`])
-const mb = n => (statSync(n).size / 1048576).toFixed(1) + 'MB'
-console.log('目录：', stage, '(' + mb(stage) + ')')
-console.log('发布包：', zipPath, '(' + mb(zipPath) + ')')
+const dirSize = p => [...readdirSync(p, { recursive: true })].reduce((n, f) => {
+  try { return n + statSync(path.join(p, f)).size } catch { return n }
+}, 0)
+const mb = n => (n / 1048576).toFixed(1) + 'MB'
+console.log('目录：', stage, '(' + mb(dirSize(stage)) + ')')
+console.log('发布包：', zipPath, '(' + mb(statSync(zipPath).size) + ')')
