@@ -72,7 +72,9 @@ const engine = createEngine({
 
 // ---- catalog ----------------------------------------------------------------
 
-async function refreshCatalog() {
+let catalogRetryTimer
+
+async function refreshCatalog(attempt = 0) {
   const s = settingsOf()
   const picked = pool.length > 0 ? pickExit({ model: 'catalog:refresh', countries: s.countries, pool, portOf: tag => ports[tag] }) : null
   const exitAddr = picked?.addr ?? 'direct' // verified anonymous direct 200; a node exit is preferred when one exists
@@ -80,9 +82,17 @@ async function refreshCatalog() {
     const ids = await fetchUpstreamIds({ exitAddr })
     catalog = buildCatalog(ids)
     membership = { 'our-free-model': catalog.map(entry => entry.id) }
+    clearTimeout(catalogRetryTimer)
     log(`catalog: ${catalog.length} free models via ${exitAddr}`)
   } catch (error) {
-    log(`catalog refresh failed: ${error?.message ?? error}`)
+    // The picked exit may be a not-yet-probed node; back off and retry instead
+    // of leaving the model list empty until the next probe round (30min).
+    log(`catalog refresh failed (${error?.message ?? error}); retry ${Math.min(attempt + 1, 5)}/5 in 60s`)
+    if (attempt < 5) {
+      clearTimeout(catalogRetryTimer)
+      catalogRetryTimer = setTimeout(() => void refreshCatalog(attempt + 1), 60000)
+      catalogRetryTimer.unref?.()
+    }
   }
 }
 
