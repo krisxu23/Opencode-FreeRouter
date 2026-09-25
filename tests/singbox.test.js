@@ -10,7 +10,7 @@ test('ports: existing keys keep their port, vanished keys are pruned', () => {
   const t2 = assignPorts([b], t1)
   assert.deepEqual(t2, { b: 21001 })
   const t3 = assignPorts([{ tag: 'c' }], t2, { base: 21000 })
-  assert.deepEqual(t3, { c: 21002 })
+  assert.deepEqual(t3, { c: 21000 }) // pruned keys release their ports for reuse
 })
 
 test('sanitize: tls block without enabled is treated as enabled (panic guard)', () => {
