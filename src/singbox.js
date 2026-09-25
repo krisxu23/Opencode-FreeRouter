@@ -108,6 +108,10 @@ export function buildConfig(outbounds, ports, { catchAllPort }) {
   const list = outbounds.map((o, i) => ({ tag: o.tag, port: ports[o.tag], inTag: `in-${i}` }))
   return {
     log: { level: 'warn' },
+    // Local DNS + explicit resolver: direct-outbound domains (catch-all traffic)
+    // and domain-server nodes must resolve, or the tunnel connects and the TLS
+    // handshake silently hangs (measured: no DNS section => every probe 000).
+    dns: { servers: [{ type: 'local', tag: 'local-dns' }] },
     inbounds: [
       ...list.map(e => ({ type: 'mixed', tag: e.inTag, listen: '127.0.0.1', listen_port: e.port })),
       { type: 'mixed', tag: CATCHALL_TAG, listen: '127.0.0.1', listen_port: catchAllPort },
@@ -116,6 +120,7 @@ export function buildConfig(outbounds, ports, { catchAllPort }) {
     route: {
       rules: list.map(e => ({ inbound: [e.inTag], outbound: e.tag })),
       final: 'direct',
+      default_domain_resolver: 'local-dns',
     },
   }
 }

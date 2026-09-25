@@ -68,5 +68,7 @@ test('buildConfig: per-node inbounds, one rule each, catch-all final direct', ()
     { inbound: ['in-1'], outbound: 'n2' },
   ])
   assert.equal(cfg.route.final, 'direct')
+  assert.equal(cfg.route.default_domain_resolver, 'local-dns')
+  assert.deepEqual(cfg.dns.servers, [{ type: 'local', tag: 'local-dns' }])
   assert.equal(cfg.outbounds.at(-1).type, 'direct')
 })

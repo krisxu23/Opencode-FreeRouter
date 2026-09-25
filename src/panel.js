@@ -14,7 +14,7 @@
 
 import http from 'node:http'
 
-export async function startPanel({ status, getSettings, applySettings, actions = {}, log = () => {} }) {
+export async function startPanel({ status, getSettings, applySettings, actions = {}, log = () => {}, port: desiredPort }) {
   const server = http.createServer((req, res) => {
     void handle(req, res).catch(error => {
       log(`panel request failed: ${error?.message ?? error}`)
@@ -59,8 +59,16 @@ export async function startPanel({ status, getSettings, applySettings, actions =
   }
 
   const port = await new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => resolve(server.address()?.port ?? 0))
+    const listenOn = candidate => {
+      server.once('error', error => {
+        if (candidate !== 0) {
+          log(`panel port ${candidate} unavailable (${error?.code ?? error}) — falling back to a random port`)
+          listenOn(0)
+        } else reject(error)
+      })
+      server.listen(candidate, '127.0.0.1', () => resolve(server.address()?.port ?? 0))
+    }
+    listenOn(Number.isFinite(desiredPort) && desiredPort > 0 ? desiredPort : 0)
   })
   return { server, port, close: () => new Promise(resolve => { server.closeAllConnections?.(); server.close(() => resolve()) }) }
 }
