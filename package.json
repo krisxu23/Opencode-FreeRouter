@@ -1,0 +1,16 @@
+{
+  "name": "lite-gateway",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Lite gateway: OpenAI-compatible forward to opencode.ai free lane via per-node sing-box exits",
+  "engines": { "node": "^22.19.0 || >=24.0.0" },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test tests/",
+    "fetch-singbox": "node scripts/fetch-singbox.mjs"
+  },
+  "dependencies": {
+    "undici": "^8.11.2"
+  }
+}

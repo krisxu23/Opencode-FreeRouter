@@ -1,0 +1,14 @@
+lite-gateway
+============
+
+网关逻辑移植自 dsh-our-free-model (MIT, Copyright (c) 2026 zouyuxuan122)
+  https://github.com/zouyuxuan122/dsh-our-free-model
+
+节点订阅源: freesub (krisxu23/freesub)
+  https://github.com/krisxu23/freesub
+
+sing-box 以独立进程方式调用 (GPLv3, SagerNet), 本项目不分发其代码,
+运行时通过 scripts/fetch-singbox.mjs 获取官方二进制。
+  https://github.com/SagerNet/sing-box
+
+架构参考: Free-Router (本机 Go 版网关项目)
