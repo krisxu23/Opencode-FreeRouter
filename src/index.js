@@ -181,12 +181,22 @@ async function rebuild(attempt = 0) {
     await waitPortFree(s.catchAllPort, 3000).catch(() => {})
     const proc = startSingbox(path.join(ROOT, 'bin', 'sing-box.exe'), configPath)
     let stderrTail = ''
+    // 拨号失败噪音抑制：一轮探测打几百个死节点，每条连接失败都打 2-4 行 ERROR，
+    // 实测能刷出 7000+ 行把日志和面板淹掉 —— 按窗口聚合成一行摘要。
+    let dialFailures = 0
+    let lastDialSummary = Date.now()
     proc.stderr?.on('data', chunk => {
       const line = String(chunk).trim()
       stderrTail = (stderrTail + '\n' + line).slice(-4000)
-      // 全量进日志（排错需要），级别按内容标注
       if (/FATAL/.test(line)) logger.error('sing-box:', line)
-      else if (/ERROR/.test(line)) logger.warn('sing-box:', line)
+      else if (/connection: open connection/.test(line)) {
+        dialFailures += 1
+        if (Date.now() - lastDialSummary >= 30000) {
+          logger.info(`sing-box: 拨号失败 ${dialFailures} 次（多为探测死节点，属正常噪音）`)
+          dialFailures = 0
+          lastDialSummary = Date.now()
+        }
+      } else if (/ERROR/.test(line)) logger.warn('sing-box:', line)
       else if (line) logger.info('sing-box:', line)
     })
     proc.stdout?.on('data', () => {})
@@ -221,7 +231,7 @@ async function rebuild(attempt = 0) {
     const portValues = Object.values(ports)
     log(`rebuild ok: ${ported.length} nodes${ported.length < picked.length ? ` (共 ${picked.length}，端口段不够)` : ''}, ports ${Math.min(...portValues)}-${Math.max(...portValues)}`)
     void refreshCatalog()
-    setTimeout(() => void probeNow(), 12000)
+    setTimeout(() => void probeNow(), 3000) // 首探提前：让面板的"–"尽快变成实测结果
   } finally {
     rebuilding = false
     if (rebuildAgain) { rebuildAgain = false; void rebuild().catch(() => {}) }

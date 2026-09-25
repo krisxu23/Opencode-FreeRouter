@@ -6,9 +6,11 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"fyne.io/systray"
@@ -42,7 +44,7 @@ func nodePath() string {
 	return "node"
 }
 
-func panelURL() string {
+func panelPort() int {
 	port := 3458
 	if raw, err := os.ReadFile(filepath.Join(exeDir(), "data", "settings.json")); err == nil {
 		var s struct {
@@ -52,7 +54,11 @@ func panelURL() string {
 			port = s.PanelPort
 		}
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d", port)
+	return port
+}
+
+func panelURL() string {
+	return "http://127.0.0.1:" + strconv.Itoa(panelPort())
 }
 
 func (g *gateway) start() error {
@@ -81,7 +87,26 @@ func (g *gateway) stop() {
 }
 
 func main() {
+	// 单实例守卫：面板端口已在监听 = 程序已在运行，直接打开那个面板并退出，
+	// 避免双开导致端口抢占、第二个实例停在空闲态。
+	if panelUp(panelPort()) {
+		openBrowser(panelURL())
+		os.Exit(0)
+	}
 	systray.Run(onReady, nil)
+}
+
+func panelUp(port int) bool {
+	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func openBrowser(url string) {
+	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 }
 
 func onReady() {
@@ -103,7 +128,7 @@ func onReady() {
 		for {
 			select {
 			case <-mOpen.ClickedCh:
-				_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", panelURL()).Start()
+				openBrowser(panelURL())
 			case <-mRestart.ClickedCh:
 				g.stop()
 				if err := g.start(); err != nil {
