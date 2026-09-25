@@ -36,9 +36,13 @@ export function setHealthFile(file) {
 // ---- node health -----------------------------------------------------------
 
 export function markProbe(nodeKey, result) {
+  const alive = result.state === 'alive'
   nodes.set(nodeKey, {
-    state: result.state === 'alive' ? 'alive' : 'dead',
-    latencyMs: result.latencyMs ?? -1,
+    state: alive ? 'alive' : 'dead',
+    // Latency is only meaningful for a working exit: a node that connects but
+    // cannot reach the upstream is dead for our purposes, and showing its
+    // liveness latency there reads as a contradiction in the panel.
+    latencyMs: alive ? (result.latencyMs ?? -1) : -1,
     exitIp: result.exitIp ?? '',
     exitCountry: String(result.exitCountry ?? '').toUpperCase().slice(0, 2),
     lastProbeAt: Date.now(),

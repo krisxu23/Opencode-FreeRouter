@@ -29,7 +29,6 @@ import { assignPorts, sanitizeOutbound, buildConfig, writeConfig, startSingbox, 
 import { fetchUpstreamIds, probeModel } from './probe.js'
 import { probeAll } from './nodeprobe.js'
 import { buildCatalog } from './catalog.js'
-import { pickExit } from './health.js'
 import * as health from './health.js'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -74,19 +73,20 @@ const engine = createEngine({
 
 let catalogRetryTimer
 
+/**
+ * Refresh the free-model catalog. Always via DIRECT connection: the models
+ * listing is anonymous-200 and direct is the fastest, most deterministic path —
+ * the user sees the model list seconds after the program opens, without
+ * waiting for nodes to be probed.
+ */
 async function refreshCatalog(attempt = 0) {
-  const s = settingsOf()
-  const picked = pool.length > 0 ? pickExit({ model: 'catalog:refresh', countries: s.countries, pool, portOf: tag => ports[tag] }) : null
-  const exitAddr = picked?.addr ?? 'direct' // verified anonymous direct 200; a node exit is preferred when one exists
   try {
-    const ids = await fetchUpstreamIds({ exitAddr })
+    const ids = await fetchUpstreamIds({ exitAddr: 'direct' })
     catalog = buildCatalog(ids)
     membership = { 'our-free-model': catalog.map(entry => entry.id) }
     clearTimeout(catalogRetryTimer)
-    log(`catalog: ${catalog.length} free models via ${exitAddr}`)
+    log(`catalog: ${catalog.length} free models via direct`)
   } catch (error) {
-    // The picked exit may be a not-yet-probed node; back off and retry instead
-    // of leaving the model list empty until the next probe round (30min).
     log(`catalog refresh failed (${error?.message ?? error}); retry ${Math.min(attempt + 1, 5)}/5 in 60s`)
     if (attempt < 5) {
       clearTimeout(catalogRetryTimer)
@@ -182,9 +182,6 @@ async function probeNow() {
     })
     health.persistHealth()
     log(`probe round: ${alive}/${pool.length} alive in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
-    // First boot fetches the catalog through an unprobed (possibly dead) node;
-    // once a round has measured real exits, refresh the catalog through a good one.
-    if (alive > 0) void refreshCatalog()
 
     // Region matrix supplement: for models measured region-restricted by real
     // traffic, probe up to 24 still-unknown alive exits with the smallest real
@@ -250,6 +247,7 @@ const panel = await startPanel({
 
 log(`panel   : http://127.0.0.1:${panel.port}`)
 log(`forward : http://127.0.0.1:${forward.port}/v1 (key ${settingsOf().forwardKey.slice(0, 8)}…)`)
+void refreshCatalog() // 直连立即拉模型列表：程序一开就能看到，不等订阅/节点
 await rebuild().catch(error => log(`initial rebuild failed (idle state): ${error?.message ?? error}`))
 setInterval(() => void probeNow().catch(() => {}), Math.max(5, settingsOf().probeIntervalMin) * 60_000).unref?.()
 setInterval(() => void rebuild().catch(() => {}), 6 * 3600_000).unref?.()

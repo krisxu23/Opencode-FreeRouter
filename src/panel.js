@@ -94,77 +94,113 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'))
 }
 
+// 视觉刻度统一约定：字号 12/13/13.5/14/20，间距全部落在 4 的倍数上，圆角 6/8/10。
 const PAGE = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Opencode-FreeRouter 控制台</title>
 <style>
-body.dark { --bg:#11151c; --fg:#dbe2ee; --muted:#7d8899; --box:#151b26; --border:#232b38; --accent:#8ab4ff; --code:#0e1420; --hbg:#1a2230; }
-body.light { --bg:#f4f6fa; --fg:#1c2733; --muted:#5d6b7c; --box:#ffffff; --border:#dde4ee; --accent:#1b62d0; --code:#eef2f8; --hbg:#e7edf6; }
-body { font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--fg); margin:0 auto; max-width:980px; padding:16px }
-h1 { font-size:20px; margin:0 } h2 { font-size:14px; margin:14px 0 8px; color:var(--accent) }
-header.row { margin-bottom:12px }
-table { border-collapse:collapse; width:100%; font-size:12.5px }
-th,td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border) }
-th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--box) }
-.alive{color:#3fae74}.dead{color:#e05252}.unknown{color:#b98a12}
-body.light .alive{color:#1d7a4c} body.light .dead{color:#c22f2f} body.light .unknown{color:#9a730b}
-input,textarea,button,code { font:inherit }
-input,textarea,button { background:var(--hbg); color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:6px 8px }
-textarea { width:100%; box-sizing:border-box }
-button { cursor:pointer } button:hover { filter:brightness(1.15) }
-.row { display:flex; gap:12px; align-items:center; flex-wrap:wrap }
-.box { background:var(--box); border:1px solid var(--border); border-radius:8px; padding:12px; margin:10px 0 }
-code { background:var(--code); border:1px solid var(--border); border-radius:4px; padding:2px 6px; font-family:Consolas,monospace; font-size:12.5px; word-break:break-all }
-.scrollbox { max-height:240px; overflow-y:auto; border:1px solid var(--border); border-radius:6px }
-.chip { display:inline-flex; align-items:center; gap:6px; margin:3px; padding:3px 4px 3px 10px; border:1px solid var(--border); border-radius:14px; background:var(--hbg); font-family:Consolas,monospace; font-size:12px }
-.chip button { padding:1px 8px; font-size:11px; border-radius:10px }
-.kv { margin:6px 0 }
-#msg { color:var(--accent); margin-left:8px }
+/* 设计约定：色彩只承载状态语义；UI 用 Segoe UI，数据一律 Cascadia Mono；
+   全页唯一加重视觉块是"接入信息"配置条，其余靠留白与细分隔线分组。 */
+:root { --mono: "Cascadia Mono", Consolas, "Courier New", monospace }
+body.dark { --bg:#10141c; --fg:#e2e8f2; --muted:#8b98ab; --line:#222b38; --surface:#171e29; --raised:#1d2634; --border:#2a3547; --accent:#79a8e6; --ok:#3ecf8e; --bad:#f0645c; --warn:#e0a640; --code:#0d1119 }
+body.light { --bg:#f4f5f7; --fg:#212b36; --muted:#5b6874; --line:#e3e7ec; --surface:#fbfcfd; --raised:#ffffff; --border:#d6dde5; --accent:#2c66b8; --ok:#0f7444; --bad:#b03330; --warn:#8a6408; --code:#eef1f5 }
+* { box-sizing:border-box }
+body { font-family:"Segoe UI","Microsoft YaHei UI",system-ui,sans-serif; font-size:14px; line-height:1.55; background:var(--bg); color:var(--fg); margin:0 auto; max-width:1060px; padding:22px 20px 40px }
+main { animation:arrive .24s ease-out }
+@keyframes arrive { from { opacity:0; transform:translateY(6px) } }
+@media (prefers-reduced-motion: reduce) { main { animation:none } }
+:focus-visible { outline:2px solid var(--accent); outline-offset:2px }
+h1 { font-size:18px; font-weight:650; letter-spacing:-.2px; margin:0 }
+h2 { font-size:14px; font-weight:600; margin:0 0 10px }
+.mono { font-family:var(--mono); font-size:13px }
+.muted { color:var(--muted) }
+header { display:flex; align-items:baseline; gap:12px }
+header .spacer { flex:1 }
+.statusline { display:flex; gap:20px; flex-wrap:wrap; align-items:center; margin:14px 0 4px; padding-bottom:14px; border-bottom:1px solid var(--line); font-family:var(--mono); font-size:13px }
+.dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--warn); margin-right:6px; vertical-align:baseline }
+.dot.ok { background:var(--ok) } .dot.bad { background:var(--bad) }
+.statusline b { color:var(--muted); font-weight:400 }
+.strip { background:var(--raised); border:1px solid var(--border); border-radius:10px; padding:16px; margin:16px 0 }
+.kv { display:flex; align-items:center; gap:10px; margin:9px 0 }
+.kv > span:first-child { min-width:76px; color:var(--muted); font-size:13px }
+.kv code { flex:1 }
+code { background:var(--code); border:1px solid var(--border); border-radius:6px; padding:5px 9px; font-family:var(--mono); font-size:13px; word-break:break-all }
+section { margin:26px 0 }
+section > h2 { padding-bottom:8px; border-bottom:1px solid var(--line) }
+input,textarea,button { font:inherit; font-size:13.5px; background:var(--surface); color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:7px 12px }
+textarea { width:100%; resize:vertical }
+button { cursor:pointer; transition:filter .12s, background .12s; white-space:nowrap }
+button:hover { filter:brightness(1.15) }
+.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap }
+.scrollbox { max-height:264px; overflow-y:auto; border:1px solid var(--border); border-radius:8px; background:var(--surface) }
+table { border-collapse:collapse; width:100%; font-size:13px }
+th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); white-space:nowrap }
+th { color:var(--muted); font-weight:400; position:sticky; top:0; background:var(--surface) }
+td:first-child { white-space:normal; min-width:220px }
+#nodes td:nth-child(3), #nodes td:nth-child(5), #nodes td:nth-child(6), #nodes td:nth-child(7) { font-family:var(--mono); font-variant-numeric:tabular-nums; font-size:12.5px }
+.alive { color:var(--ok); font-weight:600 }
+.dead { color:var(--bad); font-weight:600 }
+.unknown { color:var(--warn); font-weight:600 }
+.chip { display:inline-flex; align-items:center; gap:8px; margin:0 8px 8px 0; padding:6px 6px 6px 12px; border:1px solid var(--border); border-radius:8px; background:var(--surface); font-family:var(--mono); font-size:13px }
+.chip button { font-size:12px; padding:3px 10px; border-radius:6px }
+#msg { color:var(--ok); margin-left:8px; font-size:13.5px }
+label { font-size:13.5px }
+.formrow { margin:10px 0 }
 </style></head><body class="dark">
-<header class="row">
-  <h1>Opencode-FreeRouter</h1><span style="flex:1"></span>
+<main>
+<header>
+  <h1>Opencode-FreeRouter</h1>
+  <span class="spacer"></span>
   <button id="themeBtn"></button>
 </header>
-<div class="box">
-  <b>sing-box:</b> <span id="sb">…</span> &nbsp; <b>网关:</b> <span id="fwd">…</span> &nbsp;
-  <b>受限模型:</b> <span id="rm">…</span>
+<div class="statusline">
+  <span><span class="dot" id="sbDot"></span><span id="sb">…</span></span>
+  <span><b>转发</b> <span id="fwd">…</span></span>
+  <span><b>可用出口</b> <span id="aliveCount">–</span></span>
+  <span><b>免费模型</b> <span id="modelCount">–</span></span>
+  <span style="flex:1"></span>
+  <span class="muted" id="rm"></span>
 </div>
-<div class="box">
-  <h2>接入信息（填到 agent 工具的 API 配置里）</h2>
-  <div class="kv">API 地址：<code id="apiBase">…</code> <button class="copy" data-for="apiBase">复制</button></div>
-  <div class="kv">API Key：<code id="apiKey">…</code> <button class="copy" data-for="apiKey">复制</button></div>
+<div class="strip">
+  <h2>接入信息</h2>
+  <div class="kv"><span>API 地址</span><code id="apiBase">…</code> <button class="copy" data-for="apiBase">复制</button></div>
+  <div class="kv"><span>API Key</span><code id="apiKey">…</code> <button class="copy" data-for="apiKey">复制</button></div>
 </div>
-<div class="box">
-  <h2>免费模型（付费模型不展示；点"复制"拿模型 id）</h2>
-  <div id="models"><span style="color:var(--muted)">加载中…</span></div>
-</div>
-<div class="box">
-  <h2>节点健康 <span id="nodeCount" style="color:var(--muted);font-weight:400"></span></h2>
-  <div class="scrollbox"><table id="nodes"><thead><tr><th>节点</th><th>国家</th><th>端口</th><th>健康</th><th>延迟</th><th>出口IP</th><th>最后探测</th></tr></thead><tbody></tbody></table></div>
-</div>
-<div class="box">
+<section>
+  <h2>免费模型 <span class="muted mono" id="modelNote">点"复制"拿模型 id</span></h2>
+  <div id="models"><span class="muted">直连拉取中，稍候几秒。</span></div>
+</section>
+<section>
+  <h2>节点健康 <span class="muted mono" id="nodeCount"></span></h2>
+  <div class="scrollbox"><table id="nodes"><thead><tr><th>节点</th><th>国家</th><th>端口</th><th>健康</th><th>延迟</th><th>出口 IP</th><th>最后探测</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section>
   <h2>设置</h2>
   <label>订阅链接（每行一个，留空用内置 freesub 源）</label>
   <textarea id="subUrls" rows="3"></textarea>
-  <label>出口国家（按回退顺序，点击按钮加入/移出）</label>
-  <div id="quick"></div>
-  <input id="countries" style="width:240px" placeholder="US,SG,JP">
-  <div class="row" style="margin-top:8px">
+  <div class="formrow">
+    <label>出口国家（按回退顺序，点击加入或移出）</label>
+    <div id="quick" style="margin-top:6px"></div>
+    <input id="countries" style="width:240px;margin-top:6px" placeholder="US,SG,JP">
+  </div>
+  <div class="row" style="margin-top:12px">
     <label><input type="checkbox" id="probeEnabled"> 自动探测</label>
     <label>探测并发 <input id="probeWorkers" type="number" style="width:64px"></label>
     <label>探测周期(分) <input id="probeIntervalMin" type="number" style="width:64px"></label>
     <button id="save">保存并应用</button><span id="msg"></span>
   </div>
-</div>
-<div class="box">
-  <button id="probeNow">立即探测</button> <button id="refreshSub">刷新订阅并重建</button>
-</div>
+</section>
+<section class="row">
+  <button id="probeNow">立即探测</button>
+  <button id="refreshSub">刷新订阅并重建</button>
+</section>
+</main>
 <script>
 const QUICK = ['US','SG','JP','TW','HK','NL','DE','GB','KR','TR'];
 const body = document.body, themeBtn = document.getElementById('themeBtn');
 function applyTheme(t) {
   body.className = t;
-  themeBtn.textContent = t === 'dark' ? '☀️ 浅色' : '🌙 深色';
+  themeBtn.textContent = t === 'dark' ? '浅色' : '深色';
   localStorage.setItem('ofr-theme', t);
 }
 themeBtn.onclick = () => applyTheme(body.className === 'dark' ? 'light' : 'dark');
@@ -179,7 +215,7 @@ async function copyText(text, btn) {
     ta.value = text; document.body.appendChild(ta); ta.select();
     document.execCommand('copy'); ta.remove();
   }
-  const old = btn.textContent; btn.textContent = '已复制 ✓';
+  const old = btn.textContent; btn.textContent = '已复制';
   setTimeout(() => btn.textContent = old, 1500);
 }
 document.addEventListener('click', e => {
@@ -188,14 +224,21 @@ document.addEventListener('click', e => {
 });
 
 function renderStatus(s) {
-  document.getElementById('sb').textContent = s.singbox?.running ? '运行中 (pid ' + s.singbox.pid + ')' : '未运行';
-  document.getElementById('fwd').textContent = s.forward?.running ? '监听 ' + s.forward.port : '未监听';
-  document.getElementById('rm').textContent = (s.regionModels ?? []).join(', ') || '（暂无）';
+  const up = s.singbox?.running === true;
+  document.getElementById('sbDot').className = 'dot ' + (up ? 'ok' : 'bad');
+  document.getElementById('sb').textContent = up ? 'sing-box 运行中' : 'sing-box 未运行';
+  document.getElementById('fwd').textContent = ':' + (s.forward?.port ?? 3457);
+  document.getElementById('aliveCount').textContent = (() => {
+    const nodes = s.nodes ?? [];
+    return nodes.filter(n => n.state === 'alive').length + ' / ' + nodes.length;
+  })();
+  const models = s.models ?? [];
+  document.getElementById('modelCount').textContent = models.length;
+  document.getElementById('rm').textContent = (s.regionModels ?? []).length ? '受限: ' + s.regionModels.join(', ') : '';
   document.getElementById('apiBase').textContent = 'http://127.0.0.1:' + (s.forward?.port ?? 3457) + '/v1';
   document.getElementById('apiKey').textContent = s.forward?.key ?? '';
-  const models = s.models ?? [];
   const wrap = document.getElementById('models');
-  if (!models.length) { wrap.innerHTML = '<span style="color:var(--muted)">暂无（等探测/目录刷新后出现）</span>'; }
+  if (!models.length) { wrap.innerHTML = '<span class="muted">直连拉取中，稍候几秒。</span>'; }
   else {
     wrap.innerHTML = '';
     for (const id of models) {
@@ -205,15 +248,15 @@ function renderStatus(s) {
       btn.onclick = () => copyText(id, btn);
       chip.append(label, btn); wrap.appendChild(chip);
     }
-    const all = document.createElement('button'); all.style.margin = '6px 3px'; all.textContent = '复制全部模型 id';
+    const all = document.createElement('button'); all.style.margin = '4px 0'; all.textContent = '复制全部模型 id';
     all.onclick = () => copyText(models.join('\\n'), all);
     wrap.appendChild(all);
   }
   const nodes = s.nodes ?? [];
-  document.getElementById('nodeCount').textContent = '(' + nodes.filter(n => n.state === 'alive').length + '/' + nodes.length + ' alive)';
+  document.getElementById('nodeCount').textContent = '';
   const tb = document.querySelector('#nodes tbody'); tb.innerHTML = '';
   for (const n of nodes) {
-    tb.insertAdjacentHTML('beforeend', '<tr><td>' + esc(n.tag) + '</td><td>' + esc(n.country) + '</td><td>' + (n.port ?? '') + '</td><td class="' + n.state + '">' + n.state + '</td><td>' + (n.latencyMs >= 0 ? n.latencyMs + 'ms' : '-') + '</td><td>' + esc(n.exitIp || '') + '</td><td>' + (n.lastProbeAt ? new Date(n.lastProbeAt).toLocaleTimeString() : '-') + '</td></tr>');
+    tb.insertAdjacentHTML('beforeend', '<tr><td>' + esc(n.tag) + '</td><td>' + esc(n.country) + '</td><td>' + (n.port ?? '') + '</td><td class="' + n.state + '">' + n.state + '</td><td>' + (n.latencyMs >= 0 ? n.latencyMs + 'ms' : '–') + '</td><td>' + esc(n.exitIp || '') + '</td><td>' + (n.lastProbeAt ? new Date(n.lastProbeAt).toLocaleTimeString() : '–') + '</td></tr>');
   }
 }
 async function loadSettings() {
@@ -233,8 +276,8 @@ function save() {
     probeIntervalMin: Number(document.getElementById('probeIntervalMin').value) || 30,
   };
   j('/api/settings', { method: 'PUT', headers: {'content-type':'application/json'}, body: JSON.stringify(body) })
-    .then(() => { document.getElementById('msg').textContent = '已保存并应用 ✓'; setTimeout(() => document.getElementById('msg').textContent = '', 4000); loadStatus(); })
-    .catch(e => document.getElementById('msg').textContent = '失败: ' + e.message);
+    .then(() => { document.getElementById('msg').textContent = '已保存并应用'; setTimeout(() => document.getElementById('msg').textContent = '', 4000); loadStatus(); })
+    .catch(e => document.getElementById('msg').textContent = '保存失败: ' + e.message);
 }
 const quick = document.getElementById('quick');
 for (const c of QUICK) {
@@ -247,4 +290,5 @@ document.getElementById('probeNow').onclick = () => j('/api/probe', {method:'POS
 document.getElementById('refreshSub').onclick = () => j('/api/refresh', {method:'POST'}).then(loadStatus);
 async function loadStatus() { try { renderStatus(await j('/api/status')) } catch {} }
 loadSettings(); loadStatus(); setInterval(loadStatus, 5000);
-</script></body></html>`
+</script></body></html>
+`
