@@ -23,8 +23,9 @@ import { FreeModelAdapter, ROUTE_MAIN } from './adapter.js'
 import { baseModelId } from './upstream.js'
 import { buildCatalog, isFreeLane } from './catalog.js'
 import { toToolDefs } from './messages.js'
+import { DEFAULT_LEVEL } from './effort.js'
 import { UpstreamError, CODE } from './errors.js'
-import { pickExit, noteSticky, exitForSession, noteRegionError, noteRegionOK } from './health.js'
+import { pickExit, noteSticky, exitForSession, noteRegionError, noteRegionOK, unavailableEverywhere } from './health.js'
 
 const RETRY_ON = new Set([CODE.region, CODE.transport, CODE.timeout, CODE.empty])
 
@@ -49,7 +50,11 @@ export function createEngine({ state, recordUsage, settingsOf, poolOf, portOf, p
 
   function modelRows() {
     const created = Math.floor(Date.now() / 1000)
-    return state().catalog.map(entry => ({ id: entry.id, object: 'model', created, owned_by: 'lite-gateway' }))
+    // 上游 issue #3：在所有已探测的存活出口上都测得地区受限的模型，不再对外列出
+    // （面板仍展示并标记，便于观察 region 矩阵恢复）。
+    return state().catalog
+      .filter(entry => !unavailableEverywhere(entry.id))
+      .map(entry => ({ id: entry.id, object: 'model', created, owned_by: 'lite-gateway' }))
   }
 
   async function complete(request, onChunk) {
@@ -85,7 +90,11 @@ export function createEngine({ state, recordUsage, settingsOf, poolOf, portOf, p
         tools: tools.length > 0 ? tools : undefined,
         ...typeof openAi.temperature === 'number' ? { temperature: openAi.temperature } : {},
         ...typeof openAi.max_tokens === 'number' ? { maxTokens: openAi.max_tokens } : {},
-        ...typeof openAi.reasoning_effort === 'string' ? { reasoningEffort: openAi.reasoning_effort } : {},
+        // 默认档来自设置（上游语义：harness 缺省 balanced），调用方可用
+        // reasoning_effort 逐请求覆盖 —— 这条车道真正生效的旋钮是它导出的预算。
+        reasoningEffort: typeof openAi.reasoning_effort === 'string' && openAi.reasoning_effort !== ''
+          ? openAi.reasoning_effort
+          : (settingsOf().effortLevel ?? DEFAULT_LEVEL),
         sessionId,
         exitAddr: picked.addr,
       }
@@ -134,6 +143,18 @@ export function createEngine({ state, recordUsage, settingsOf, poolOf, portOf, p
         outcome.toolCalls = outcome.toolCalls.filter(call => {
           try { JSON.parse(call.arguments === '' ? '{}' : call.arguments); return true } catch { return false }
         })
+      }
+      // harness usage 形状 -> OpenAI 形状：非流式响应与 /v1/responses 的 usage
+      // 都直接透传 outcome.usage，OpenAI 客户端只认 prompt_tokens/completion_tokens。
+      if (outcome.usage) {
+        const u = outcome.usage
+        outcome.usage = {
+          prompt_tokens: (u.inputTokens ?? 0) + (u.cacheReadTokens ?? 0),
+          completion_tokens: u.outputTokens ?? 0,
+          total_tokens: u.totalTokens ?? ((u.inputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.outputTokens ?? 0)),
+          prompt_tokens_details: { cached_tokens: u.cacheReadTokens ?? 0 },
+          completion_tokens_details: { reasoning_tokens: u.reasoningTokens ?? 0 },
+        }
       }
       return outcome
     }

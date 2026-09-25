@@ -17,7 +17,7 @@
 
 import http from 'node:http'
 
-export async function startPanel({ status, getSettings, applySettings, actions = {}, log = () => {}, port: desiredPort }) {
+export async function startPanel({ status, getSettings, applySettings, actions = {}, logs, log = () => {}, port: desiredPort }) {
   const server = http.createServer((req, res) => {
     void handle(req, res).catch(error => {
       log(`panel request failed: ${error?.message ?? error}`)
@@ -46,6 +46,10 @@ export async function startPanel({ status, getSettings, applySettings, actions =
     }
     if (req.method === 'GET' && path === '/api/status') {
       json(res, 200, status())
+      return
+    }
+    if (req.method === 'GET' && path === '/api/logs') {
+      json(res, 200, { lines: logs?.() ?? [] })
       return
     }
     if (req.method === 'POST' && path === '/api/probe') {
@@ -175,6 +179,19 @@ label { font-size:13.5px }
   <div class="scrollbox"><table id="nodes"><thead><tr><th>节点</th><th>国家</th><th>端口</th><th>健康</th><th>延迟</th><th>出口 IP</th><th>最后探测</th></tr></thead><tbody></tbody></table></div>
 </section>
 <section>
+  <h2>用量（全部留在本机）<span class="muted mono" id="usageToday"></span></h2>
+  <div class="scrollbox"><table id="usage"><thead><tr><th>模型</th><th>请求</th><th>输入 tok</th><th>输出 tok</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section>
+  <h2>日志（最近 400 条，排错用）</h2>
+  <div class="row" style="margin-bottom:8px">
+    <button id="logRefresh">刷新</button>
+    <button id="logCopy">复制全部</button>
+    <span class="muted" style="font-size:12.5px">完整文件在 data/gateway.log（超 5MB 自动轮转为 gateway.old.log）</span>
+  </div>
+  <div class="scrollbox"><pre id="logs" style="margin:0;padding:10px;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-all"></pre></div>
+</section>
+<section>
   <h2>设置</h2>
   <label>订阅链接（每行一个，留空用内置 freesub 源）</label>
   <textarea id="subUrls" rows="3"></textarea>
@@ -185,6 +202,14 @@ label { font-size:13.5px }
   </div>
   <div class="row" style="margin-top:12px">
     <label><input type="checkbox" id="probeEnabled"> 自动探测</label>
+    <label>默认思考强度
+      <select id="effortLevel" style="margin-left:4px">
+        <option value="light">Light 精简 (2K)</option>
+        <option value="balanced">Balanced 均衡 (24K)</option>
+        <option value="deep">Deep 深思 (模型上限)</option>
+      </select>
+    </label>
+    <label>默认输出上限 <input id="defaultMaxTokens" type="number" style="width:88px"></label>
     <label>探测并发 <input id="probeWorkers" type="number" style="width:64px"></label>
     <label>探测周期(分) <input id="probeIntervalMin" type="number" style="width:64px"></label>
     <button id="save">保存并应用</button><span id="msg"></span>
@@ -238,6 +263,7 @@ function renderStatus(s) {
     return nodes.filter(n => n.state === 'alive').length + ' / ' + nodes.length;
   })();
   const models = s.models ?? [];
+  const restricted = new Set(s.regionModels ?? []);
   document.getElementById('modelCount').textContent = models.length;
   document.getElementById('rm').textContent = (s.regionModels ?? []).length ? '受限: ' + s.regionModels.join(', ') : '';
   document.getElementById('apiBase').textContent = 'http://127.0.0.1:' + (s.forward?.port ?? 3457) + '/v1';
@@ -249,6 +275,7 @@ function renderStatus(s) {
     for (const id of models) {
       const chip = document.createElement('span'); chip.className = 'chip';
       const label = document.createElement('span'); label.textContent = id;
+      if (restricted.has(id)) { chip.style.opacity = .55; chip.title = '该模型当前所有已测健康出口均报地区受限'; }
       const btn = document.createElement('button'); btn.textContent = '复制';
       btn.onclick = () => copyText(id, btn);
       chip.append(label, btn); wrap.appendChild(chip);
@@ -263,6 +290,24 @@ function renderStatus(s) {
   for (const n of nodes) {
     tb.insertAdjacentHTML('beforeend', '<tr><td>' + esc(n.tag) + '</td><td>' + esc(n.country) + '</td><td>' + (n.port ?? '') + '</td><td class="' + n.state + '">' + n.state + '</td><td>' + (n.latencyMs >= 0 ? n.latencyMs + 'ms' : '–') + '</td><td>' + esc(n.exitIp || '') + '</td><td>' + (n.lastProbeAt ? new Date(n.lastProbeAt).toLocaleTimeString() : '–') + '</td></tr>');
   }
+  // 用量
+  const u = s.usage ?? {};
+  const today = u.today ?? { req: 0, in: 0, out: 0 };
+  document.getElementById('usageToday').textContent = '今日 ' + today.req + ' 次 / ' + today.in + ' 进 / ' + today.out + ' 出';
+  const ub = document.querySelector('#usage tbody'); ub.innerHTML = '';
+  const rows = Object.entries(u.byModel ?? {}).sort((a, b) => b[1].req - a[1].req).slice(0, 20);
+  for (const [model, m] of rows) {
+    ub.insertAdjacentHTML('beforeend', '<tr><td>' + esc(model) + '</td><td>' + m.req + '</td><td>' + m.in + '</td><td>' + m.out + '</td></tr>');
+  }
+  if (!rows.length) ub.innerHTML = '<tr><td colspan="4" class="muted">还没有请求记录</td></tr>';
+}
+async function loadLogs() {
+  try {
+    const j = await j('/api/logs');
+    document.getElementById('logs').textContent = (j.lines ?? []).map(l => new Date(l.t).toLocaleTimeString() + ' [' + l.level + '] ' + l.msg).join('\n');
+    const box = document.getElementById('logs');
+    box.scrollTop = box.scrollHeight;
+  } catch {}
 }
 async function loadSettings() {
   const s = await j('/api/settings');
@@ -271,6 +316,8 @@ async function loadSettings() {
   document.getElementById('probeEnabled').checked = s.probeEnabled !== false;
   document.getElementById('probeWorkers').value = s.probeWorkers ?? 24;
   document.getElementById('probeIntervalMin').value = s.probeIntervalMin ?? 30;
+  document.getElementById('effortLevel').value = s.effortLevel ?? 'balanced';
+  document.getElementById('defaultMaxTokens').value = s.defaultMaxTokens ?? 32768;
   document.getElementById('portBase').value = s.portBase ?? 21000;
   document.getElementById('portSpan').value = s.portSpan ?? 8000;
 }
@@ -281,6 +328,8 @@ function save() {
     probeEnabled: document.getElementById('probeEnabled').checked,
     probeWorkers: Number(document.getElementById('probeWorkers').value) || 24,
     probeIntervalMin: Number(document.getElementById('probeIntervalMin').value) || 30,
+    effortLevel: document.getElementById('effortLevel').value || 'balanced',
+    defaultMaxTokens: Number(document.getElementById('defaultMaxTokens').value) || 32768,
     portBase: Number(document.getElementById('portBase').value) || 21000,
     portSpan: Number(document.getElementById('portSpan').value) || 8000,
   };
@@ -297,7 +346,9 @@ for (const c of QUICK) {
 document.getElementById('save').onclick = save;
 document.getElementById('probeNow').onclick = () => j('/api/probe', {method:'POST'}).then(loadStatus);
 document.getElementById('refreshSub').onclick = () => j('/api/refresh', {method:'POST'}).then(loadStatus);
+document.getElementById('logRefresh').onclick = loadLogs;
+document.getElementById('logCopy').onclick = () => copyText(document.getElementById('logs').textContent || '（空）', document.getElementById('logCopy'));
 async function loadStatus() { try { renderStatus(await j('/api/status')) } catch {} }
-loadSettings(); loadStatus(); setInterval(loadStatus, 5000);
+loadSettings(); loadStatus(); loadLogs(); setInterval(loadStatus, 5000); setInterval(loadLogs, 15000);
 </script></body></html>
 `

@@ -108,8 +108,10 @@ export function mapUsage(usage) {
   const cacheWrite = number(usage.prompt_tokens_details?.cache_write_tokens)
   const reasoning = number(usage.completion_tokens_details?.reasoning_tokens ?? usage.output_tokens_details?.reasoning_tokens)
   if (prompt === undefined && completion === undefined) return undefined
+  // 上游原版在此处 `prompt - cached`：网关不带 cached_tokens 时得 NaN 并传染
+  // 整个 usage —— 本仓库加守卫（2026-09-26）。
   const out = {
-    inputTokens: Math.max(0, (prompt ?? 0) - cached),
+    inputTokens: Math.max(0, (prompt ?? 0) - (cached ?? 0)),
     outputTokens: completion ?? 0,
   }
   if (cached > 0) out.cacheReadTokens = cached

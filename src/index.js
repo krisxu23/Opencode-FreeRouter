@@ -30,14 +30,14 @@ import { assignPorts, sanitizeOutbound, buildConfig, writeConfig, startSingbox, 
 import { fetchUpstreamIds, probeModel } from './probe.js'
 import { probeAll } from './nodeprobe.js'
 import { buildCatalog } from './catalog.js'
+import { initLogger, logger } from './logger.js'
 import * as health from './health.js'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DATA = path.join(ROOT, 'data')
+initLogger(path.join(DATA, 'gateway.log'))
 
-function log(...parts) {
-  console.log(new Date().toISOString().slice(11, 19), '[gateway]', ...parts)
-}
+const log = (...parts) => logger.info(...parts)
 
 // ---- settings ---------------------------------------------------------------
 
@@ -62,9 +62,33 @@ let probeRunning = false
 let probeRerun = false
 
 const state = () => ({ catalog, membership, settings: settingsOf(), attributionUserAgent: '' })
+
+// 用量记账（README 亮点"用量看板，全部留在本机"的轻量版）：按天 + 按模型 +
+// 最近采样。stats 绝不能影响一次回答，全程 fail-soft。
+const statsStore = new JsonStore(path.join(DATA, 'stats.json'), { requests: 0, days: {}, models: {}, samples: [] })
+function recordUsage(record) {
+  try {
+    statsStore.edit(st => {
+      const day = new Date(record.at ?? Date.now()).toISOString().slice(0, 10)
+      const d = st.days[day] ??= { req: 0, in: 0, out: 0 }
+      d.req += 1
+      d.in += record.input ?? 0
+      d.out += record.output ?? 0
+      const m = st.models[record.model] ??= { req: 0, in: 0, out: 0 }
+      m.req += 1
+      m.in += record.input ?? 0
+      m.out += record.output ?? 0
+      st.requests += 1
+      st.samples.push({ t: record.at ?? Date.now(), model: record.model, ok: record.ok !== false, ttftMs: record.ttftMs ?? null, out: record.output ?? 0 })
+      if (st.samples.length > 100) st.samples.splice(0, st.samples.length - 100)
+      return st
+    })
+  } catch { /* stats must never break a turn */ }
+}
+
 const engine = createEngine({
   state,
-  recordUsage: () => {},
+  recordUsage,
   settingsOf,
   poolOf: () => pool,
   portOf: tag => ports[tag],
@@ -160,7 +184,10 @@ async function rebuild(attempt = 0) {
     proc.stderr?.on('data', chunk => {
       const line = String(chunk).trim()
       stderrTail = (stderrTail + '\n' + line).slice(-4000)
-      if (/ERROR|FATAL/.test(line)) log('sing-box:', line)
+      // 全量进日志（排错需要），级别按内容标注
+      if (/FATAL/.test(line)) logger.error('sing-box:', line)
+      else if (/ERROR/.test(line)) logger.warn('sing-box:', line)
+      else if (line) logger.info('sing-box:', line)
     })
     proc.stdout?.on('data', () => {})
     const alive = await new Promise(resolve => {
@@ -245,14 +272,14 @@ async function probeNow() {
 
 // ---- listeners ------------------------------------------------------------------
 
-async function startForwardResilient() {
+async function startForwardResilient(logForward) {
   const preferred = settingsOf().forwardPort
   try {
     return await startForwardServer({
       config: () => ({ host: '127.0.0.1', port: preferred, enabled: true, key: settingsOf().forwardKey }),
       complete: engine.complete,
       modelRows: engine.modelRows,
-      log: message => log('forward:', message),
+      log: logForward,
     })
   } catch (error) {
     log(`forward port ${preferred} unavailable (${error?.code ?? error}) — falling back to a random port`)
@@ -260,31 +287,37 @@ async function startForwardResilient() {
       config: () => ({ host: '127.0.0.1', port: 0, enabled: true, key: settingsOf().forwardKey }),
       complete: engine.complete,
       modelRows: engine.modelRows,
-      log: message => log('forward:', message),
+      log: logForward,
     })
   }
 }
 
-const forward = await startForwardResilient()
+const forward = await startForwardResilient(message => logger.warn('forward:', message))
 
 const panel = await startPanel({
   port: settingsOf().panelPort,
+  logs: () => logger.recent(400),
   getSettings: settingsOf,
   applySettings: patch => {
     settingsStore.update(patch)
     settingsStore.flush()
-    void rebuild().catch(error => log('rebuild after settings change failed:', error?.message ?? error))
+    void rebuild().catch(error => logger.error('rebuild after settings change failed:', error?.message ?? error))
     return settingsOf()
   },
-  status: () => ({
-    singbox: { running: singboxProc !== null && singboxProc.exitCode === null, pid: singboxProc?.pid ?? null, catchAllPort: settingsOf().catchAllPort },
-    forward: { running: true, port: forward.port, key: settingsOf().forwardKey },
-    models: catalog.map(entry => entry.id), // buildCatalog 只保留免费车道，付费模型不进目录
-    nodes: pool.map(node => ({ tag: node.tag, country: node.country, port: ports[node.tag], ...(health.nodeSnapshot()[node.tag] ?? { state: 'unknown', latencyMs: -1 }) })),
-    regionModels: health.regionSnapshot().models,
-  }),
+  status: () => {
+    const st = statsStore.get()
+    const today = new Date().toISOString().slice(0, 10)
+    return {
+      singbox: { running: singboxProc !== null && singboxProc.exitCode === null, pid: singboxProc?.pid ?? null, catchAllPort: settingsOf().catchAllPort },
+      forward: { running: true, port: forward.port, key: settingsOf().forwardKey },
+      models: catalog.map(entry => entry.id), // buildCatalog 只保留免费车道，付费模型不进目录
+      nodes: pool.map(node => ({ tag: node.tag, country: node.country, port: ports[node.tag], ...(health.nodeSnapshot()[node.tag] ?? { state: 'unknown', latencyMs: -1 }) })),
+      regionModels: health.regionSnapshot().models,
+      usage: { today: st.days?.[today] ?? { req: 0, in: 0, out: 0 }, requests: st.requests, byModel: st.models ?? {} },
+    }
+  },
   actions: { probeNow, refresh: rebuild },
-  log: message => log('panel:', message),
+  log: message => logger.warn('panel:', message),
 })
 
 log(`panel   : http://127.0.0.1:${panel.port}`)
@@ -301,7 +334,18 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     process.exit(0)
   })
 }
+process.on('unhandledRejection', reason => {
+  logger.error('unhandledRejection:', reason?.stack ?? reason)
+})
+process.on('uncaughtException', error => {
+  logger.error('uncaughtException:', error?.stack ?? error)
+  // 状态已不可信：落盘后退出，托盘重启即可恢复
+  try { singboxProc?.kill() } catch { /* already gone */ }
+  settingsStore.flush()
+  process.exit(1)
+})
 process.on('exit', () => {
   try { singboxProc?.kill() } catch { /* already gone */ }
   settingsStore.flush()
+  statsStore.flush()
 })

@@ -86,8 +86,29 @@ export async function postStreamed({ path, body, session, requestId, exitAddr, a
     throw classifyFailure(response.status, payload, setRetry)
   }
   if (response.body === null) throw new UpstreamError('our-free-model: upstream returned no body', CODE.empty)
-  if (!contentType.includes('event-stream')) {
-    const text = await response.text()
+
+  // 上游 issue #6：嗅探首块判形状（≥8 字节足够覆盖 `retry:` 前缀），
+  // 不信任 Content-Type，也永不 response.text()——那会把流式响应整条吃掉。
+  const reader = response.body.getReader()
+  const head = []
+  let headBytes = 0
+  while (headBytes < 8) {
+    const { value, done } = await reader.read()
+    if (done) break
+    head.push(value)
+    headBytes += value.byteLength
+  }
+  const kind = classifyHead(head.length ? Buffer.concat(head) : new Uint8Array(0), contentType)
+  if (kind === 'empty') throw new UpstreamError('our-free-model: upstream returned no body', CODE.empty)
+
+  if (kind === 'json') {
+    const rest = []
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      rest.push(value)
+    }
+    const text = Buffer.concat([...head, ...rest]).toString('utf8')
     let payload
     try { payload = JSON.parse(text) } catch { throw new UpstreamError(`our-free-model: unexpected non-SSE response: ${text.slice(0, 200)}`, CODE.server) }
     if (payload.error) throw classifyFailure(response.status, payload, setRetry)
@@ -95,22 +116,20 @@ export async function postStreamed({ path, body, session, requestId, exitAddr, a
     return { status: response.status, headers: response.headers }
   }
 
-  await readSse(response.body, onData, signal, timeoutMs)
+  await readSse(replayHead(head, reader), onData, signal, timeoutMs)
   return { status: response.status, headers: response.headers }
 }
 
-/** Split an SSE byte stream into `data:` payload strings; comment lines ignored. */
-export async function readSse(stream, onData, signal, timeoutMs = 300000) {
-  const reader = stream.getReader()
+/** Split an SSE byte stream into `data:` payload strings; comment lines ignored.
+ * Accepts any async iterable of Uint8Array chunks (a sniffed head can be
+ * replayed ahead of the live stream); `chunks.cancel?.()` on abort. */
+export async function readSse(chunks, onData, signal, timeoutMs = 300000) {
   const decoder = new TextDecoder()
   let buffer = ''
   let deadline = Date.now() + timeoutMs
-  const onAbort = () => { void reader.cancel().catch(() => {}) }
-  signal?.addEventListener('abort', onAbort, { once: true })
+  signal?.addEventListener('abort', () => { try { void chunks.cancel?.() } catch { /* not cancellable */ } }, { once: true })
   try {
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
+    for await (const value of chunks) {
       if (Date.now() > deadline) throw new UpstreamError('our-free-model: upstream stream idle past its deadline', CODE.timeout)
       if (value !== undefined) buffer += decoder.decode(value, { stream: true })
       let newline = buffer.indexOf('\n')
@@ -122,14 +141,12 @@ export async function readSse(stream, onData, signal, timeoutMs = 300000) {
       }
       deadline = Date.now() + timeoutMs
     }
+    buffer += decoder.decode()
     emit(buffer, onData)
   } catch (error) {
     if (error instanceof UpstreamError) throw error
     if (signal?.aborted) throw new UpstreamError('request aborted', CODE.aborted)
     throw new UpstreamError(`our-free-model: stream read failed: ${error?.message ?? error}`, CODE.transport)
-  } finally {
-    signal?.removeEventListener('abort', onAbort)
-    reader.releaseLock?.()
   }
 }
 
@@ -140,6 +157,27 @@ function emit(line, onData) {
     const payload = text.slice(5).trim()
     if (payload === '' || payload === '[DONE]') return
     onData(payload)
+  }
+}
+
+/** 上游 issue #6：高负载下网关会返回非 event-stream 的 Content-Type 但 SSE 形状的
+ *  响应体——仅凭 Content-Type 分支会把整条流当 JSON 误杀。按首块形状分类：
+ *  SSE 帧（data:/event:/id:/retry:/: 注释开头）走流式；`{`/`[` 走单 JSON；空为
+ *  EMPTY_RESPONSE。形状不明时回退 Content-Type 判断。永不 response.text()。 */
+function classifyHead(bytes, contentType) {
+  if (bytes.length === 0) return 'empty'
+  const head = Buffer.from(bytes).toString('latin1').slice(0, 16)
+  if (/^\s*(data:|event:|id:|retry:|:)/.test(head)) return 'sse'
+  if (/^\s*[[{]/.test(head)) return 'json'
+  return contentType.includes('event-stream') ? 'sse' : 'json'
+}
+
+async function* replayHead(head, reader) {
+  for (const chunk of head) yield chunk
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) return
+    if (value !== undefined) yield value
   }
 }
 

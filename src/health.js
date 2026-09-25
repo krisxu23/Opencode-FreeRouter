@@ -140,6 +140,20 @@ export function regionProbeCandidates(model, { max = 24 } = {}) {
   return out
 }
 
+/** 上游 issue #3：某模型在所有"已探测过"的存活出口上都测得 region-false 时，
+ *  视为当前整体不可用。没有存活节点或尚无测量 → 不下结论（返回 false）。 */
+export function unavailableEverywhere(model) {
+  if (!regionModels.has(model)) return false
+  const inner = regionNodeOK.get(model)
+  if (!inner || inner.size === 0) return false
+  const measured = []
+  for (const [nodeKey, n] of nodes) {
+    if (n.state === 'alive' && inner.has(nodeKey)) measured.push(nodeKey)
+  }
+  if (measured.length === 0) return false
+  return measured.every(k => inner.get(k) === false)
+}
+
 // ---- sticky sessions ----------------------------------------------------------
 
 export function noteSticky(session, nodeKey) {

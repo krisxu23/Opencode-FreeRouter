@@ -46,6 +46,15 @@ export class JsonStore {
     return this.value
   }
 
+  /** Mutate through a callback; used for read-modify-write on nested state. */
+  edit(mutate) {
+    if (this.disposed) return this.value
+    const next = mutate(structuredClone(this.value))
+    if (next !== undefined) this.value = next
+    this.schedule()
+    return this.value
+  }
+
   schedule(delayMs = 300) {
     if (this.disposed) return
     this.dirty = true
@@ -86,6 +95,11 @@ export const SETTINGS_INITIAL = {
   forwardPort: 3457,
   panelPort: 3458,
   catchAllPort: 20900,
+  /** Default thinking-effort tier (real max_tokens budget) when the caller
+   *  does not pass reasoning_effort. Upstream semantics: balanced. */
+  effortLevel: 'balanced',
+  /** Cap a turn's output so a slow lane cannot run away. */
+  defaultMaxTokens: 32768,
   /** Per-node local inbound range: [portBase, portBase + portSpan). Keep it
    *  below 49152 (Windows ephemeral client ports start there) and span >= the
    *  largest node count you expect — a few thousand needs span ~10000. */

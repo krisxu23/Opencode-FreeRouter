@@ -21,10 +21,16 @@
  * @module src/effort.js
  */
 
-/** Ordered for display: the array order is the picker's order. */
+/** Ordered for display: the array order is the picker's order.
+ *
+ * 上游 issue #2 的实测修订（本仓库 2026-09-26 采纳）：这条车道唯一生效的旋钮是
+ * max_tokens，且思考与正文共享它。mimo-v2.6 的思考不可关闭，8192 的 balanced
+ * 上限实测 82% 被思考占用，长回答必然以 length 截断。balanced 上调到 24576，
+ * 给正文留出 ≥1/3；light 保持 2048（精简是显式选择）；deep 仍是模型全上限。
+ */
 export const LEVELS = [
   { id: 'light', name: 'Light', zh: '精简', ceiling: 2048, description: 'A 2K ceiling shared by thinking and the answer: terse deliberation.' },
-  { id: 'balanced', name: 'Balanced', zh: '均衡', ceiling: 8192, description: 'An 8K ceiling, enough to reason through a normal turn.' },
+  { id: 'balanced', name: 'Balanced', zh: '均衡', ceiling: 24576, description: 'A 24K ceiling — headroom for models whose thinking cannot be turned off (measured: 8K was 82% eaten by reasoning).' },
   { id: 'deep', name: 'Deep', zh: '深思', ceiling: undefined, description: 'The model full output capacity, with extended deliberation.' },
 ]
 

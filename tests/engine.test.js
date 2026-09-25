@@ -55,7 +55,7 @@ function engineWithPicker(picker) {
 
 test('effort budgets: enforced max_tokens ceilings', () => {
   assert.equal(budgetFor('light', entry, undefined, 32768), 2048)
-  assert.equal(budgetFor('balanced', entry, undefined, 32768), 8192)
+  assert.equal(budgetFor('balanced', entry, undefined, 32768), 24576) // 上游 issue #2: 8192 会被不可关闭的思考吃掉 82%
   assert.equal(budgetFor('deep', entry, undefined, 32768), 32768)
   assert.deepEqual(LEVELS.map(l => l.id), ['light', 'balanced', 'deep'])
 })
@@ -71,9 +71,10 @@ test('complete streams text and usage through the adapter chain', async () => {
   assert.equal(outcome.text, 'hello world')
   assert.deepEqual(deltas, ['hello ', 'world'])
   assert.ok(calls >= 2)
-  assert.equal(outcome.usage.outputTokens, 2)
+  assert.equal(outcome.usage.completion_tokens, 2) // OpenAI 形状
+  assert.equal(outcome.usage.prompt_tokens, 10)
   assert.equal(fakeRequests.at(-1).body.messages.at(-1).content, 'hi')
-  assert.equal(fakeRequests.at(-1).body.max_tokens, 32768) // no effort requested -> default ceiling
+  assert.equal(fakeRequests.at(-1).body.max_tokens, 24576) // 默认 balanced 档预算
 })
 
 test('pre-content region failure retries once on the next exit, same session', async () => {
@@ -96,4 +97,13 @@ test('unknown model is refused without dialing', async () => {
     engine.complete({ model: 'gpt-99-turbo', openAi: { messages: [] } }, () => {}),
     error => error.code === CODE.server,
   )
+})
+
+test('modelRows filters models measured region-blocked on every alive exit (issue #3)', async () => {
+  const { markProbe, noteRegionError } = await import('../src/health.js')
+  markProbe('node-a', { state: 'alive', latencyMs: 100 })
+  noteRegionError('mimo-v2.6-flash-free', 'node-a')
+  const engine = engineWithPicker(() => null)
+  const ids = engine.modelRows().map(r => r.id)
+  assert.ok(!ids.includes('mimo-v2.6-flash-free'), '受限模型不应出现在 /v1/models')
 })
