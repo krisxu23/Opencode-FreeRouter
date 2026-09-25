@@ -1,0 +1,162 @@
+/**
+ * Outbound HTTP for the free lane: request posting, SSE line extraction, with
+ * every call routed through a caller-chosen exit address.
+ *
+ * The one deliberate departure from upstream: `postStreamed`/`getJson` take an
+ * `exitAddr` (`http://127.0.0.1:<port>` of a per-node sing-box inbound, or
+ * `'direct'`) and dial through it via an undici ProxyAgent. Upstream traffic
+ * never leaves through the OS default route unless the caller explicitly asks
+ * for `'direct'`.
+ *
+ * @module src/http.js
+ */
+
+import { ProxyAgent } from 'undici'
+import { CLIENT_UA, UPSTREAM_BASE, gatewayHeaders, truncateSession } from './upstream.js'
+import { CODE, UpstreamError, classifyFailure, retryAfter } from './errors.js'
+
+export { CODE, UpstreamError, classifyFailure }
+
+/**
+ * Proxy dispatchers, one per exit address, cached for the process lifetime.
+ * `'direct'`/absent maps to `undefined` — plain fetch, no dispatcher.
+ */
+const dispatchers = new Map()
+export function dispatcherFor(addr) {
+  if (!addr || addr === 'direct') return undefined
+  let agent = dispatchers.get(addr)
+  if (agent === undefined) {
+    agent = new ProxyAgent(addr)
+    dispatchers.set(addr, agent)
+  }
+  return agent
+}
+
+/**
+ * Compose the request User-Agent.
+ *
+ * Two independent requirements meet in one header: the harness mandates an
+ * attribution User-Agent on every provider request, and the gateway identifies a
+ * desktop client by an `opencode/<version>` token (>= 1.17). The gateway tests
+ * with a search rather than an anchored match, so one value can satisfy both —
+ * verified live against this lane.
+ */
+function userAgentWith(attribution) {
+  if (typeof attribution !== 'string' || attribution === '') return CLIENT_UA
+  return attribution.includes('opencode/') ? attribution : `${attribution} ${CLIENT_UA}`
+}
+
+/**
+ * POST one request and stream back decoded SSE `data:` payloads.
+ *
+ * @param {object} options
+ * @param {string} options.path - gateway path
+ * @param {object} options.body - JSON request body
+ * @param {string} options.session - canonical upstream session id
+ * @param {string} options.requestId - per-turn request id
+ * @param {string} [options.exitAddr] - local proxy exit (`http://127.0.0.1:<port>` | 'direct')
+ * @param {string} [options.attributionUserAgent] - harness User-Agent merged into the request
+ * @param {AbortSignal} [options.signal]
+ * @param {(payload: string) => void} options.onData - one `data:` payload, in order
+ * @returns {Promise<{status:number, headers:Headers}>}
+ */
+export async function postStreamed({ path, body, session, requestId, exitAddr, attributionUserAgent, signal, onData, timeoutMs = 300000 }) {
+  const headers = gatewayHeaders({ session: truncateSession(session), requestId, stream: true })
+  headers['user-agent'] = userAgentWith(attributionUserAgent)
+  let response
+  try {
+    response = await fetch(`${UPSTREAM_BASE}${path}`, { method: 'POST', headers, body: JSON.stringify(body), redirect: 'error', signal, dispatcher: dispatcherFor(exitAddr) })
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new UpstreamError('request aborted', CODE.aborted)
+    throw new UpstreamError(`our-free-model: upstream request failed: ${error?.message ?? error}`, CODE.transport)
+  }
+
+  const setRetry = retryAfter(response.headers.get('retry-after'))
+  const contentType = String(response.headers.get('content-type') ?? '')
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    let payload
+    try { payload = JSON.parse(text) } catch { payload = { error: { message: text.slice(0, 300) || `HTTP ${response.status}` } } }
+    throw classifyFailure(response.status, payload, setRetry)
+  }
+  if (response.body === null) throw new UpstreamError('our-free-model: upstream returned no body', CODE.empty)
+  if (!contentType.includes('event-stream')) {
+    const text = await response.text()
+    let payload
+    try { payload = JSON.parse(text) } catch { throw new UpstreamError(`our-free-model: unexpected non-SSE response: ${text.slice(0, 200)}`, CODE.server) }
+    if (payload.error) throw classifyFailure(response.status, payload, setRetry)
+    onData(JSON.stringify(payload))
+    return { status: response.status, headers: response.headers }
+  }
+
+  await readSse(response.body, onData, signal, timeoutMs)
+  return { status: response.status, headers: response.headers }
+}
+
+/** Split an SSE byte stream into `data:` payload strings; comment lines ignored. */
+export async function readSse(stream, onData, signal, timeoutMs = 300000) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let deadline = Date.now() + timeoutMs
+  const onAbort = () => { void reader.cancel().catch(() => {}) }
+  signal?.addEventListener('abort', onAbort, { once: true })
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (Date.now() > deadline) throw new UpstreamError('our-free-model: upstream stream idle past its deadline', CODE.timeout)
+      if (value !== undefined) buffer += decoder.decode(value, { stream: true })
+      let newline = buffer.indexOf('\n')
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        emit(line, onData)
+        newline = buffer.indexOf('\n')
+      }
+      deadline = Date.now() + timeoutMs
+    }
+    emit(buffer, onData)
+  } catch (error) {
+    if (error instanceof UpstreamError) throw error
+    if (signal?.aborted) throw new UpstreamError('request aborted', CODE.aborted)
+    throw new UpstreamError(`our-free-model: stream read failed: ${error?.message ?? error}`, CODE.transport)
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+    reader.releaseLock?.()
+  }
+}
+
+function emit(line, onData) {
+  const text = line.trim()
+  if (text === '' || text.startsWith(':')) return
+  if (text.startsWith('data:')) {
+    const payload = text.slice(5).trim()
+    if (payload === '' || payload === '[DONE]') return
+    onData(payload)
+  }
+}
+
+/** Fetch a small JSON document from the gateway with the fingerprint headers. */
+export async function getJson(path, { session, requestId, exitAddr, attributionUserAgent, signal, timeoutMs = 15000 } = {}) {
+  const headers = gatewayHeaders({ session: truncateSession(session ?? ''), requestId: requestId ?? '', stream: false, accept: 'application/json' })
+  headers['user-agent'] = userAgentWith(attributionUserAgent)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  timer.unref?.()
+  signal?.addEventListener('abort', () => controller.abort(), { once: true })
+  try {
+    const response = await fetch(`${UPSTREAM_BASE}${path}`, { headers, redirect: 'error', signal: controller.signal, dispatcher: dispatcherFor(exitAddr) })
+    const text = await response.text()
+    let payload
+    try { payload = JSON.parse(text) } catch { payload = { error: { message: text.slice(0, 200) } } }
+    if (!response.ok) throw classifyFailure(response.status, payload)
+    return payload
+  } catch (error) {
+    if (error instanceof UpstreamError) throw error
+    if (error?.name === 'AbortError') throw new UpstreamError('our-free-model: upstream GET timed out', CODE.timeout)
+    throw new UpstreamError(`our-free-model: upstream GET failed: ${error?.message ?? error}`, CODE.transport)
+  } finally {
+    clearTimeout(timer)
+  }
+}
