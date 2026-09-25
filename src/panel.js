@@ -2,10 +2,13 @@
  * Admin panel: a single-page settings + status console served on 127.0.0.1.
  *
  * Endpoints (all local-only):
- *   GET  /              single-page console
+ *   GET  /              single-page console (dark/light theme, copyable API
+ *                       credentials, free-model list with copy ids, scrollable
+ *                       node table)
  *   GET  /api/settings  current settings
  *   PUT  /api/settings  merge a patch, persist, apply (rebuild callback)
- *   GET  /api/status    sing-box state, node health table, region matrix
+ *   GET  /api/status    sing-box state, node health table, region matrix,
+ *                       free-model catalog, forward endpoint + key
  *   POST /api/probe     run one probe round now
  *   POST /api/refresh   refetch subscriptions and rebuild
  *
@@ -93,57 +96,126 @@ async function readJson(req) {
 
 const PAGE = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Lite Gateway 控制台</title>
+<title>Opencode-FreeRouter 控制台</title>
 <style>
-:root { color-scheme: dark }
-body { font-family: "Segoe UI", system-ui, sans-serif; background:#11151c; color:#dbe2ee; margin:0 auto; max-width:980px; padding:16px }
-h1 { font-size:20px } h2 { font-size:15px; margin:18px 0 8px; color:#8ab4ff }
+body.dark { --bg:#11151c; --fg:#dbe2ee; --muted:#7d8899; --box:#151b26; --border:#232b38; --accent:#8ab4ff; --code:#0e1420; --hbg:#1a2230; }
+body.light { --bg:#f4f6fa; --fg:#1c2733; --muted:#5d6b7c; --box:#ffffff; --border:#dde4ee; --accent:#1b62d0; --code:#eef2f8; --hbg:#e7edf6; }
+body { font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--fg); margin:0 auto; max-width:980px; padding:16px }
+h1 { font-size:20px; margin:0 } h2 { font-size:14px; margin:14px 0 8px; color:var(--accent) }
+header.row { margin-bottom:12px }
 table { border-collapse:collapse; width:100%; font-size:12.5px }
-th,td { text-align:left; padding:4px 8px; border-bottom:1px solid #232b38 }
-th { color:#7d8899; font-weight:600 }
-.alive{color:#5bd08a}.dead{color:#ff6b6b}.unknown{color:#c9a227}
-input,textarea,button,select { background:#1a2230; color:#dbe2ee; border:1px solid #2c3850; border-radius:6px; padding:6px 8px; font:inherit }
+th,td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border) }
+th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--box) }
+.alive{color:#3fae74}.dead{color:#e05252}.unknown{color:#b98a12}
+body.light .alive{color:#1d7a4c} body.light .dead{color:#c22f2f} body.light .unknown{color:#9a730b}
+input,textarea,button,code { font:inherit }
+input,textarea,button { background:var(--hbg); color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:6px 8px }
 textarea { width:100%; box-sizing:border-box }
-button { cursor:pointer } button:hover { background:#24304a }
-#quick button { margin:2px; padding:2px 8px; font-size:12px }
+button { cursor:pointer } button:hover { filter:brightness(1.15) }
 .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap }
-#msg { color:#5bd08a; margin-left:8px }
-.box { background:#151b26; border:1px solid #232b38; border-radius:8px; padding:12px; margin:8px 0 }
-</style></head><body>
-<h1>Lite Gateway 控制台</h1>
-<div class="box"><b>sing-box:</b> <span id="sb">…</span> <b>网关:</b> <span id="fwd">…</span>
- <b>受限模型:</b> <span id="rm">…</span></div>
-<div class="box"><table id="nodes"><thead><tr><th>节点</th><th>国家</th><th>端口</th><th>健康</th><th>延迟</th><th>出口IP</th><th>最后探测</th></tr></thead><tbody></tbody></table></div>
+.box { background:var(--box); border:1px solid var(--border); border-radius:8px; padding:12px; margin:10px 0 }
+code { background:var(--code); border:1px solid var(--border); border-radius:4px; padding:2px 6px; font-family:Consolas,monospace; font-size:12.5px; word-break:break-all }
+.scrollbox { max-height:240px; overflow-y:auto; border:1px solid var(--border); border-radius:6px }
+.chip { display:inline-flex; align-items:center; gap:6px; margin:3px; padding:3px 4px 3px 10px; border:1px solid var(--border); border-radius:14px; background:var(--hbg); font-family:Consolas,monospace; font-size:12px }
+.chip button { padding:1px 8px; font-size:11px; border-radius:10px }
+.kv { margin:6px 0 }
+#msg { color:var(--accent); margin-left:8px }
+</style></head><body class="dark">
+<header class="row">
+  <h1>Opencode-FreeRouter</h1><span style="flex:1"></span>
+  <button id="themeBtn"></button>
+</header>
 <div class="box">
- <h2>设置</h2>
- <label>订阅链接（每行一个，留空用内置 freesub 源）</label>
- <textarea id="subUrls" rows="3"></textarea>
- <label>出口国家（按回退顺序，逗号分隔）</label>
- <div id="quick"></div>
- <input id="countries" style="width:240px" placeholder="US,SG,JP">
- <div class="row" style="margin-top:8px">
-   <label><input type="checkbox" id="probeEnabled"> 自动探测</label>
-   <label>探测并发 <input id="probeWorkers" type="number" style="width:64px"></label>
-   <label>探测周期(分) <input id="probeIntervalMin" type="number" style="width:64px"></label>
-   <button id="save">保存并应用</button><span id="msg"></span>
- </div>
+  <b>sing-box:</b> <span id="sb">…</span> &nbsp; <b>网关:</b> <span id="fwd">…</span> &nbsp;
+  <b>受限模型:</b> <span id="rm">…</span>
 </div>
 <div class="box">
- <button id="probeNow">立即探测</button> <button id="refreshSub">刷新订阅并重建</button>
+  <h2>接入信息（填到 agent 工具的 API 配置里）</h2>
+  <div class="kv">API 地址：<code id="apiBase">…</code> <button class="copy" data-for="apiBase">复制</button></div>
+  <div class="kv">API Key：<code id="apiKey">…</code> <button class="copy" data-for="apiKey">复制</button></div>
+</div>
+<div class="box">
+  <h2>免费模型（付费模型不展示；点"复制"拿模型 id）</h2>
+  <div id="models"><span style="color:var(--muted)">加载中…</span></div>
+</div>
+<div class="box">
+  <h2>节点健康 <span id="nodeCount" style="color:var(--muted);font-weight:400"></span></h2>
+  <div class="scrollbox"><table id="nodes"><thead><tr><th>节点</th><th>国家</th><th>端口</th><th>健康</th><th>延迟</th><th>出口IP</th><th>最后探测</th></tr></thead><tbody></tbody></table></div>
+</div>
+<div class="box">
+  <h2>设置</h2>
+  <label>订阅链接（每行一个，留空用内置 freesub 源）</label>
+  <textarea id="subUrls" rows="3"></textarea>
+  <label>出口国家（按回退顺序，点击按钮加入/移出）</label>
+  <div id="quick"></div>
+  <input id="countries" style="width:240px" placeholder="US,SG,JP">
+  <div class="row" style="margin-top:8px">
+    <label><input type="checkbox" id="probeEnabled"> 自动探测</label>
+    <label>探测并发 <input id="probeWorkers" type="number" style="width:64px"></label>
+    <label>探测周期(分) <input id="probeIntervalMin" type="number" style="width:64px"></label>
+    <button id="save">保存并应用</button><span id="msg"></span>
+  </div>
+</div>
+<div class="box">
+  <button id="probeNow">立即探测</button> <button id="refreshSub">刷新订阅并重建</button>
 </div>
 <script>
 const QUICK = ['US','SG','JP','TW','HK','NL','DE','GB','KR','TR'];
+const body = document.body, themeBtn = document.getElementById('themeBtn');
+function applyTheme(t) {
+  body.className = t;
+  themeBtn.textContent = t === 'dark' ? '☀️ 浅色' : '🌙 深色';
+  localStorage.setItem('ofr-theme', t);
+}
+themeBtn.onclick = () => applyTheme(body.className === 'dark' ? 'light' : 'dark');
+applyTheme(localStorage.getItem('ofr-theme') || 'dark');
+
 async function j(url, opt) { const r = await fetch(url, opt); if (!r.ok) throw new Error(await r.text()); return r.json() }
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])) }
+async function copyText(text, btn) {
+  try { await navigator.clipboard.writeText(text) }
+  catch {
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
+  }
+  const old = btn.textContent; btn.textContent = '已复制 ✓';
+  setTimeout(() => btn.textContent = old, 1500);
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('.copy'); if (!b) return;
+  copyText(document.getElementById(b.dataset.for).textContent, b);
+});
+
 function renderStatus(s) {
   document.getElementById('sb').textContent = s.singbox?.running ? '运行中 (pid ' + s.singbox.pid + ')' : '未运行';
   document.getElementById('fwd').textContent = s.forward?.running ? '监听 ' + s.forward.port : '未监听';
   document.getElementById('rm').textContent = (s.regionModels ?? []).join(', ') || '（暂无）';
+  document.getElementById('apiBase').textContent = 'http://127.0.0.1:' + (s.forward?.port ?? 3457) + '/v1';
+  document.getElementById('apiKey').textContent = s.forward?.key ?? '';
+  const models = s.models ?? [];
+  const wrap = document.getElementById('models');
+  if (!models.length) { wrap.innerHTML = '<span style="color:var(--muted)">暂无（等探测/目录刷新后出现）</span>'; }
+  else {
+    wrap.innerHTML = '';
+    for (const id of models) {
+      const chip = document.createElement('span'); chip.className = 'chip';
+      const label = document.createElement('span'); label.textContent = id;
+      const btn = document.createElement('button'); btn.textContent = '复制';
+      btn.onclick = () => copyText(id, btn);
+      chip.append(label, btn); wrap.appendChild(chip);
+    }
+    const all = document.createElement('button'); all.style.margin = '6px 3px'; all.textContent = '复制全部模型 id';
+    all.onclick = () => copyText(models.join('\\n'), all);
+    wrap.appendChild(all);
+  }
+  const nodes = s.nodes ?? [];
+  document.getElementById('nodeCount').textContent = '(' + nodes.filter(n => n.state === 'alive').length + '/' + nodes.length + ' alive)';
   const tb = document.querySelector('#nodes tbody'); tb.innerHTML = '';
-  for (const n of s.nodes ?? []) {
+  for (const n of nodes) {
     tb.insertAdjacentHTML('beforeend', '<tr><td>' + esc(n.tag) + '</td><td>' + esc(n.country) + '</td><td>' + (n.port ?? '') + '</td><td class="' + n.state + '">' + n.state + '</td><td>' + (n.latencyMs >= 0 ? n.latencyMs + 'ms' : '-') + '</td><td>' + esc(n.exitIp || '') + '</td><td>' + (n.lastProbeAt ? new Date(n.lastProbeAt).toLocaleTimeString() : '-') + '</td></tr>');
   }
 }
-function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])) }
 async function loadSettings() {
   const s = await j('/api/settings');
   document.getElementById('subUrls').value = (s.subUrls ?? []).join('\\n');

@@ -229,7 +229,8 @@ const panel = await startPanel({
   },
   status: () => ({
     singbox: { running: singboxProc !== null && singboxProc.exitCode === null, pid: singboxProc?.pid ?? null, catchAllPort: settingsOf().catchAllPort },
-    forward: { running: true, port: forward.port },
+    forward: { running: true, port: forward.port, key: settingsOf().forwardKey },
+    models: catalog.map(entry => entry.id), // buildCatalog 只保留免费车道，付费模型不进目录
     nodes: pool.map(node => ({ tag: node.tag, country: node.country, port: ports[node.tag], ...(health.nodeSnapshot()[node.tag] ?? { state: 'unknown', latencyMs: -1 }) })),
     regionModels: health.regionSnapshot().models,
   }),

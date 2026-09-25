@@ -1,10 +1,12 @@
 {
-  "name": "lite-gateway",
+  "name": "opencode-freerouter",
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Lite gateway: OpenAI-compatible forward to opencode.ai free lane via per-node sing-box exits",
-  "engines": { "node": "^22.19.0 || >=24.0.0" },
+  "description": "Opencode-FreeRouter: OpenAI-compatible forward to opencode.ai free lane via per-node sing-box exits",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test",

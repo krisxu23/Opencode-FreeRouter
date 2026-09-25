@@ -86,8 +86,8 @@ func main() {
 
 func onReady() {
 	systray.SetIcon(iconBytes)
-	systray.SetTitle("Lite Gateway")
-	systray.SetTooltip("Lite Gateway — opencode.ai 免费车道网关")
+	systray.SetTitle("Opencode-FreeRouter")
+	systray.SetTooltip("Opencode-FreeRouter — opencode.ai 免费车道网关")
 
 	mOpen := systray.AddMenuItem("打开面板", "打开网关设置与状态面板")
 	mRestart := systray.AddMenuItem("重启网关", "重启 node 网关（连带 sing-box）")

@@ -26,7 +26,7 @@ test('settings roundtrip and status/actions wiring', async () => {
 
     const page = await fetch(base)
     assert.equal(page.status, 200)
-    assert.match(await page.text(), /Lite Gateway/)
+    assert.match(await page.text(), /Opencode-FreeRouter/)
 
     const initial = await (await fetch(`${base}/api/settings`)).json()
     assert.deepEqual(initial.countries, SETTINGS_INITIAL.countries)

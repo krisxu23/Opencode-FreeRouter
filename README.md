@@ -1,4 +1,4 @@
-# Lite Gateway（opencode-FreeRouter）
+# Opencode-FreeRouter
 
 把 [dsh-our-free-model](https://github.com/zouyuxuan122/dsh-our-free-model) 的免密网关逻辑移植成独立 Windows 桌面程序，
 并缝合一台 [sing-box](https://github.com/SagerNet/sing-box) 边车接管全部出站：订阅节点 → 逐节点两级实测 →
@@ -6,11 +6,11 @@
 
 ## 快速开始
 
-1. 双击 `lite-gateway.exe`（托盘出现蓝色图标）
-2. 托盘菜单 → **打开面板**（`http://127.0.0.1:3458`）
-3. 面板里：勾选出口国家（按回退顺序，点国家按钮可加入/移出）→ **保存并应用**
-4. 等首轮探测跑完（约 1 分钟，面板节点表出现 alive/dead 标记）
-5. 把 agent 工具的 API 配置指向网关：
+1. 双击 `Opencode-FreeRouter.exe`（托盘出现图标）
+2. 托盘菜单 → **打开面板**（`http://127.0.0.1:3458`，右上角可切深色/浅色）
+3. 面板 **接入信息** 区：一键复制 API 地址与 Key
+4. 面板里：勾选出口国家（点国家按钮加入/移出，按回退顺序）→ **保存并应用**
+5. 等首轮探测跑完（约 1 分钟，节点表出现 alive/dead 标记；免费模型目录在"免费模型"区，可一键复制模型 id）
 
 ```
 baseURL: http://127.0.0.1:3457/v1
@@ -42,11 +42,11 @@ npm install            # 唯一第三方依赖 undici
 npm test               # node:test 全量
 npm run fetch-singbox  # 下载 sing-box v1.14.0 内核到 bin/
 node src/index.js      # 前台跑网关（托盘 exe 的等价物）
-cd launcher && go build -ldflags="-s -w -H=windowsgui" -o ../lite-gateway.exe .   # 构建托盘 exe
+cd launcher && go build -ldflags="-s -w -H=windowsgui" -o ../Opencode-FreeRouter.exe .   # 图标资源 launcher/rsrc_windows_amd64.syso 自动链接   # 构建托盘 exe
 ```
 
 目录：`src/` 网关（upstream/http/catalog/forward 等照抄上游 1:1，singbox/health/engine/panel/nodeprobe 为新增）；
-`launcher/` Go 托盘壳；`data/` 运行时状态（settings/subs_cache/node-health/singbox.json/gateway.log，不入 git）；
+`launcher/` Go 托盘壳（含 exe 图标资源）；`data/` 运行时状态（settings/subs_cache/node-health/singbox.json/gateway.log，不入 git）；
 `bin/` sing-box 内核（不入 git）；`runtime/node.exe` 可选自带 node（不入 git，没有则用 PATH）。
 
 ## 上游与许可
