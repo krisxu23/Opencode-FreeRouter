@@ -7,7 +7,7 @@
   "engines": { "node": "^22.19.0 || >=24.0.0" },
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test tests/",
+    "test": "node --test",
     "fetch-singbox": "node scripts/fetch-singbox.mjs"
   },
   "dependencies": {
