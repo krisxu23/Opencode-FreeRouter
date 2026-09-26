@@ -206,12 +206,16 @@ export function waitPortFree(port, timeoutMs = 3000) {
 
 /**
  * Watchdog: every interval, check the process is alive and the catch-all port
- * still accepts. `onDead` fires when the process is gone; the caller decides
- * the restart policy (bounded retries live in index.js).
+ * still accepts. `onDead` fires ONCE (timer self-clears) — a leaking timer kept
+ * firing on the dead proc forever and caused a rebuild storm (measured).
  */
 export function watchSingbox(proc, port, onDead, { intervalMs = 30000 } = {}) {
+  let dead = false
   const timer = setInterval(() => {
+    if (dead) return
     if (proc.exitCode !== null || !proc.pid) {
+      dead = true
+      clearInterval(timer)
       onDead()
       return
     }
@@ -219,7 +223,11 @@ export function watchSingbox(proc, port, onDead, { intervalMs = 30000 } = {}) {
     sock.once('connect', () => sock.destroy())
     sock.once('error', () => {
       sock.destroy()
-      if (proc.exitCode !== null || !proc.pid) onDead()
+      if (!dead && (proc.exitCode !== null || !proc.pid)) {
+        dead = true
+        clearInterval(timer)
+        onDead()
+      }
     })
   }, intervalMs)
   timer.unref?.()

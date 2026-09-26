@@ -1,6 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { assignPorts, sanitizeOutbound, buildConfig, CATCHALL_TAG } from '../src/singbox.js'
+import { assignPorts, sanitizeOutbound, buildConfig, watchSingbox, CATCHALL_TAG } from '../src/singbox.js'
+
+test('watchdog: onDead fires exactly once for a dead proc (timer leak regression)', async () => {
+  let calls = 0
+  const timer = watchSingbox({ exitCode: 1, pid: 123 }, 20999, () => { calls += 1 }, { intervalMs: 20 })
+  await new Promise(r => setTimeout(r, 80)) // 4 个周期：老实现会触发 4 次
+  clearInterval(timer)
+  assert.equal(calls, 1)
+})
 
 test('ports: existing keys keep their port, vanished keys are pruned', () => {
   const a = { tag: 'a' }

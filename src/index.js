@@ -65,8 +65,9 @@ let membership = { 'our-free-model': [] }
 let pool = []           // [{tag, country}] — nodes of the current instance
 let ports = {}          // tag -> local inbound port
 let singboxProc = null
+let watchdogTimer = null
 let rebuilding = false
-let rebuildAgain = false
+let rebuildAgain = null
 let probeRunning = false
 let probeRerun = false
 
@@ -135,7 +136,7 @@ async function refreshCatalog(attempt = 0) {
 const portBlacklist = new Set() // ports that made sing-box FATAL (bind conflict); never reused this session
 
 async function rebuild(attempt = 0) {
-  if (rebuilding) { rebuildAgain = true; return }
+  if (rebuilding) { rebuildAgain = Math.max(rebuildAgain ?? 0, attempt); return }
   rebuilding = true
   try {
     const s = settingsOf()
@@ -178,6 +179,12 @@ async function rebuild(attempt = 0) {
       log('no node fits the port range — enlarge 端口段容量 in the panel')
       return
     }
+    // 订阅源抖动保护：部分源 fetch failed 时会得到一个远小于在服规模的残缺集，
+    // 直接换装会让出口池反复横跳（实测 1240 → 145 → 1044 振荡）——保旧。
+    if (singboxProc !== null && pool.length > 0 && ported.length < pool.length * 0.5) {
+      log()
+      return
+    }
     pool = ported.map(o => ({ tag: o.tag, country: countryOf(o.tag) }))
     const configPath = path.join(DATA, 'singbox.json')
     writeConfig(configPath, buildConfig(ported, ports, { catchAllPort: s.catchAllPort }))
@@ -218,6 +225,7 @@ async function rebuild(attempt = 0) {
       return
     }
     const previous0 = singboxProc
+    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null }
     previous0?.kill()
     await waitPortFree(s.catchAllPort, 3000).catch(() => {})
     const proc = startSingbox(path.join(ROOT, 'bin', 'sing-box.exe'), configPath)
@@ -230,7 +238,7 @@ async function rebuild(attempt = 0) {
       const line = String(chunk).trim()
       stderrTail = (stderrTail + '\n' + line).slice(-4000)
       if (/FATAL/.test(line)) logger.error('sing-box:', line)
-      else if (/connection: open connection/.test(line)) {
+      else if (/connection: open connection|connection download closed|unknown version/.test(line)) {
         dialFailures += 1
         if (Date.now() - lastDialSummary >= 30000) {
           logger.info(`sing-box: 拨号失败 ${dialFailures} 次（多为探测死节点，属正常噪音）`)
@@ -262,14 +270,17 @@ async function rebuild(attempt = 0) {
         portBlacklist.add(port)
         if (tag) delete ports[tag]
         log(`端口 ${port} 被外部占用（${tag ? '节点 ' + tag.slice(0, 30) : '未知'}），已拉黑并换端口重试`)
-        return void rebuild(attempt + 1)
+        rebuildAgain = attempt + 1; return
       }
       log('新实例启动失败且无法自愈 — 网关空闲；可在面板点"刷新订阅并重建"重试')
       return
     }
     singboxProc = proc
     await waitPort(s.catchAllPort, 15000).catch(() => log('catch-all port not accepting yet — watchdog will re-check'))
-    watchSingbox(proc, s.catchAllPort, () => {
+    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null }
+    watchdogTimer = watchSingbox(proc, s.catchAllPort, () => {
+      if (singboxProc !== proc) return // 陈旧看门狗：实例已被换装，忽略
+      logger.error('sing-box exited (code ' + proc.exitCode + ', signal ' + (proc.signalCode ?? 'null') + ') stderr: ' + stderrTail.slice(-200))
       log('sing-box died — rebuilding in 5s')
       setTimeout(() => void rebuild().catch(() => {}), 5000)
     })
@@ -281,7 +292,7 @@ async function rebuild(attempt = 0) {
     setTimeout(() => void probeNow(), 3000) // 首探提前：让面板的"–"尽快变成实测结果
   } finally {
     rebuilding = false
-    if (rebuildAgain) { rebuildAgain = false; void rebuild().catch(() => {}) }
+    if (rebuildAgain !== null) { const a = rebuildAgain; rebuildAgain = null; void rebuild(a).catch(() => {}) }
   }
 }
 
