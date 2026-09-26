@@ -289,18 +289,21 @@ async function rebuild(attempt = 0) {
       if (bindPort && attempt < 3) {
         const pid = pidHoldingPort(bindPort)
         const image = pid ? pidImageName(pid) : ''
-        if (image === 'sing-box.exe') {
-          // 只清我们亲自拉起过的（PID 台账在案）；用户自己的 sing-box 客户端一律不碰
-          if (!isOurPid(pid)) {
-            log(`端口  被独立的 sing-box 客户端占用 — 未动它，已为本节点换端口`)
-            portBlacklist.add(bindPort)
-            const t2 = Object.keys(ports).find(k => ports[k] === bindPort)
-            if (t2) delete ports[t2] // 保留节点，下轮重建自动换新端口
-            rebuildAgain = attempt + 1; return
-          }
-          // 上次异常退出残留的孤儿 sing-box —— 清掉后原端口即可用，无需拉黑
+        // 端口段归属判定：sing-box.exe + 端口在本程序专用段（兜底口 ~ 端口段末尾）
+        // = 本程序历次异常退出叠加的孤儿，直接清理；段外的 sing-box 可能是用户
+        // 自己的客户端，不碰。
+        const rangeStart = Math.min(s.catchAllPort, s.portBase)
+        const inOurRange = bindPort >= rangeStart && bindPort <= s.portBase + s.portSpan
+        if (image === 'sing-box.exe' && inOurRange) {
           killPid(pid)
-          log(`清掉残留 sing-box 孤儿进程 (pid ${pid}，占用端口 ${bindPort})，换装重试`)
+          log(`清掉残留孤儿 sing-box (pid ${pid}，端口 ${bindPort} 在本程序专用段内)，换装重试`)
+          rebuildAgain = attempt + 1; return
+        }
+        if (image === 'sing-box.exe') {
+          log(`端口 ${bindPort} 被独立的 sing-box 进程占用（不属于本程序端口段）— 未动它，已为本节点换端口`)
+          portBlacklist.add(bindPort)
+          const t2 = Object.keys(ports).find(k => ports[k] === bindPort)
+          if (t2) delete ports[t2]
           rebuildAgain = attempt + 1; return
         }
         const tag = Object.keys(ports).find(k => ports[k] === bindPort)

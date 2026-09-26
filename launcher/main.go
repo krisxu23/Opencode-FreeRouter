@@ -12,15 +12,46 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"unsafe"
 
 	"fyne.io/systray"
+	"golang.org/x/sys/windows"
 )
 
 //go:embed icon.ico
 var iconBytes []byte
 
+var jobHandle windows.Handle
+
 type gateway struct {
 	cmd *exec.Cmd
+}
+
+// createKillOnCloseJob 作业对象：句柄关闭（本程序退出/崩溃/被杀）时，
+// 内所有成员（node 及其子进程 sing-box）一并终止 —— 孤儿从源头杜绝。
+func createKillOnCloseJob() windows.Handle {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil || job == 0 {
+		return 0
+	}
+	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+		return 0
+	}
+	return job
+}
+
+func assignToJob(job windows.Handle, pid int) {
+	if job == 0 {
+		return
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(h)
+	_ = windows.AssignProcessToJobObject(job, h)
 }
 
 func exeDir() string {
@@ -74,6 +105,8 @@ func (g *gateway) start() error {
 		return err
 	}
 	g.cmd = cmd
+	// node 连同它拉起的 sing-box 一起纳入作业对象：本程序死 => 全家死
+	assignToJob(jobHandle, cmd.Process.Pid)
 	return nil
 }
 
@@ -93,6 +126,7 @@ func main() {
 		openBrowser(panelURL())
 		os.Exit(0)
 	}
+	jobHandle = createKillOnCloseJob()
 	systray.Run(onReady, nil)
 }
 
