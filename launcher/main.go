@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"fyne.io/systray"
@@ -22,6 +23,16 @@ import (
 var iconBytes []byte
 
 var jobHandle windows.Handle
+
+// launcherLog 启动器自证日志：作业对象挂接、启停动作都有迹可循。
+func launcherLog(msg string) {
+	f, err := os.OpenFile(filepath.Join(exeDir(), "data", "launcher.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
+}
 
 type gateway struct {
 	cmd *exec.Cmd
@@ -44,14 +55,18 @@ func createKillOnCloseJob() windows.Handle {
 
 func assignToJob(job windows.Handle, pid int) {
 	if job == 0 {
+		launcherLog("job 无效，跳过挂接（无保护）")
 		return
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(pid))
 	if err != nil {
+		launcherLog("OpenProcess 失败: " + err.Error())
 		return
 	}
 	defer windows.CloseHandle(h)
-	_ = windows.AssignProcessToJobObject(job, h)
+	if err := windows.AssignProcessToJobObject(job, h); err != nil {
+		launcherLog("assign 失败: " + err.Error())
+	}
 }
 
 func exeDir() string {
@@ -107,6 +122,7 @@ func (g *gateway) start() error {
 	g.cmd = cmd
 	// node 连同它拉起的 sing-box 一起纳入作业对象：本程序死 => 全家死
 	assignToJob(jobHandle, cmd.Process.Pid)
+	launcherLog(fmt.Sprintf("node started pid %d, job assigned", cmd.Process.Pid))
 	return nil
 }
 
@@ -115,11 +131,13 @@ func (g *gateway) stop() {
 	if g.cmd == nil || g.cmd.Process == nil {
 		return
 	}
+	launcherLog("quit: taskkill node tree")
 	_ = exec.Command("taskkill", "/T", "/F", "/PID", fmt.Sprint(g.cmd.Process.Pid)).Run()
 	g.cmd = nil
 }
 
 func main() {
+	launcherLog("launcher start")
 	// 单实例守卫：面板端口已在监听 = 程序已在运行，直接打开那个面板并退出，
 	// 避免双开导致端口抢占、第二个实例停在空闲态。
 	if panelUp(panelPort()) {
@@ -127,6 +145,7 @@ func main() {
 		os.Exit(0)
 	}
 	jobHandle = createKillOnCloseJob()
+	launcherLog("job object created (kill-on-close)")
 	systray.Run(onReady, nil)
 }
 
