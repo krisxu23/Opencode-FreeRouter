@@ -22,14 +22,6 @@ import { parseLinks } from './parse-links.js'
 
 export { parseNodeUri, parseLinks } from './parse-links.js'
 
-export const DEFAULT_SOURCES = [
-  'https://cdn.jsdelivr.net/gh/krisxu23/freesub@main/output/singbox.json',
-  'https://gh-proxy.com/https://raw.githubusercontent.com/krisxu23/freesub/main/output/singbox.json',
-  'https://raw.githubusercontent.com/krisxu23/freesub/main/output/singbox.json',
-]
-
-export const COUNTRY_SUB = c => `https://cdn.jsdelivr.net/gh/krisxu23/freesub@main/output/by-country/singbox-${c}.json`
-
 /** 出口地区固定分组（面板按此多选，顺序即回退顺序）。 */
 export const GROUPS = ['US', 'JP', 'HK', 'TW', 'KR', 'SG', 'EU', 'OTHER']
 
@@ -256,7 +248,7 @@ export function clashProxyToOutbound(p) {
 // ---- 拉取与合并 ---------------------------------------------------------------
 
 /** 拉取全部订阅源并合并（不再"首个成功即用"）——多订阅共存，按 tag+server 去重。 */
-export async function fetchSub({ sources = DEFAULT_SOURCES, signal } = {}) {
+export async function fetchSub({ sources, signal } = {}) {
   const list = (sources ?? DEFAULT_SOURCES).map(s => String(s).trim()).filter(Boolean)
   if (!list.length) throw new Error('no subscription sources configured')
   const results = await Promise.allSettled(list.map(async url => {

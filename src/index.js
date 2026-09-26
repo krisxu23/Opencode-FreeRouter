@@ -160,40 +160,38 @@ async function rebuild(attempt = 0) {
   rebuilding = true
   try {
     const s = settingsOf()
-    const sources = s.subUrls.length > 0 ? s.subUrls : undefined
+    // 订阅完全由用户在面板配置。未配置或全部拉取失败时：注册表历史节点继续服务；
+    // 注册表也为空则以纯直连兜底模式启动（sing-box 照常运行，所有出站直连）。
     const cacheFile = path.join(DATA, 'subs_cache.json')
-    let sub = await fetchSub({ sources }).catch(() => null)
-    if (!sub) sub = loadCache(cacheFile)
-    if (!sub) {
-      log('no subscription available (settings empty, cache empty) — staying idle; open the panel to add one')
-      return
+    let sub = null
+    let stats = { total: 0, matched: 0 }
+    if (s.subUrls.length > 0) {
+      sub = await fetchSub({ sources: s.subUrls }).catch(() => null)
+      if (!sub) sub = loadCache(cacheFile)
     }
-    saveCache(sub, cacheFile)
-    if (sub.details) {
-      log('订阅源: ' + sub.details.map(d => `${d.url.slice(0, 48)} → ${d.ok ? d.nodes + ' 节点' : '失败(' + d.error + ')'}`).join(' | '))
-    }
-    const { picked, stats } = filterByGroups(sub.outbounds, s.countries)
-    // 拉取结果只是注册表的增量输入：新节点加入、重复丢弃；源抖动不会缩小池子
-    const merged = registry.mergeNodes(picked)
-    registry.prune()
-    log(`国家分桶: 本轮 ${stats.total} 出站（匹配 ${stats.matched}）→ 新增 ${merged.added}、变更 ${merged.updated}、重复丢弃 ${merged.duplicate}；注册表现有 ${registry.all().length} 节点`)
-    if (stats.matched === 0) {
-      log('样例 tag: ' + sub.outbounds.slice(0, 4).map(o => o.tag).join(' | ').slice(0, 220))
+    if (sub) {
+      saveCache(sub, cacheFile)
+      if (sub.details) {
+        log('订阅源: ' + sub.details.map(d => `${d.url.slice(0, 48)} → ${d.ok ? d.nodes + ' 节点' : '失败(' + d.error + ')'}`).join(' | '))
+      }
+      const { picked, stats: st } = filterByGroups(sub.outbounds, s.countries)
+      stats = st
+      // 拉取结果只是注册表的增量输入：新节点加入、重复丢弃；源抖动不会缩小池子
+      const merged = registry.mergeNodes(picked)
+      registry.prune()
+      log(`国家分桶: 本轮 ${stats.total} 出站（匹配 ${stats.matched}）→ 新增 ${merged.added}、变更 ${merged.updated}、重复丢弃 ${merged.duplicate}；注册表现有 ${registry.all().length} 节点`)
+      if (stats.matched === 0) {
+        log('样例 tag: ' + sub.outbounds.slice(0, 4).map(o => o.tag).join(' | ').slice(0, 220))
+      }
+    } else {
+      log('未配置订阅或全部拉取失败 — 使用注册表历史节点；注册表为空则以纯直连兜底模式启动')
     }
     const candidates = registry.all()
     const sanitized = candidates.map(o => sanitizeOutbound(structuredClone(o))).filter(Boolean)
     ports = assignPorts(sanitized, ports, { base: s.portBase, span: s.portSpan, avoid: portBlacklist })
     const ported = sanitized.filter(o => ports[o.tag] != null)
-    if (ported.length < picked.length) {
+    if (ported.length < candidates.length) {
       log(`端口段 ${s.portBase}+${s.portSpan} 已满：${candidates.length - ported.length} 个节点未启用 — 可在面板调大"端口段容量"`)
-    }
-    if (ported.length === 0 && singboxProc !== null) {
-      log('no node fits the port range — keeping the serving instance')
-      return
-    }
-    if (ported.length === 0) {
-      log('no node fits the port range — enlarge 端口段容量 in the panel')
-      return
     }
     pool = ported.map(o => ({ tag: o.tag, country: countryOf(o.tag) }))
     // 兜底口被占（可能是你自己的代理软件）时自动顺延，不强抢
@@ -239,10 +237,12 @@ async function rebuild(attempt = 0) {
         logger.warn(`check 剔除坏节点 outbounds[${idx}] ${dropped?.tag?.slice(0, 44) ?? ''}: ${(checkError.match(/FATAL.*/) ?? [''])[0].slice(0, 130)}`)
       }
     }
-    if (checkError || checkList.length === 0) {
-      log('check 未收敛或无可用节点 — 保留当前实例继续服务')
+    if (checkError) {
+      logger.error('新配置未通过 sing-box check — 保留当前实例继续服务:', checkError.slice(0, 300))
       return
     }
+    // checkList 可以为空：空节点列表 = 纯直连兜底模式（catch-all + direct 照常启动）
+    if (checkList.length === 0) log('直连兜底模式：无可用节点，所有出站直连')
     const previous0 = singboxProc
     if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null }
     previous0?.kill()

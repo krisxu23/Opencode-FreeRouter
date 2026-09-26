@@ -193,7 +193,7 @@ label { font-size:13.5px }
 </section>
 <section>
   <h2>设置</h2>
-  <label>订阅链接（每行一个，留空用内置 freesub 源）</label>
+  <label>订阅链接（每行一条；留空则仅以直连兜底模式运行）</label>
   <textarea id="subUrls" rows="3"></textarea>
   <div class="formrow">
     <label>出口地区（按回退顺序，点击加入或移出；"其他"含无名节点，由探测按出口 IP 实测归桶）</label>
