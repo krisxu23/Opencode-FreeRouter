@@ -303,12 +303,15 @@ function renderStatus(s) {
   if (!rows.length) ub.innerHTML = '<tr><td colspan="4" class="muted">还没有请求记录</td></tr>';
 }
 async function loadLogs() {
+  const box = document.getElementById('logs');
   try {
-    const j = await j('/api/logs');
-    document.getElementById('logs').textContent = (j.lines ?? []).map(l => new Date(l.t).toLocaleTimeString() + ' [' + l.level + '] ' + l.msg).join('\\n');
-    const box = document.getElementById('logs');
+    // 注意：局部变量不能命名为 j —— 会遮蔽页面级的 j() 函数（TDZ），调用直接抛错
+    const data = await j('/api/logs');
+    box.textContent = (data.lines ?? []).map(l => new Date(l.t).toLocaleTimeString() + ' [' + l.level + '] ' + l.msg).join('\\n');
     box.scrollTop = box.scrollHeight;
-  } catch {}
+  } catch (e) {
+    box.textContent = '日志加载失败: ' + (e?.message ?? e);
+  }
 }
 async function loadSettings() {
   const s = await j('/api/settings');
