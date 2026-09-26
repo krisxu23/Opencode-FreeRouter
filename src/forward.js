@@ -97,8 +97,11 @@ export async function startForwardServer({ config, complete, modelRows, log = ()
       res.end()
       return
     }
+    // Liveness only, and deliberately before the key check: a caller probing
+    // whether the port is up must not need the key to get an answer. It gets a
+    // count of nothing — the model roster is what the authenticated routes serve.
     if (path === '/' || path === '/health') {
-      json(res, 200, { ok: true, service: 'our-free-model', models: modelRows().length })
+      json(res, 200, { ok: true, service: 'our-free-model' })
       return
     }
     if (!authorized(req, settings.key)) {
@@ -182,7 +185,15 @@ async function chatCompletions(req, res, complete) {
   const wantsStream = body.stream === true
 
   if (!wantsStream) {
-    const outcome = await complete({ model, openAi: body }, collectAccumulator())
+    const outcome = await complete({ model, openAi: body })
+    // A turn the lane refused has to come back as a failure. `complete` reports
+    // it in `outcome.error`, and without this guard the caller got 200 with
+    // `content: null` and `finish_reason: stop` — indistinguishable from a model
+    // that chose to say nothing.
+    if (outcome.error !== undefined && (outcome.text ?? '') === '' && (outcome.toolCalls?.length ?? 0) === 0) {
+      openAiError(res, 502, 'server_error', outcome.error)
+      return
+    }
     const text = [outcome.text ?? '', ...(outcome.toolCalls ?? []).map(() => '')].join('')
     json(res, 200, {
       id, object: 'chat.completion', created, model,
@@ -203,16 +214,20 @@ async function chatCompletions(req, res, complete) {
   openStreamHeaders(res)
   sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })
   const seenToolStart = new Set()
+  let forwarded = false
   const outcome = await complete({ model, openAi: body }, (chunk) => {
     if (chunk.type === 'text-delta') {
+      if (chunk.text !== '') forwarded = true
       sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { content: chunk.text }, finish_reason: null }] })
       return
     }
     if (chunk.type === 'reasoning-delta') {
+      if (chunk.text !== '') forwarded = true
       sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: { reasoning: chunk.text }, finish_reason: null }] })
       return
     }
     if (chunk.type === 'tool-call-delta') {
+      forwarded = true
       const first = !seenToolStart.has(chunk.index)
       if (first) seenToolStart.add(chunk.index)
       sendSse(res, {
@@ -237,6 +252,18 @@ async function chatCompletions(req, res, complete) {
       sendSse(res, { id, object: 'chat.completion.chunk', created, model, choices: [], usage: toOpenAiUsage(chunk.usage) })
     }
   })
+  if (outcome.error !== undefined) {
+    // The status line went out with the first SSE header, so 200 is already spent
+    // — but a turn the lane refused must still say so. Answering a refusal with a
+    // clean `finish_reason: stop` and no content is the empty-200 this endpoint's
+    // non-streaming branch fixed, arriving by the other door.
+    sendSse(res, { error: { message: String(outcome.error), type: 'server_error' } })
+    if (!forwarded) {
+      res.write('data: [DONE]\n\n')
+      res.end()
+      return
+    }
+  }
   sendSse(res, {
     id, object: 'chat.completion.chunk', created, model,
     choices: [{ index: 0, delta: {}, finish_reason: outcome.toolCalls?.length || seenToolStart.size > 0 ? 'tool_calls' : outcome.truncated ? 'length' : 'stop' }],
@@ -250,7 +277,11 @@ async function responsesEndpoint(req, res, complete) {
   const body = await readBody(req)
   const model = baseModelId(String(body.model ?? ''))
   const id = `resp-${crypto.randomBytes(8).toString('hex')}`
-  const outcome = await complete({ model, openAi: { ...body, input: body.input ?? body.messages ?? [] }, responses: true }, collectAccumulator())
+  const outcome = await complete({ model, openAi: { ...body, input: body.input ?? body.messages ?? [] }, responses: true })
+  if (outcome.error !== undefined && (outcome.text ?? '') === '' && (outcome.toolCalls?.length ?? 0) === 0) {
+    openAiError(res, 502, 'server_error', outcome.error)
+    return
+  }
   json(res, 200, {
     id, object: 'response', created_at: Math.floor(Date.now() / 1000), model, status: 'completed',
     output: [
@@ -265,44 +296,7 @@ async function responsesEndpoint(req, res, complete) {
   })
 }
 
-/** Accumulator used by the non-streaming paths. */
-function collectAccumulator() {
-  /** @type {{text:string, toolCalls:Array<{id:string,name:string,arguments:string}>, usage?:object, truncated?:boolean, error?:string}} */
-  const state = { text: '', toolCalls: [], usage: undefined, truncated: false }
-  return chunk => {
-    if (typeof chunk === 'string') return state
-    switch (chunk.type) {
-      case 'text-delta': state.text += chunk.text; break
-      case 'tool-call-delta': {
-        let call = state.toolCalls.find(candidate => candidate.slot === chunk.index)
-        if (call === undefined) {
-          call = { slot: chunk.index, id: chunk.id ?? '', name: chunk.name ?? '', arguments: '' }
-          state.toolCalls.push(call)
-        }
-        if (chunk.id) call.id = chunk.id
-        if (chunk.name) call.name = chunk.name
-        call.arguments += chunk.argumentsDelta ?? ''
-        break
-      }
-      case 'block-end':
-        if (chunk.block?.type === 'tool-call') {
-          const existing = state.toolCalls.find(candidate => candidate.id === chunk.block.id)
-          if (existing === undefined) state.toolCalls.push({ slot: chunk.index, id: chunk.block.id, name: chunk.block.name, arguments: chunk.block.arguments })
-          else { existing.name = chunk.block.name; existing.arguments = chunk.block.arguments }
-        }
-        break
-      case 'usage': state.usage = toOpenAiUsage(chunk.usage); break
-      case 'finish':
-        if (chunk.reason?.kind === 'max-tokens') state.truncated = true
-        if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') state.error = chunk.reason.failure?.message
-        break
-      default: break
-    }
-    return state
-  }
-}
-
-function toOpenAiUsage(usage) {
+export function toOpenAiUsage(usage) {
   if (usage === undefined) return undefined
   return {
     prompt_tokens: (usage.inputTokens ?? 0) + (usage.cacheReadTokens ?? 0),

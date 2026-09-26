@@ -16,6 +16,7 @@
  */
 
 import crypto from 'node:crypto'
+import { classifyFailure } from './http.js'
 import { restoreToolName } from './upstream.js'
 
 /** Mint a tool-call id for providers that stream arguments without one. */
@@ -99,19 +100,26 @@ class BlockSink {
   }
 }
 
-/** Turn a provider `usage` object into the harness's disjoint TokenUsage. */
+/**
+ * Turn one provider `usage` object into the harness's disjoint TokenUsage.
+ *
+ * `prompt_tokens_details` is optional in the OpenAI schema, and the harness's
+ * durable session log rejects a non-finite number outright — so an absent cache
+ * count has to default to zero before the subtraction, not afterwards. Reading
+ * `undefined` off the optional field turned `inputTokens` into `NaN`, which any
+ * gateway that omits the details block would have handed the kernel on
+ * every single call.
+ */
 export function mapUsage(usage) {
   if (!usage || typeof usage !== 'object') return undefined
   const prompt = number(usage.prompt_tokens ?? usage.input_tokens)
   const completion = number(usage.completion_tokens ?? usage.output_tokens)
-  const cached = number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens)
+  const cached = number(usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens) ?? 0
   const cacheWrite = number(usage.prompt_tokens_details?.cache_write_tokens)
   const reasoning = number(usage.completion_tokens_details?.reasoning_tokens ?? usage.output_tokens_details?.reasoning_tokens)
   if (prompt === undefined && completion === undefined) return undefined
-  // 上游原版在此处 `prompt - cached`：网关不带 cached_tokens 时得 NaN 并传染
-  // 整个 usage —— 本仓库加守卫（2026-09-26）。
   const out = {
-    inputTokens: Math.max(0, (prompt ?? 0) - (cached ?? 0)),
+    inputTokens: Math.max(0, (prompt ?? 0) - cached),
     outputTokens: completion ?? 0,
   }
   if (cached > 0) out.cacheReadTokens = cached
@@ -178,7 +186,7 @@ function feedClaude(sink, event, onFinish, renameMap) {
   if (event.type === 'message_delta') {
     const usage = event.usage
     if (usage && number(usage.output_tokens) !== undefined) {
-      onFinish({ inputTokens: 0, outputTokens: number(usage.output_tokens), totalTokens: number(usage.output_tokens) }, 'usage')
+      onFinish({ outputTokens: number(usage.output_tokens) }, 'usage')
     }
     const stop = event.delta?.stop_reason
     if (stop) onFinish(undefined, 'finish', stop)
@@ -269,7 +277,15 @@ export async function * readStream(lines, wire, renameMap, now = () => Date.now(
   const state = { usage: undefined, finish: undefined, sawToolCall: false, firstDeltaAt: undefined, sawReasoning: false, sawText: false, brokenToolCall: false }
 
   const onFinish = (usage, kind, token) => {
-    if (kind === 'usage' && usage !== undefined) state.usage = usage
+    if (kind === 'usage' && usage !== undefined) {
+      const carried = state.usage
+      // A usage report that names no input side is `message_delta` on the Messages
+      // wire: it carries only the output count, and taking it whole dropped the
+      // prompt counts `message_start` had already given for every Claude turn.
+      state.usage = carried !== undefined && usage.inputTokens === undefined
+        ? { ...carried, ...usage, totalTokens: Math.max(0, (carried.totalTokens ?? 0) - (carried.outputTokens ?? 0)) + (usage.outputTokens ?? 0) }
+        : usage
+    }
     if (kind === 'finish') state.finish = token
   }
 
@@ -280,11 +296,17 @@ export async function * readStream(lines, wire, renameMap, now = () => Date.now(
     let payload
     try { payload = JSON.parse(text) } catch { continue }
     if (payload.type === 'error' || payload.error) {
+      // Classify an in-stream refusal exactly as an error *envelope* is
+      // classified, because everything downstream decides off `code`. This throw
+      // used to carry only `llmCode`, which nothing reads: the failure reached
+      // `toFailure` unrecognized and came out as `TRANSPORT` — a retryable code —
+      // so the harness re-sent a turn whose partial answer had already been
+      // streamed, and a mid-turn geography refusal never reached the re-probe
+      // that watches for `CODE.region`.
       const failure = payload.error ?? payload
-      throw Object.assign(new Error(typeof failure.message === 'string' ? failure.message : 'upstream error'), {
-        llmCode: typeof failure.type === 'string' ? failure.type : 'SERVER',
-        upstream: payload,
-      })
+      const classified = classifyFailure(undefined, payload)
+      if (typeof failure.message !== 'string') classified.message = 'upstream error'
+      throw Object.assign(classified, { upstream: payload })
     }
     if (state.firstDeltaAt === undefined && carriesDelta(payload, wire)) state.firstDeltaAt = now()
     if (wire === 'chat') feedChat(sink, payload, renameMap, onFinish)

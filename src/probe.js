@@ -90,13 +90,22 @@ function buildPing(modelId, wire) {
   return { model: modelId, messages: [{ role: 'user', content: PING_PROMPT }], stream: true, max_tokens: 16 }
 }
 
+const ROUTING_REFUSAL_STATUS = new Set([400, 404, 422])
+
 function stateOf(error) {
   switch (error?.code) {
     case CODE.region: return STATE.regionBlocked
     case CODE.quota: return STATE.throttled
     default: break
   }
-  if (error?.unavailable === true || /unavailable|not supported/i.test(String(error?.message))) return STATE.unavailable
+  const message = String(error?.message ?? '')
+  // 上游 1.2.2：503 的 reason phrase 是网关侧故障不是模型判决；400/404/422 才是
+  // 路由层拒绝。误读会把活模型判死到下一轮探测。
+  const gatewayTrouble = Number.isInteger(error?.status) && error.status >= 500
+  const named = error?.unavailable === true
+    || (!gatewayTrouble && /unavailable|not supported|no such model|unknown model|invalid model/i.test(message))
+  if (named) return STATE.unavailable
+  if (Number.isInteger(error?.status) && ROUTING_REFUSAL_STATUS.has(error.status)) return STATE.unavailable
   return STATE.unknown
 }
 

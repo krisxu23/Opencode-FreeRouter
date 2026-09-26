@@ -54,8 +54,8 @@ function engineWithPicker(picker) {
 }
 
 test('effort budgets: enforced max_tokens ceilings', () => {
-  assert.equal(budgetFor('light', entry, undefined, 32768), 2048)
-  assert.equal(budgetFor('balanced', entry, undefined, 32768), 24576) // 上游 issue #2: 8192 会被不可关闭的思考吃掉 82%
+  assert.equal(budgetFor('light', entry, undefined, 32768), 4096) // 不可关闭思考的模型预算翻倍
+  assert.equal(budgetFor('balanced', entry, undefined, 32768), 16384) // 上游 issue #2: 8192 会被不可关闭的思考吃掉 82%
   assert.equal(budgetFor('deep', entry, undefined, 32768), 32768)
   assert.deepEqual(LEVELS.map(l => l.id), ['light', 'balanced', 'deep'])
 })
@@ -74,7 +74,7 @@ test('complete streams text and usage through the adapter chain', async () => {
   assert.equal(outcome.usage.completion_tokens, 2) // OpenAI 形状
   assert.equal(outcome.usage.prompt_tokens, 10)
   assert.equal(fakeRequests.at(-1).body.messages.at(-1).content, 'hi')
-  assert.equal(fakeRequests.at(-1).body.max_tokens, 24576) // 默认 balanced 档预算
+  assert.equal(fakeRequests.at(-1).body.max_tokens, 16384) // 默认 balanced 档预算（思考不可关闭 ×2）
 })
 
 test('pre-content region failure retries once on the next exit, same session', async () => {
