@@ -7,7 +7,7 @@ import {
   markProbe, healthOf, nodeUsable, pruneStale, persistHealth,
   noteRegionError, noteRegionOK, regionUsable, regionProbeCandidates,
   noteSticky, exitForSession,
-  pickExit, setHealthFile,
+  pickExit, setHealthFile, seedRestrictedModels, isRestrictedModel,
 } from '../src/health.js'
 
 test('unknown is usable; only measured dead excludes', () => {
@@ -91,4 +91,24 @@ test('health persists and reloads through a temp file', () => {
   assert.equal(healthOf('px'), 'alive')
   assert.deepEqual(regionUsable('pm', 'px'), { usable: false, known: true })
   fs.rmSync(file, { force: true })
+})
+
+test('pickExit: 受限模型严格走验证过的特殊节点，普通模型特殊+普通并用', () => {
+  const pool = [{ tag: 'n1', country: 'US' }, { tag: 'n2', country: 'US' }]
+  const portOf = t => ({ n1: 21000, n2: 21001 })[t]
+  markProbe('n1', { state: 'alive', latencyMs: 300 })
+  markProbe('n2', { state: 'alive', latencyMs: 100 })
+  noteRegionOK('mm3', 'n1') // n1 = 验证过的特殊节点（★）
+  // 受限模型：n2 更快但未验证 → 严格用 n1，不赌未验证出口
+  const hit = pickExit({ model: 'mm3', restricted: true, countries: ['US'], pool, portOf })
+  assert.equal(hit.nodeKey, 'n1')
+  // 普通模型：特殊节点与普通节点并用 → 更快的 n2 胜出
+  const hit2 = pickExit({ model: 'mm4', countries: ['US'], pool, portOf })
+  assert.equal(hit2.nodeKey, 'n2')
+})
+
+test('seedRestrictedModels 预置受限名单', () => {
+  seedRestrictedModels(['muse-spark-1.3-contributor-free'])
+  assert.equal(isRestrictedModel('muse-spark-1.3-contributor-free'), true)
+  assert.equal(isRestrictedModel('mimo-v2.6-flash-free'), false)
 })

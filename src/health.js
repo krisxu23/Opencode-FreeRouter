@@ -128,6 +128,21 @@ export function regionSnapshot() {
   return { models: [...regionModels], matrix: Object.fromEntries([...regionNodeOK].map(([m, inner]) => [m, Object.fromEntries(inner)])) }
 }
 
+/** 预置受限模型（catalog 的 regionSensitive 名单，如 muse-spark 系）；运行时发现的自动追加。 */
+export function seedRestrictedModels(models) {
+  for (const m of models ?? []) if (m) regionModels.add(m)
+}
+
+export function isRestrictedModel(model) {
+  return regionModels.has(model)
+}
+
+/** 受限模型的"特殊节点"标记：该出口验证过能跑受限模型。 */
+export function markRestrictedOk(nodeKey) {
+  const n = nodes.get(nodeKey)
+  if (n) n.restrictedOk = true
+}
+
 /** Usable nodes whose region verdict for `model` is still unknown — probe targets. */
 export function regionProbeCandidates(model, { max = 24 } = {}) {
   const inner = regionNodeOK.get(model) ?? new Map()
@@ -185,7 +200,7 @@ export function exitForSession(session) {
  * @param {string} [args.stickyNode] - node pinned by the session, tried first
  * @returns {{nodeKey:string, addr:string, country:string} | null}
  */
-export function pickExit({ model, countries, pool, portOf, stickyNode }) {
+export function pickExit({ model, restricted = false, countries, pool, portOf, stickyNode }) {
   const effectiveCountry = node => {
     const measured = nodes.get(node.tag)?.exitCountry
     return (measured && measured.length === 2 ? measured : '') || String(node.country ?? '').toUpperCase().slice(0, 2)
@@ -195,7 +210,10 @@ export function pickExit({ model, countries, pool, portOf, stickyNode }) {
     const usable = nodeUsable(node.tag)
     const region = regionUsable(model, node.tag)
     if (!usable || !region.usable) return null
-    return { node, bucket: h?.state === 'alive' ? 0 : 1, latency: h?.latencyMs ?? Number.MAX_SAFE_INTEGER, country: effectiveCountry(node) }
+    const proven = region.known && region.usable
+    // 受限模型的特殊节点排最前（bucket -1）；普通模型不加不减、自然并用
+    const bucket = (h?.state === 'alive' ? 0 : 1) - (restricted && proven ? 1 : 0)
+    return { node, bucket, latency: h?.latencyMs ?? Number.MAX_SAFE_INTEGER, country: effectiveCountry(node), proven }
   }
   const consider = candidate => {
     if (!candidate) return null
@@ -224,13 +242,16 @@ export function pickExit({ model, countries, pool, portOf, stickyNode }) {
     byCountry.set(r.country, list)
   }
   for (const country of want) {
-    const list = (byCountry.get(country) ?? []).sort((a, b) => a.bucket - b.bucket || a.latency - b.latency)
+    let list = (byCountry.get(country) ?? []).sort((a, b) => a.bucket - b.bucket || a.latency - b.latency)
+    // 受限模型：本分组已有验证过的特殊节点时，严格只用特殊节点（不再赌未验证出口）
+    if (restricted && list.some(r => r.proven)) list = list.filter(r => r.proven)
     const hit = consider(list[0])
     if (hit) return hit
   }
   // Selected countries all exhausted: still prefer any usable pool node over
   // failing outright — a wrong-but-working country beats no answer. Direct
-  // dialing is never a candidate here.
-  const any = pool.map(rank).filter(Boolean).sort((a, b) => a.bucket - b.bucket || a.latency - b.latency)
+  // dialing is never a candidate here. 受限模型同样只认特殊节点。
+  let any = pool.map(rank).filter(Boolean).sort((a, b) => a.bucket - b.bucket || a.latency - b.latency)
+  if (restricted && any.some(r => r.proven)) any = any.filter(r => r.proven)
   return consider(any[0])
 }

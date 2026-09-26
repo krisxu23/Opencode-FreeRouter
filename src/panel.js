@@ -275,8 +275,8 @@ function renderStatus(s) {
     wrap.innerHTML = '';
     for (const id of models) {
       const chip = document.createElement('span'); chip.className = 'chip';
-      const label = document.createElement('span'); label.textContent = id;
-      if (restricted.has(id)) { chip.style.opacity = .55; chip.title = '该模型当前所有已测健康出口均报地区受限'; }
+      const label = document.createElement('span'); label.textContent = (restricted.has(id) ? '★ ' : '') + id;
+      if (restricted.has(id)) { chip.style.opacity = .55; chip.title = '受限模型：仅经特殊标记(★)节点出站'; }
       const btn = document.createElement('button'); btn.textContent = '复制';
       btn.onclick = () => copyText(id, btn);
       chip.append(label, btn); wrap.appendChild(chip);
@@ -289,7 +289,7 @@ function renderStatus(s) {
   document.getElementById('nodeCount').textContent = '';
   const tb = document.querySelector('#nodes tbody'); tb.innerHTML = '';
   for (const n of nodes) {
-    tb.insertAdjacentHTML('beforeend', '<tr><td>' + esc(n.tag) + '</td><td>' + esc(n.country) + '</td><td>' + (n.port ?? '') + '</td><td class="' + n.state + '">' + n.state + '</td><td>' + (n.latencyMs >= 0 ? n.latencyMs + 'ms' : '–') + '</td><td>' + esc(n.exitIp || '') + '</td><td>' + (n.lastProbeAt ? new Date(n.lastProbeAt).toLocaleTimeString() : '–') + '</td></tr>');
+    tb.insertAdjacentHTML('beforeend', '<tr><td>' + (n.restrictedOk ? '★ ' : '') + esc(n.tag) + '</td><td>' + esc(n.country) + '</td><td>' + (n.port ?? '') + '</td><td class="' + n.state + '">' + n.state + '</td><td>' + (n.latencyMs >= 0 ? n.latencyMs + 'ms' : '–') + '</td><td>' + esc(n.exitIp || '') + '</td><td>' + (n.lastProbeAt ? new Date(n.lastProbeAt).toLocaleTimeString() : '–') + '</td></tr>');
   }
   // 用量
   const u = s.usage ?? {};

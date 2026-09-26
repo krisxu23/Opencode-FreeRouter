@@ -121,6 +121,8 @@ async function refreshCatalog(attempt = 0) {
     const ids = await fetchUpstreamIds({ exitAddr: 'direct' })
     catalog = buildCatalog(ids)
     membership = { 'our-free-model': catalog.map(entry => entry.id) }
+    // catalog 的 regionSensitive 名单（muse-spark 系）预置为受限模型，补探据此发现特殊节点
+    health.seedRestrictedModels(catalog.filter(entry => entry.regionSensitive).map(entry => entry.id))
     clearTimeout(catalogRetryTimer)
     log(`catalog: ${catalog.length} free models via direct`)
   } catch (error) {
@@ -371,7 +373,7 @@ async function probeNow() {
         const port = ports[nodeKey]
         if (port == null) continue
         const result = await probeModel({ id: model }, { exitAddr: `http://127.0.0.1:${port}`, timeoutMs: 20000 })
-        if (result.state === 'available') health.noteRegionOK(model, nodeKey)
+        if (result.state === 'available') { health.noteRegionOK(model, nodeKey); health.markRestrictedOk(nodeKey) }
         else if (result.state === 'region-blocked') health.noteRegionError(model, nodeKey)
       }
     }

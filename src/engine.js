@@ -25,7 +25,7 @@ import { buildCatalog, isFreeLane } from './catalog.js'
 import { toToolDefs } from './messages.js'
 import { DEFAULT_LEVEL } from './effort.js'
 import { UpstreamError, CODE } from './errors.js'
-import { pickExit, noteSticky, exitForSession, noteRegionError, noteRegionOK, unavailableEverywhere } from './health.js'
+import { pickExit, noteSticky, exitForSession, noteRegionError, noteRegionOK, unavailableEverywhere, isRestrictedModel, markRestrictedOk } from './health.js'
 
 const RETRY_ON = new Set([CODE.region, CODE.transport, CODE.timeout, CODE.empty])
 
@@ -41,10 +41,10 @@ const RETRY_ON = new Set([CODE.region, CODE.transport, CODE.timeout, CODE.empty]
 export function createEngine({ state, recordUsage, settingsOf, poolOf, portOf, picker }) {
   const adapter = new FreeModelAdapter({ state, recordUsage, warn: () => {} })
 
-  const defaultPicker = ({ model, sessionId, exclude }) => {
+  const defaultPicker = ({ model, sessionId, exclude, restricted }) => {
     const stickyNode = sessionId && !exclude ? exitForSession(sessionId) : null
     const pool = exclude ? poolOf().filter(n => n.tag !== exclude) : poolOf()
-    return pickExit({ model, countries: settingsOf().countries ?? [], pool, portOf, stickyNode })
+    return pickExit({ model, countries: settingsOf().countries ?? [], pool, portOf, stickyNode, restricted })
   }
   const pick = picker ?? defaultPicker
 
@@ -73,7 +73,8 @@ export function createEngine({ state, recordUsage, settingsOf, poolOf, portOf, p
     let exclude
     let lastFailure
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const picked = pick({ model: base, sessionId: attempt === 1 ? sessionId : null, exclude })
+      const restricted = isRestrictedModel(base) || entry.regionSensitive === true
+      const picked = pick({ model: base, sessionId: attempt === 1 ? sessionId : null, exclude, restricted })
       if (!picked) {
         throw new UpstreamError(
           lastFailure ? `no other healthy exit (last: ${lastFailure.message})` : 'no healthy exit for the selected countries',
@@ -122,6 +123,8 @@ export function createEngine({ state, recordUsage, settingsOf, poolOf, portOf, p
       if (code === CODE.region) noteRegionError(entry.id, picked.nodeKey)
       if (failure === undefined && (finishKind === 'stop' || finishKind === 'tool-calls' || finishKind === 'max-tokens')) {
         noteRegionOK(entry.id, picked.nodeKey)
+        // 受限模型的真实成功：给该出口打上特殊节点标记（面板 ★）
+        if (isRestrictedModel(entry.id) || entry.regionSensitive === true) markRestrictedOk(picked.nodeKey)
       }
 
       if (failure !== undefined && !sawContent && RETRY_ON.has(code) && attempt < 2) {
