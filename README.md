@@ -41,11 +41,28 @@ OpenAI 兼容路由：`GET /v1/models`、`POST /v1/chat/completions`（流式/�
 node scripts/build-release.mjs
 ```
 
-产出 `release/Opencode-FreeRouter-v<版本>-windows-x64.zip`（约 62MB），内含全部运行组件：
-托盘 exe（嵌图标）、自带 Node 运行时（`runtime/node.exe`，对方无需安装 Node）、网关源码、
-undici 依赖、sing-box v1.14.0 内核、运行说明。**解压后双击 exe 即可用**，数据都在解压目录的
-`data/` 下，删除文件夹即卸载。上传 GitHub：Releases → New release → 拖入 zip 附件。
-首次运行 SmartScreen 会提示未签名程序，点"更多信息 → 仍要运行"（消除需代码签名证书）。
+一条命令完成：**构建托盘 exe → 装配全部运行组件 → 完整性校验 → 压缩**，产出
+`release/Opencode-FreeRouter-v<版本>-windows-x64.zip`（约 62MB），内含托盘 exe（嵌图标）、
+自带 Node 运行时（`runtime/node.exe`，对方无需安装 Node）、网关源码、undici 依赖、
+sing-box v1.14.0 内核、运行说明。**解压后双击 `release/Opencode-FreeRouter/Opencode-FreeRouter.exe`
+即可使用**，数据都在解压目录的 `data/` 下，删除文件夹即卸载。上传 GitHub：Releases →
+New release → 拖入 zip 附件。首次运行 SmartScreen 会提示未签名程序，点"更多信息 →
+仍要运行"（消除需代码签名证书）。
+
+## 目录结构
+
+```
+├── src/                 网关源码（ESM）
+├── launcher/            Go 托盘壳（含 exe 图标资源）
+├── scripts/             构建/下载/图标脚本
+├── tests/               node:test 测试
+├── bin/                 sing-box 内核（不入 git）
+├── node_modules/        undici 依赖（不入 git）
+├── data/                运行时状态与日志（不入 git）
+└── release/             打包产物（不入 git）
+    ├── Opencode-FreeRouter/   解压即可运行的完整程序目录
+    └── *.zip                  发布包
+```
 
 ## 开发
 
@@ -53,13 +70,13 @@ undici 依赖、sing-box v1.14.0 内核、运行说明。**解压后双击 exe �
 npm install            # 唯一第三方依赖 undici
 npm test               # node:test 全量
 npm run fetch-singbox  # 下载 sing-box v1.14.0 内核到 bin/
-node src/index.js      # 前台跑网关（托盘 exe 的等价物）
-cd launcher && go build -ldflags="-s -w -H=windowsgui" -o ../Opencode-FreeRouter.exe .   # 图标资源 launcher/rsrc_windows_amd64.syso 自动链接
+node src/index.js      # 前台跑网关
+node scripts/build-release.mjs   # 构建托盘 exe + 发布 zip
 ```
 
-目录：`src/` 网关（upstream/http/catalog/forward 等照抄上游 1:1，singbox/health/engine/panel/nodeprobe 为新增）；
-`launcher/` Go 托盘壳（含 exe 图标资源）；`data/` 运行时状态（settings/subs_cache/node-health/singbox.json/gateway.log，不入 git）；
-`bin/` sing-box 内核（不入 git）；`runtime/node.exe` 可选自带 node（不入 git，没有则用 PATH）。
+`src/` 中 upstream/http/catalog/forward/channel/messages/stream/effort/adapter 等照抄上游 1:1，
+singbox/health/engine/panel/nodeprobe/registry/logger 为本项目新增；`launcher/` Go 托盘壳
+（`rsrc_windows_amd64.syso` 图标资源随构建自动链接）。
 
 ## 上游与许可
 

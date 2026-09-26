@@ -25,12 +25,8 @@ console.log('== 打包 Opencode-FreeRouter v' + version + ' ==')
 rmSync(stage, { recursive: true, force: true })
 mkdirSync(stage, { recursive: true })
 
-// 1. 托盘 exe（要求已构建）
-if (!existsSync(path.join(ROOT, `${NAME}.exe`))) {
-  console.error('缺少 Opencode-FreeRouter.exe，先在 launcher/ 下执行 go build')
-  process.exit(1)
-}
-cpSync(path.join(ROOT, `${NAME}.exe`), path.join(stage, `${NAME}.exe`))
+// 1. 托盘 exe（发布脚本自行构建，含图标资源；不再要求根目录预置 exe）
+execFileSync('go', ['build', '-trimpath', '-ldflags=-s -w -H=windowsgui', '-o', path.join(stage, `${NAME}.exe`), '.'], { cwd: path.join(ROOT, 'launcher'), env: { ...process.env, CGO_ENABLED: '0' } })
 
 // 2. Node 运行时（取当前进程的 node，保证与开发验证同版本）
 mkdirSync(path.join(stage, 'runtime'), { recursive: true })
