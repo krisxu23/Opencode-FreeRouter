@@ -15,7 +15,7 @@
 
 import fs from 'node:fs'
 import net from 'node:net'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 
 export const CATCHALL_TAG = 'in-catchall'
 
@@ -202,6 +202,39 @@ export function waitPortFree(port, timeoutMs = 3000) {
     }
     tryOnce()
   })
+}
+
+/** 找出占用本地端口并处于 LISTENING 的进程 PID；找不到返回 null。 */
+export function pidHoldingPort(port) {
+  try {
+    const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8', timeout: 15000 })
+    const line = out.split('\n').find(l => l.includes(`:${port} `) && l.includes('LISTENING'))
+    if (!line) return null
+    return Number(line.trim().split(/\s+/).pop())
+  } catch {
+    return null
+  }
+}
+
+/** 查询 PID 的进程映像名（小写，如 sing-box.exe）；查不到返回 ''。 */
+export function pidImageName(pid) {
+  try {
+    const out = execFileSync('tasklist', ['/FI', `PID eq ${pid}`], { encoding: 'utf8', timeout: 15000 })
+    const line = out.split('\n').find(l => l.includes(String(pid)))
+    return line ? line.trim().split(/\s+/)[0].toLowerCase() : ''
+  } catch {
+    return ''
+  }
+}
+
+/** 强杀指定 PID。 */
+export function killPid(pid) {
+  try {
+    execFileSync('taskkill', ['/F', '/PID', String(pid)], { stdio: 'pipe', timeout: 15000 })
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**

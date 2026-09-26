@@ -26,7 +26,7 @@ import { createEngine } from './engine.js'
 import { startPanel } from './panel.js'
 import { JsonStore, SETTINGS_INITIAL } from './store.js'
 import { fetchSub, filterByGroups, loadCache, saveCache, bucketOf, countryOf, GROUPS } from './sub.js'
-import { assignPorts, sanitizeOutbound, buildConfig, writeConfig, startSingbox, watchSingbox, waitPort, waitPortFree } from './singbox.js'
+import { assignPorts, sanitizeOutbound, buildConfig, writeConfig, startSingbox, watchSingbox, waitPort, waitPortFree, pidHoldingPort, pidImageName, killPid } from './singbox.js'
 import { fetchUpstreamIds, probeModel } from './probe.js'
 import { probeAll } from './nodeprobe.js'
 import { buildCatalog } from './catalog.js'
@@ -252,16 +252,28 @@ async function rebuild(attempt = 0) {
       proc.once('exit', code => done({ ok: false, code }))
       waitPort(s.catchAllPort, bootTimeout).then(ok => done({ ok })).catch(() => done({ ok: false }))
     })
+    if (outcome.ok) {
+      await new Promise(r => setTimeout(r, 400)) // 孤儿占口导致的假成功会在几百 ms 内显形（进程 FATAL 退出）
+      if (proc.exitCode !== null) outcome.ok = false
+    }
     if (!outcome.ok) {
       // Self-heal (Free-Router purgeStablePortsFromError): a bind conflict names
       // the port — blacklist it, free its node for a new port, retry once.
       const m = /listen tcp [^:]*:(\d+): bind/.exec(stderrTail)
-      if (m && attempt < 2) {
-        const port = Number(m[1])
-        const tag = Object.keys(ports).find(k => ports[k] === port)
-        portBlacklist.add(port)
-        if (tag) delete ports[tag]
-        log(`端口 ${port} 被外部占用（${tag ? '节点 ' + tag.slice(0, 30) : '未知'}），已拉黑并换端口重试`)
+      const bindPort = m ? Number(m[1]) : null
+      if (bindPort && attempt < 3) {
+        const pid = pidHoldingPort(bindPort)
+        const image = pid ? pidImageName(pid) : ''
+        if (image === 'sing-box.exe') {
+          // 上次异常退出残留的孤儿 sing-box —— 清掉后原端口即可用，无需拉黑
+          killPid(pid)
+          log(`清掉残留 sing-box 孤儿进程 (pid ${pid}，占用端口 ${bindPort})，换装重试`)
+          rebuildAgain = attempt + 1; return
+        }
+        const tag = Object.keys(ports).find(k => ports[k] === bindPort)
+        portBlacklist.add(bindPort)
+        if (tag) { delete ports[tag]; registry.remove(tag) }
+        log(`端口 ${bindPort} 被其他程序占用（${image || '未知进程'}），节点已拉黑并换端口重试`)
         rebuildAgain = attempt + 1; return
       }
       log('新实例启动失败且无法自愈 — 网关空闲；可在面板点"刷新订阅并重建"重试')

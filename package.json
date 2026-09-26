@@ -1,6 +1,6 @@
 {
   "name": "opencode-freerouter",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "private": true,
   "type": "module",
   "description": "Opencode-FreeRouter: OpenAI-compatible forward to opencode.ai free lane via per-node sing-box exits",
