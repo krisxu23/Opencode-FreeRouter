@@ -90,8 +90,8 @@ export class JsonStore {
 export const SETTINGS_INITIAL = {
   /** Subscription URLs; empty = the built-in freesub source chain. */
   subUrls: [],
-  /** Exit countries in fallback order. */
-  countries: ['US', 'SG', 'JP'],
+  /** 出口地区固定分组（US/JP/HK/TW/KR/SG/EU/OTHER），顺序即回退顺序。 */
+  countries: ['US', 'JP', 'HK', 'TW', 'KR', 'SG'],
   forwardPort: 3457,
   panelPort: 3458,
   catchAllPort: 20900,

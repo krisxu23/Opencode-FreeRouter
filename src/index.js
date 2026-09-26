@@ -20,12 +20,12 @@
 
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { generateKey, startForwardServer } from './forward.js'
 import { createEngine } from './engine.js'
 import { startPanel } from './panel.js'
 import { JsonStore, SETTINGS_INITIAL } from './store.js'
-import { fetchSub, filterByCountries, loadCache, saveCache, countryOf } from './sub.js'
+import { fetchSub, filterByGroups, loadCache, saveCache, bucketOf, countryOf, GROUPS } from './sub.js'
 import { assignPorts, sanitizeOutbound, buildConfig, writeConfig, startSingbox, watchSingbox, waitPort, waitPortFree } from './singbox.js'
 import { fetchUpstreamIds, probeModel } from './probe.js'
 import { probeAll } from './nodeprobe.js'
@@ -48,6 +48,15 @@ if (!settingsOf().forwardKey) {
   settingsStore.flush()
 }
 health.setHealthFile(path.join(DATA, 'node-health.json'))
+
+// 设置迁移：旧版 countries 存的是国家码，分桶制后统一映射到固定分组
+const GROUP_IDS = new Set(GROUPS)
+if (Array.isArray(settingsOf().countries) && !settingsOf().countries.every(c => GROUP_IDS.has(c))) {
+  const migrated = [...new Set(settingsOf().countries.map(c => bucketOf(c)))]
+  settingsStore.update({ countries: migrated })
+  settingsStore.flush()
+  log(`设置迁移: 出口国家码 → 固定分组 ${migrated.join(',')}`)
+}
 
 // ---- live state ---------------------------------------------------------------
 
@@ -139,17 +148,25 @@ async function rebuild(attempt = 0) {
       return
     }
     saveCache(sub, cacheFile)
-    const picked = filterByCountries(sub.outbounds, s.countries).map(o => sanitizeOutbound(structuredClone(o)))
+    if (sub.details) {
+      log('订阅源: ' + sub.details.map(d => `${d.url.slice(0, 48)} → ${d.ok ? d.nodes + ' 节点' : '失败(' + d.error + ')'}`).join(' | '))
+    }
+    const { picked, stats } = filterByGroups(sub.outbounds, s.countries)
+    log(`国家分桶: ${stats.total} 个出站中 ${stats.matched} 个匹配所选地区，无名节点 ${stats.unknown} 个（纳入探测 ${stats.unknownKept} 个）`)
+    if (stats.matched === 0) {
+      log('样例 tag: ' + sub.outbounds.slice(0, 4).map(o => o.tag).join(' | ').slice(0, 220))
+    }
     if (picked.length === 0 && singboxProc !== null) {
-      log(`parsed 0 nodes for countries [${s.countries.join(',')}] (mid-refresh?) — keeping the serving instance`)
+      log(`匹配到 0 个节点（countries [${s.countries.join(',')}]，可能是刷新中间态）— 保留当前实例继续服务`)
       return
     }
     if (picked.length === 0) {
-      log(`parsed 0 nodes for countries [${s.countries.join(',')}] — check the country list in the panel`)
+      log(`匹配到 0 个节点（countries [${s.countries.join(',')}]）— 检查面板的出口地区选择`)
       return
     }
-    ports = assignPorts(picked, ports, { base: s.portBase, span: s.portSpan, avoid: portBlacklist })
-    const ported = picked.filter(o => ports[o.tag] != null)
+    const sanitized = picked.map(o => sanitizeOutbound(structuredClone(o))).filter(Boolean)
+    ports = assignPorts(sanitized, ports, { base: s.portBase, span: s.portSpan, avoid: portBlacklist })
+    const ported = sanitized.filter(o => ports[o.tag] != null)
     if (ported.length < picked.length) {
       log(`端口段 ${s.portBase}+${s.portSpan} 已满：${picked.length - ported.length} 个节点本轮未启用 — 可在面板调大"端口段容量"`)
     }
@@ -165,18 +182,42 @@ async function rebuild(attempt = 0) {
     const configPath = path.join(DATA, 'singbox.json')
     writeConfig(configPath, buildConfig(ported, ports, { catchAllPort: s.catchAllPort }))
 
-    // Static validation BEFORE touching the serving instance: a bad config
-    // must cost nothing. (Sidecar reality, measured: the new instance cannot
-    // bind the same stable ports while the old one lives — unlike the in-process
-    // Free-Router rebuild — so the swap itself is stop-the-world once the
-    // config is known-good.)
-    const previous0 = singboxProc
-    try {
-      execFileSync(path.join(ROOT, 'bin', 'sing-box.exe'), ['check', '-c', configPath], { stdio: 'pipe' })
-    } catch (error) {
-      log('新配置未通过 sing-box check — 保留当前实例继续服务:', String(error?.stderr ?? error?.message ?? error).slice(0, 300))
+    // Static validation BEFORE touching the serving instance, with self-heal:
+    // any single bad node (bad uuid / unknown field / …) fails the whole config
+    // decode, and the error names `outbounds[N]` — drop that node and re-check,
+    // up to 5 rounds. Async: a 1000+ inbound check blocks for seconds.
+    let checkList = ported
+    let checkError = ''
+    for (let checkAttempt = 0; checkAttempt < 5; checkAttempt++) {
+      writeConfig(configPath, buildConfig(checkList, ports, { catchAllPort: s.catchAllPort }))
+      try {
+        await new Promise((resolve, reject) => {
+          execFile(path.join(ROOT, 'bin', 'sing-box.exe'), ['check', '-c', configPath], { timeout: 30000, maxBuffer: 8 * 1024 * 1024 }, (error, _stdout, stderr) => {
+            if (error) reject(Object.assign(error, { stderr }))
+            else resolve()
+          })
+        })
+        checkError = ''
+        break
+      } catch (error) {
+        checkError = String(error?.stderr ?? error?.message ?? error)
+        const m = /outbounds\[(\d+)\]/.exec(checkError)
+        if (!m) {
+          logger.error('新配置未通过 sing-box check — 保留当前实例继续服务:', checkError.slice(0, 300))
+          return
+        }
+        const idx = Number(m[1])
+        const dropped = checkList[idx]
+        checkList = checkList.filter((_, i) => i !== idx)
+        if (dropped?.tag) { delete ports[dropped.tag]; pool = pool.filter(n => n.tag !== dropped.tag) }
+        logger.warn(`check 剔除坏节点 outbounds[${idx}] ${dropped?.tag?.slice(0, 44) ?? ''}: ${(checkError.match(/FATAL.*/) ?? [''])[0].slice(0, 130)}`)
+      }
+    }
+    if (checkError || checkList.length === 0) {
+      log('check 未收敛或无可用节点 — 保留当前实例继续服务')
       return
     }
+    const previous0 = singboxProc
     previous0?.kill()
     await waitPortFree(s.catchAllPort, 3000).catch(() => {})
     const proc = startSingbox(path.join(ROOT, 'bin', 'sing-box.exe'), configPath)
@@ -200,12 +241,18 @@ async function rebuild(attempt = 0) {
       else if (line) logger.info('sing-box:', line)
     })
     proc.stdout?.on('data', () => {})
-    const alive = await new Promise(resolve => {
-      if (proc.exitCode !== null) return resolve(false)
-      const timer = setTimeout(() => resolve(true), 2000)
-      proc.once('exit', () => { clearTimeout(timer); resolve(false) })
+    // Readiness = the catch-all port accepting (the definitive signal, and the
+    // only scale-safe one: 1000+ inbounds take far longer to bind than any
+    // fixed settle window — a fixed 2s window misjudged a healthy 1255-node
+    // boot as dead, measured). Process exit during the wait = failure.
+    const bootTimeout = Math.min(30000, 5000 + ported.length * 10)
+    const outcome = await new Promise(resolve => {
+      let settled = false
+      const done = value => { if (!settled) { settled = true; resolve(value) } }
+      proc.once('exit', code => done({ ok: false, code }))
+      waitPort(s.catchAllPort, bootTimeout).then(ok => done({ ok })).catch(() => done({ ok: false }))
     })
-    if (!alive) {
+    if (!outcome.ok) {
       // Self-heal (Free-Router purgeStablePortsFromError): a bind conflict names
       // the port — blacklist it, free its node for a new port, retry once.
       const m = /listen tcp [^:]*:(\d+): bind/.exec(stderrTail)

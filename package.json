@@ -1,6 +1,6 @@
 {
   "name": "opencode-freerouter",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "private": true,
   "type": "module",
   "description": "Opencode-FreeRouter: OpenAI-compatible forward to opencode.ai free lane via per-node sing-box exits",
@@ -13,6 +13,7 @@
     "fetch-singbox": "node scripts/fetch-singbox.mjs"
   },
   "dependencies": {
-    "undici": "^8.11.2"
+    "undici": "^8.11.2",
+    "yaml": "^2.9.1"
   }
 }

@@ -18,6 +18,7 @@
  */
 
 import fs from 'node:fs'
+import { bucketOf } from './sub.js'
 
 const STICKY_TTL_MS = 30 * 60 * 1000
 
@@ -210,12 +211,14 @@ export function pickExit({ model, countries, pool, portOf, stickyNode }) {
     }
   }
 
-  const want = new Set((countries ?? []).map(c => String(c).toUpperCase()))
+  const want = new Set((countries ?? []).map(g => String(g).toUpperCase()))
   const byCountry = new Map()
   for (const node of pool) {
     const r = rank(node)
     if (!r) continue
-    if (!want.has(r.country)) continue
+    // countries 现在是固定分组（US/JP/HK/TW/KR/SG/EU/OTHER），节点的
+    // tag 推断国与出口 IP 实测国都归到分桶后再匹配
+    if (!want.has(bucketOf(r.country))) continue
     const list = byCountry.get(r.country) ?? []
     list.push(r)
     byCountry.set(r.country, list)

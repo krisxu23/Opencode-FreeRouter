@@ -21,6 +21,7 @@ export const CATCHALL_TAG = 'in-catchall'
 
 /** uTLS fingerprints sing-box accepts (option/uTLSFingerprint table). */
 const UTLS_FP = new Set(['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq', 'random', 'randomized'])
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 /** Known Shadowsocks cipher names (used to detect the base64("method:password") malformation). */
 const SS_METHODS = new Set([
   'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm', 'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
@@ -74,6 +75,24 @@ export function assignPorts(outbounds, prev = {}, { base = 21000, span = 8000, a
  *    restore; the userinfo is the authoritative source.
  */
 export function sanitizeOutbound(ob) {
+  // 0) 协议字段白名单（仅对已识别类型生效）：Clash 订阅会给 ss 标 tls:true，而
+  //    sing-box 的 shadowsocks/socks/http/ssh 出站没有 tls 字段 —— 带着会整份
+  //    配置 FATAL。transport 只属于 vless/vmess/trojan；flow 只属于 vless；
+  //    server_ports/obfs 只属于 hysteria2。
+  const type0 = String(ob.type ?? '')
+  const KNOWN0 = ['vless', 'vmess', 'trojan', 'hysteria2', 'tuic', 'anytls', 'shadowsocks', 'socks', 'http', 'ssh'].includes(type0)
+  if (KNOWN0) {
+    // uuid 形状校验：免费订阅里偶见非法 uuid，sing-box 在 initialize 阶段
+    // FATAL 掉整份配置 —— 直接剔除该节点。
+    if ((type0 === 'vless' || type0 === 'vmess' || type0 === 'tuic') && typeof ob.uuid === 'string' && !UUID_RE.test(ob.uuid.trim())) return null
+    const tlsCapable = ['vless', 'vmess', 'trojan', 'hysteria2', 'tuic', 'anytls'].includes(type0)
+    if (!tlsCapable) delete ob.tls
+    if (type0 !== 'vless') delete ob.flow
+    if (type0 !== 'vmess') delete ob.alter_id
+    if (type0 !== 'hysteria2') delete ob.server_ports
+    if (type0 !== 'hysteria2') delete ob.obfs
+  }
+
   const tls = ob.tls
   if (tls && typeof tls === 'object' && !Array.isArray(tls)) {
     if (tls.enabled === false) delete ob.tls
@@ -93,6 +112,9 @@ export function sanitizeOutbound(ob) {
   if (ob.transport && typeof ob.transport === 'object') {
     const t = String(ob.transport.type ?? '').toLowerCase()
     if (t === '' || t === 'tcp' || t === 'raw') delete ob.transport
+    // 5b) 未知传输（xhttp 等 Xray 专属）会让 sing-box 在 decode 阶段 FATAL 掉
+    //     整份配置 —— 只能丢弃该节点（等价 Free-Router 的"明确剔除"，不静默降级）。
+    else if (!['ws', 'grpc', 'http', 'httpupgrade', 'quic'].includes(t)) return null
   }
   delete ob.xtls
   if (ob.type === 'shadowsocks' && typeof ob.method === 'string' && !SS_METHODS.has(ob.method.toLowerCase())) {

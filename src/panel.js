@@ -196,9 +196,9 @@ label { font-size:13.5px }
   <label>订阅链接（每行一个，留空用内置 freesub 源）</label>
   <textarea id="subUrls" rows="3"></textarea>
   <div class="formrow">
-    <label>出口国家（按回退顺序，点击加入或移出）</label>
+    <label>出口地区（按回退顺序，点击加入或移出；"其他"含无名节点，由探测按出口 IP 实测归桶）</label>
     <div id="quick" style="margin-top:6px"></div>
-    <input id="countries" style="width:240px;margin-top:6px" placeholder="US,SG,JP">
+    <div id="orderLine" class="muted mono" style="font-size:12.5px;margin-top:6px"></div>
   </div>
   <div class="row" style="margin-top:12px">
     <label><input type="checkbox" id="probeEnabled"> 自动探测</label>
@@ -226,7 +226,8 @@ label { font-size:13.5px }
 </section>
 </main>
 <script>
-const QUICK = ['US','SG','JP','TW','HK','NL','DE','GB','KR','TR'];
+const GROUPS = [['US','美国'],['JP','日本'],['HK','香港'],['TW','台湾'],['KR','韩国'],['SG','新加坡'],['EU','欧洲'],['OTHER','其他']];
+let sel = [];
 const body = document.body, themeBtn = document.getElementById('themeBtn');
 function applyTheme(t) {
   body.className = t;
@@ -312,7 +313,9 @@ async function loadLogs() {
 async function loadSettings() {
   const s = await j('/api/settings');
   document.getElementById('subUrls').value = (s.subUrls ?? []).join('\\n');
-  document.getElementById('countries').value = (s.countries ?? []).join(',');
+  document.getElementById('countries')?.remove();
+  sel = (s.countries ?? []).filter(c => GROUPS.some(g => g[0] === c));
+  renderQuick();
   document.getElementById('probeEnabled').checked = s.probeEnabled !== false;
   document.getElementById('probeWorkers').value = s.probeWorkers ?? 24;
   document.getElementById('probeIntervalMin').value = s.probeIntervalMin ?? 30;
@@ -324,7 +327,7 @@ async function loadSettings() {
 function save() {
   const body = {
     subUrls: document.getElementById('subUrls').value.split('\\n').map(x => x.trim()).filter(Boolean),
-    countries: document.getElementById('countries').value.split(',').map(x => x.trim().toUpperCase()).filter(Boolean),
+    countries: sel.slice(),
     probeEnabled: document.getElementById('probeEnabled').checked,
     probeWorkers: Number(document.getElementById('probeWorkers').value) || 24,
     probeIntervalMin: Number(document.getElementById('probeIntervalMin').value) || 30,
@@ -338,11 +341,20 @@ function save() {
     .catch(e => document.getElementById('msg').textContent = '保存失败: ' + e.message);
 }
 const quick = document.getElementById('quick');
-for (const c of QUICK) {
-  const b = document.createElement('button'); b.textContent = c;
-  b.onclick = () => { const el = document.getElementById('countries'); const set = new Set(el.value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean)); set.has(c) ? set.delete(c) : set.add(c); el.value = [...set].join(','); };
-  quick.appendChild(b);
+function renderQuick() {
+  quick.innerHTML = '';
+  for (const [id, name] of GROUPS) {
+    const idx = sel.indexOf(id);
+    const b = document.createElement('button');
+    b.textContent = idx >= 0 ? '✓ ' + name + ' (' + (idx + 1) + ')' : name;
+    if (idx >= 0) b.style.borderColor = 'var(--accent)';
+    b.onclick = () => { idx >= 0 ? sel.splice(idx, 1) : sel.push(id); renderQuick(); };
+    quick.appendChild(b);
+  }
+  const line = document.getElementById('orderLine');
+  line.textContent = sel.length ? '回退顺序: ' + sel.map(s => (GROUPS.find(g => g[0] === s) ?? [])[1]).join(' → ') : '（尚未选择任何地区）';
 }
+renderQuick();
 document.getElementById('save').onclick = save;
 document.getElementById('probeNow').onclick = () => j('/api/probe', {method:'POST'}).then(loadStatus);
 document.getElementById('refreshSub').onclick = () => j('/api/refresh', {method:'POST'}).then(loadStatus);
