@@ -137,6 +137,22 @@ async function refreshCatalog(attempt = 0) {
 
 const portBlacklist = new Set() // ports that made sing-box FATAL (bind conflict); never reused this session
 
+// PID 台账：只杀我们亲自拉起过的 sing-box（孤儿）；用户自己的 sing-box 客户端一律不碰。
+const PID_LEDGER_FILE = path.join(DATA, 'sing-box-pids.json')
+function loadPidLedger() {
+  try { return JSON.parse(fs.readFileSync(PID_LEDGER_FILE, 'utf8')) } catch { return { current: null, history: [] } }
+}
+function recordPid(pid) {
+  const l = loadPidLedger()
+  l.current = pid
+  l.history = [...new Set([...(l.history ?? []), pid])].slice(-50)
+  try { fs.writeFileSync(PID_LEDGER_FILE, JSON.stringify(l)) } catch { /* fail-soft */ }
+}
+function isOurPid(pid) {
+  const l = loadPidLedger()
+  return l.current === pid || (l.history ?? []).includes(pid)
+}
+
 async function rebuild(attempt = 0) {
   if (rebuilding) { rebuildAgain = Math.max(rebuildAgain ?? 0, attempt); return }
   rebuilding = true
@@ -178,8 +194,17 @@ async function rebuild(attempt = 0) {
       return
     }
     pool = ported.map(o => ({ tag: o.tag, country: countryOf(o.tag) }))
+    // 兜底口被占（可能是你自己的代理软件）时自动顺延，不强抢
+    let catchAllPort = s.catchAllPort
+    if (singboxProc === null || singboxProc.exitCode !== null) {
+      for (let p = s.catchAllPort; p < s.catchAllPort + 100; p++) {
+        if (await waitPortFree(p, 400)) { catchAllPort = p; break }
+        if (p === s.catchAllPort) continue
+      }
+      if (catchAllPort !== s.catchAllPort) log(`兜底口 ${s.catchAllPort} 被占用（可能是本机其他代理软件），改用 ${catchAllPort}`)
+    }
     const configPath = path.join(DATA, 'singbox.json')
-    writeConfig(configPath, buildConfig(ported, ports, { catchAllPort: s.catchAllPort }))
+    writeConfig(configPath, buildConfig(ported, ports, { catchAllPort }))
 
     // Static validation BEFORE touching the serving instance, with self-heal:
     // any single bad node (bad uuid / unknown field / …) fails the whole config
@@ -188,7 +213,7 @@ async function rebuild(attempt = 0) {
     let checkList = ported
     let checkError = ''
     for (let checkAttempt = 0; checkAttempt < 5; checkAttempt++) {
-      writeConfig(configPath, buildConfig(checkList, ports, { catchAllPort: s.catchAllPort }))
+      writeConfig(configPath, buildConfig(checkList, ports, { catchAllPort }))
       try {
         await new Promise((resolve, reject) => {
           execFile(path.join(ROOT, 'bin', 'sing-box.exe'), ['check', '-c', configPath], { timeout: 30000, maxBuffer: 8 * 1024 * 1024 }, (error, _stdout, stderr) => {
@@ -250,7 +275,7 @@ async function rebuild(attempt = 0) {
       let settled = false
       const done = value => { if (!settled) { settled = true; resolve(value) } }
       proc.once('exit', code => done({ ok: false, code }))
-      waitPort(s.catchAllPort, bootTimeout).then(ok => done({ ok })).catch(() => done({ ok: false }))
+      waitPort(catchAllPort, bootTimeout).then(ok => done({ ok })).catch(() => done({ ok: false }))
     })
     if (outcome.ok) {
       await new Promise(r => setTimeout(r, 400)) // 孤儿占口导致的假成功会在几百 ms 内显形（进程 FATAL 退出）
@@ -265,6 +290,14 @@ async function rebuild(attempt = 0) {
         const pid = pidHoldingPort(bindPort)
         const image = pid ? pidImageName(pid) : ''
         if (image === 'sing-box.exe') {
+          // 只清我们亲自拉起过的（PID 台账在案）；用户自己的 sing-box 客户端一律不碰
+          if (!isOurPid(pid)) {
+            log(`端口  被独立的 sing-box 客户端占用 — 未动它，已为本节点换端口`)
+            portBlacklist.add(bindPort)
+            const t2 = Object.keys(ports).find(k => ports[k] === bindPort)
+            if (t2) delete ports[t2] // 保留节点，下轮重建自动换新端口
+            rebuildAgain = attempt + 1; return
+          }
           // 上次异常退出残留的孤儿 sing-box —— 清掉后原端口即可用，无需拉黑
           killPid(pid)
           log(`清掉残留 sing-box 孤儿进程 (pid ${pid}，占用端口 ${bindPort})，换装重试`)
@@ -280,9 +313,10 @@ async function rebuild(attempt = 0) {
       return
     }
     singboxProc = proc
-    await waitPort(s.catchAllPort, 15000).catch(() => log('catch-all port not accepting yet — watchdog will re-check'))
+    recordPid(proc.pid)
+    await waitPort(catchAllPort, 15000).catch(() => log('catch-all port not accepting yet — watchdog will re-check'))
     if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null }
-    watchdogTimer = watchSingbox(proc, s.catchAllPort, () => {
+    watchdogTimer = watchSingbox(proc, catchAllPort, () => {
       if (singboxProc !== proc) return // 陈旧看门狗：实例已被换装，忽略
       logger.error('sing-box exited (code ' + proc.exitCode + ', signal ' + (proc.signalCode ?? 'null') + ') stderr: ' + stderrTail.slice(-200))
       log('sing-box died — rebuilding in 5s')
