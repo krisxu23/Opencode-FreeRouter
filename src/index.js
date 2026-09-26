@@ -31,11 +31,13 @@ import { fetchUpstreamIds, probeModel } from './probe.js'
 import { probeAll } from './nodeprobe.js'
 import { buildCatalog } from './catalog.js'
 import { initLogger, logger } from './logger.js'
+import * as registry from './registry.js'
 import * as health from './health.js'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DATA = path.join(ROOT, 'data')
 initLogger(path.join(DATA, 'gateway.log'))
+registry.initRegistry(path.join(DATA, 'node-registry.json'))
 
 const log = (...parts) => logger.info(...parts)
 
@@ -153,23 +155,19 @@ async function rebuild(attempt = 0) {
       log('订阅源: ' + sub.details.map(d => `${d.url.slice(0, 48)} → ${d.ok ? d.nodes + ' 节点' : '失败(' + d.error + ')'}`).join(' | '))
     }
     const { picked, stats } = filterByGroups(sub.outbounds, s.countries)
-    log(`国家分桶: ${stats.total} 个出站中 ${stats.matched} 个匹配所选地区，无名节点 ${stats.unknown} 个（纳入探测 ${stats.unknownKept} 个）`)
+    // 拉取结果只是注册表的增量输入：新节点加入、重复丢弃；源抖动不会缩小池子
+    const merged = registry.mergeNodes(picked)
+    registry.prune()
+    log(`国家分桶: 本轮 ${stats.total} 出站（匹配 ${stats.matched}）→ 新增 ${merged.added}、变更 ${merged.updated}、重复丢弃 ${merged.duplicate}；注册表现有 ${registry.all().length} 节点`)
     if (stats.matched === 0) {
       log('样例 tag: ' + sub.outbounds.slice(0, 4).map(o => o.tag).join(' | ').slice(0, 220))
     }
-    if (picked.length === 0 && singboxProc !== null) {
-      log(`匹配到 0 个节点（countries [${s.countries.join(',')}]，可能是刷新中间态）— 保留当前实例继续服务`)
-      return
-    }
-    if (picked.length === 0) {
-      log(`匹配到 0 个节点（countries [${s.countries.join(',')}]）— 检查面板的出口地区选择`)
-      return
-    }
-    const sanitized = picked.map(o => sanitizeOutbound(structuredClone(o))).filter(Boolean)
+    const candidates = registry.all()
+    const sanitized = candidates.map(o => sanitizeOutbound(structuredClone(o))).filter(Boolean)
     ports = assignPorts(sanitized, ports, { base: s.portBase, span: s.portSpan, avoid: portBlacklist })
     const ported = sanitized.filter(o => ports[o.tag] != null)
     if (ported.length < picked.length) {
-      log(`端口段 ${s.portBase}+${s.portSpan} 已满：${picked.length - ported.length} 个节点本轮未启用 — 可在面板调大"端口段容量"`)
+      log(`端口段 ${s.portBase}+${s.portSpan} 已满：${candidates.length - ported.length} 个节点未启用 — 可在面板调大"端口段容量"`)
     }
     if (ported.length === 0 && singboxProc !== null) {
       log('no node fits the port range — keeping the serving instance')
@@ -177,12 +175,6 @@ async function rebuild(attempt = 0) {
     }
     if (ported.length === 0) {
       log('no node fits the port range — enlarge 端口段容量 in the panel')
-      return
-    }
-    // 订阅源抖动保护：部分源 fetch failed 时会得到一个远小于在服规模的残缺集，
-    // 直接换装会让出口池反复横跳（实测 1240 → 145 → 1044 振荡）——保旧。
-    if (singboxProc !== null && pool.length > 0 && ported.length < pool.length * 0.5) {
-      log()
       return
     }
     pool = ported.map(o => ({ tag: o.tag, country: countryOf(o.tag) }))
@@ -216,7 +208,7 @@ async function rebuild(attempt = 0) {
         const idx = Number(m[1])
         const dropped = checkList[idx]
         checkList = checkList.filter((_, i) => i !== idx)
-        if (dropped?.tag) { delete ports[dropped.tag]; pool = pool.filter(n => n.tag !== dropped.tag) }
+        if (dropped?.tag) { delete ports[dropped.tag]; registry.remove(dropped.tag); pool = pool.filter(n => n.tag !== dropped.tag) }
         logger.warn(`check 剔除坏节点 outbounds[${idx}] ${dropped?.tag?.slice(0, 44) ?? ''}: ${(checkError.match(/FATAL.*/) ?? [''])[0].slice(0, 130)}`)
       }
     }
@@ -314,9 +306,11 @@ async function probeNow() {
       workers,
       onResult: (node, result) => {
         health.markProbe(node.tag, result)
+        registry.markProbeResult(node.tag, result.state === 'alive')
         if (result.state === 'alive') alive += 1
       },
     })
+    registry.prune()
     health.persistHealth()
     log(`probe round: ${alive}/${pool.length} alive in ${((Date.now() - t0) / 1000).toFixed(1)}s`)
 
