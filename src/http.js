@@ -26,6 +26,11 @@ export { CODE, UpstreamError, classifyFailure }
 /**
  * Proxy dispatchers, one per exit address, cached for the process lifetime.
  * `'direct'`/absent maps to `undefined` — plain fetch, no dispatcher.
+ *
+ * Lifetime: ports churn every rebuild (nodes removed / ports reassigned), so
+ * callers MUST prune via `pruneDispatchers()` after each rebuild — an
+ * ever-growing table was a measured incident in Free-Router (27k stale
+ * entries), and a leaked ProxyAgent keeps its sockets alive.
  */
 const dispatchers = new Map()
 export function dispatcherFor(addr) {
@@ -36,6 +41,22 @@ export function dispatcherFor(addr) {
     dispatchers.set(addr, agent)
   }
   return agent
+}
+
+/** Drop cached dispatchers not in `keepAddrs` (current pool ports); closes them. */
+export function pruneDispatchers(keepAddrs) {
+  const keep = new Set(keepAddrs ?? [])
+  for (const [addr, agent] of dispatchers) {
+    if (keep.has(addr)) continue
+    dispatchers.delete(addr)
+    try { agent.close?.() } catch { /* already closed */ }
+  }
+  return dispatchers.size
+}
+
+/** Test hook: current dispatcher cache size. */
+export function dispatcherCount() {
+  return dispatchers.size
 }
 
 /**

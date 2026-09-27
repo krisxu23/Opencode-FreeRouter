@@ -11,6 +11,7 @@
  *                       free-model catalog, forward endpoint + key
  *   POST /api/probe     run one probe round now
  *   POST /api/refresh   refetch subscriptions and rebuild
+ *   POST /api/limits    force-refresh the models.dev limit overlay
  *
  * @module src/panel.js
  */
@@ -60,6 +61,11 @@ export async function startPanel({ status, getSettings, applySettings, actions =
     if (req.method === 'POST' && path === '/api/refresh') {
       await actions.refresh?.()
       json(res, 200, { ok: true })
+      return
+    }
+    if (req.method === 'POST' && path === '/api/limits') {
+      const r = await actions.refreshLimits?.({ force: true })
+      json(res, 200, { ok: true, rows: r ? Object.keys(r.byId ?? {}).length : 0, stale: r?.stale ?? false })
       return
     }
     json(res, 404, { error: `no route for ${req.method} ${path}` })
@@ -172,6 +178,7 @@ label { font-size:13.5px }
 </div>
 <section>
   <h2>免费模型 <span class="muted mono" id="modelNote">点"复制"拿模型 id</span></h2>
+  <div class="muted mono" id="limitsNote" style="font-size:12px"></div>
   <div id="models"><span class="muted">直连拉取中，稍候几秒。</span></div>
 </section>
 <section>
@@ -254,6 +261,7 @@ document.addEventListener('click', e => {
   copyText(document.getElementById(b.dataset.for).textContent, b);
 });
 
+function fmtTok(n) { if (!Number.isFinite(n) || n <= 0) return '–'; return n >= 1000000 ? (n/1000000).toFixed(n % 1000000 === 0 ? 0 : 1) + 'M' : n >= 1000 ? Math.round(n/1000) + 'K' : String(n); }
 function renderStatus(s) {
   const up = s.singbox?.running === true;
   document.getElementById('sbDot').className = 'dot ' + (up ? 'ok' : 'bad');
@@ -267,6 +275,7 @@ function renderStatus(s) {
   const restricted = new Set(s.regionModels ?? []);
   document.getElementById('modelCount').textContent = models.length;
   document.getElementById('rm').textContent = (s.regionModels ?? []).length ? '受限: ' + s.regionModels.join(', ') : '';
+  { const lim = s.limits; const ln = document.getElementById('limitsNote'); if (ln) ln.textContent = lim ? ('限额表: models.dev ' + (lim.rows ?? 0) + ' 行' + (lim.fetchedAt ? ' · ' + new Date(lim.fetchedAt).toLocaleString() : '') + (lim.stale ? ' (缓存)' : '')) : ''; }
   document.getElementById('apiBase').textContent = 'http://127.0.0.1:' + (s.forward?.port ?? 3457) + '/v1';
   document.getElementById('apiKey').textContent = s.forward?.key ?? '';
   const wrap = document.getElementById('models');
@@ -275,7 +284,7 @@ function renderStatus(s) {
     wrap.innerHTML = '';
     for (const id of models) {
       const chip = document.createElement('span'); chip.className = 'chip';
-      const label = document.createElement('span'); label.textContent = (restricted.has(id) ? '★ ' : '') + id;
+      const label = document.createElement('span'); label.textContent = (restricted.has(id) ? '★ ' : '') + id + (() => { const cap = (s.modelCaps ?? {})[id]; return cap ? ' (' + fmtTok(cap.contextWindow) + ' ctx · ' + fmtTok(cap.maxOutput) + ' out)' : ''; })();
       if (restricted.has(id)) { chip.style.opacity = .55; chip.title = '受限模型：仅经特殊标记(★)节点出站'; }
       const btn = document.createElement('button'); btn.textContent = '复制';
       btn.onclick = () => copyText(id, btn);
@@ -361,6 +370,7 @@ renderQuick();
 document.getElementById('save').onclick = save;
 document.getElementById('probeNow').onclick = () => j('/api/probe', {method:'POST'}).then(loadStatus);
 document.getElementById('refreshSub').onclick = () => j('/api/refresh', {method:'POST'}).then(loadStatus);
+{ const b = document.createElement('button'); b.textContent = '刷新限额表'; b.onclick = () => { b.textContent = '刷新中…'; j('/api/limits', {method:'POST'}).then(() => { b.textContent = '刷新限额表'; loadStatus(); }).catch(() => { b.textContent = '刷新限额表'; }); }; document.getElementById('refreshSub').after(b); }
 document.getElementById('logRefresh').onclick = loadLogs;
 document.getElementById('logCopy').onclick = () => copyText(document.getElementById('logs').textContent || '（空）', document.getElementById('logCopy'));
 async function loadStatus() { try { renderStatus(await j('/api/status')) } catch {} }

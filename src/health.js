@@ -172,16 +172,40 @@ export function unavailableEverywhere(model) {
 
 // ---- sticky sessions ----------------------------------------------------------
 
+// Per-session consecutive pre-content failures on the STICKY exit. A node can
+// be `alive` (probe passes) yet fail every real turn on transport; without a
+// fuse the same session re-hits the same exit for the full 30min TTL, paying
+// one wasted failure+retry per request. 2 strikes rotate the sticky.
+const stickyFailures = new Map() // session -> count
+
 export function noteSticky(session, nodeKey) {
   if (!session || !nodeKey) return
   sticky.set(session, { nodeKey, at: Date.now() })
 }
 
+/** Record a pre-content transport/region failure served from the sticky exit. */
+export function noteStickyFailure(session) {
+  if (!session) return
+  stickyFailures.set(session, (stickyFailures.get(session) ?? 0) + 1)
+}
+
+/** Clear the per-session failure count (a turn completed content). */
+export function clearStickyFailures(session) {
+  if (!session) return
+  stickyFailures.delete(session)
+}
+
+/** Sessions that burned their sticky twice in a row must rotate exits. */
+export function stickyBurned(session) {
+  return (stickyFailures.get(session) ?? 0) >= 2
+}
+
 export function exitForSession(session) {
   const hit = sticky.get(session)
   if (!hit) return null
-  if (Date.now() - hit.at > STICKY_TTL_MS || !nodeUsable(hit.nodeKey)) {
+  if (Date.now() - hit.at > STICKY_TTL_MS || !nodeUsable(hit.nodeKey) || stickyBurned(session)) {
     sticky.delete(session)
+    stickyFailures.delete(session)
     return null
   }
   return hit.nodeKey
@@ -230,19 +254,21 @@ export function pickExit({ model, restricted = false, countries, pool, portOf, s
   }
 
   const want = new Set((countries ?? []).map(g => String(g).toUpperCase()))
-  const byCountry = new Map()
+  const byGroup = new Map()
   for (const node of pool) {
     const r = rank(node)
     if (!r) continue
     // countries 现在是固定分组（US/JP/HK/TW/KR/SG/EU/OTHER），节点的
-    // tag 推断国与出口 IP 实测国都归到分桶后再匹配
-    if (!want.has(bucketOf(r.country))) continue
-    const list = byCountry.get(r.country) ?? []
+    // tag 推断国与出口 IP 实测国都归到分桶后再匹配；byGroup 必须按分桶 key，
+    // 不能按原始国家码（否则 EU/OTHER 分组永远查不到，如 NL→EU、CA→OTHER）。
+    const group = bucketOf(r.country)
+    if (!want.has(group)) continue
+    const list = byGroup.get(group) ?? []
     list.push(r)
-    byCountry.set(r.country, list)
+    byGroup.set(group, list)
   }
   for (const country of want) {
-    let list = (byCountry.get(country) ?? []).sort((a, b) => a.bucket - b.bucket || a.latency - b.latency)
+    let list = (byGroup.get(country) ?? []).sort((a, b) => a.bucket - b.bucket || a.latency - b.latency)
     // 受限模型：本分组已有验证过的特殊节点时，严格只用特殊节点（不再赌未验证出口）
     if (restricted && list.some(r => r.proven)) list = list.filter(r => r.proven)
     const hit = consider(list[0])

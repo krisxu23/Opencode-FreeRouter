@@ -19,6 +19,37 @@ apiKey:  <data/settings.json 里的 forwardKey，ofm- 开头>
 
 OpenAI 兼容路由：`GET /v1/models`、`POST /v1/chat/completions`（流式/非流式）、`POST /v1/responses`。
 
+## 模型限额表（与 OpenChamber 同源）
+
+`GET /zen/v1/models` 只给模型 id，不给 context/output 数值。面板 Zen 页展示的
+`100万 上下文 · 13.1万 输出` 来自 models.dev 的 `opencode` 供应商行
+（`https://models.dev/providers/opencode`，`@opencode-ai/models` 的 `providers()` 接口，
+即 `GET https://models.dev/api.json`），网关做和 OpenChamber 一模一样的事：
+
+```
+zen 出 id → 本地 CAPABILITIES 打底 → models.dev Zen 行 overlay（精确 id 匹配）→ budgetFor 钳制上 wire
+```
+
+* `src/limits.js`：直连拉快照（~5MB，24h TTL），只取 `opencode` 行的
+  `limit.context/output`，按精确免费 id 匹配——不用 canonical/付费行
+  （如 `mimo-v2.6-flash` 1048576/131072 是公版天花板，车道只认
+  `mimo-v2.6-flash-free` 200000/32000）。
+* 缓存 `data/modelsdev.json`，失败 fail-soft（stale 顶着，无缓存用本地表）；
+  面板"刷新限额表"按钮（`POST /api/limits`）可手动强制刷新。
+* 本地表兜底值（`src/catalog.js` CAPABILITIES，离线/首启用，与 Zen 行一致）：
+
+| 模型 | 上下文 | 输出 |
+|---|---|---|
+| LongCat 2.5 Preview | 100万 | 13.1万 |
+| Space Bunny | 104.9万 | 52.4万 |
+| MiMo-V2.6 / V2.5 | 20万 | 3.2万 |
+| Muse Spark 1.2 / 1.3 | 104.9万 | 13.1万 |
+| Ling 3.0 Flash Fin | 26.2万 | 3.3万 |
+| Nemotron 3.5 Lightning | 26.2万 | 26.2万 |
+| Nemotron 3 Ultra | 100万 | 12.8万 |
+| Big Pickle | 20万 | 3.2万 |
+| DeepSeek V4 Flash | 20万 | 12.8万 |
+
 ## 工作原理
 
 ```
@@ -53,12 +84,17 @@ New release → 拖入 zip 附件。首次运行 SmartScreen 会提示未签名�
 
 ```
 ├── src/                 网关源码（ESM）
+│   ├── limits.js        models.dev 限额 overlay（与 OpenChamber Zen 页同源，24h TTL）
+│   ├── catalog.js       免费车道目录 + 本地 CAPABILITIES 兜底表（Zen 行数值）
+│   ├── engine.js        请求装配 + 未知免费 id 旁路（同样过 overlay）
+│   ├── health.js        节点健康 + EU/OTHER 分桶出口选择
+│   └── panel.js         控制台（模型限额显示 + 刷新限额表按钮）
 ├── launcher/            Go 托盘壳（含 exe 图标资源）
 ├── scripts/             构建/下载/图标脚本
-├── tests/               node:test 测试
+├── tests/               node:test 测试（含 limits.test.js overlay 回归）
 ├── bin/                 sing-box 内核（不入 git）
-├── node_modules/        undici 依赖（不入 git）
-├── data/                运行时状态与日志（不入 git）
+├── node_modules/        undici + yaml 依赖（不入 git）
+├── data/                运行时状态与日志（不入 git，含 modelsdev.json 限额缓存）
 └── release/             打包产物（不入 git）
     ├── Opencode-FreeRouter/   解压即可运行的完整程序目录
     └── *.zip                  发布包
@@ -67,15 +103,15 @@ New release → 拖入 zip 附件。首次运行 SmartScreen 会提示未签名�
 ## 开发
 
 ```bash
-npm install            # 唯一第三方依赖 undici
-npm test               # node:test 全量
+npm install            # 第三方依赖 undici + yaml
+npm test               # node:test 全量（64 项）
 npm run fetch-singbox  # 下载 sing-box v1.14.0 内核到 bin/
 node src/index.js      # 前台跑网关
 node scripts/build-release.mjs   # 构建托盘 exe + 发布 zip
 ```
 
 `src/` 中 upstream/http/catalog/forward/channel/messages/stream/effort/adapter 等照抄上游 1:1，
-singbox/health/engine/panel/nodeprobe/registry/logger 为本项目新增；`launcher/` Go 托盘壳
+singbox/health/engine/panel/nodeprobe/registry/logger/limits 为本项目新增；`launcher/` Go 托盘壳
 （`rsrc_windows_amd64.syso` 图标资源随构建自动链接）。
 
 ## 上游与许可

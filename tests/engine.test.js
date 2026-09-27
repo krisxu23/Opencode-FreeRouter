@@ -56,7 +56,7 @@ function engineWithPicker(picker) {
 test('effort budgets: enforced max_tokens ceilings', () => {
   assert.equal(budgetFor('light', entry, undefined, 32768), 4096) // 不可关闭思考的模型预算翻倍
   assert.equal(budgetFor('balanced', entry, undefined, 32768), 16384) // 上游 issue #2: 8192 会被不可关闭的思考吃掉 82%
-  assert.equal(budgetFor('deep', entry, undefined, 32768), 32768)
+  assert.equal(budgetFor('deep', entry, undefined, 32768), 32000) // Zen 车道限额 32K < 默认上限 32768，deep 取车道限额
   assert.deepEqual(LEVELS.map(l => l.id), ['light', 'balanced', 'deep'])
 })
 
@@ -89,6 +89,42 @@ test('pre-content region failure retries once on the next exit, same session', a
   assert.deepEqual(picks, [null, 'node-a']) // first pick, then exclude the failed node
   const [first, second] = fakeRequests.slice(-2)
   assert.equal(first.session, second.session) // quota follows the session across the retry
+})
+
+test('tool definitions survive the engine -> adapter projection on both wires', async () => {
+  // Regression: engine used to pre-project tools into a provider shape, and the
+  // adapter's own toToolDefs then read `tool.name` off a `{function:{name}}` row
+  // and dropped every real tool — the upstream saw only the fingerprint quartet
+  // (chat wire: plus `tool_choice: none`), so no model ever called a tool.
+  const tools = [
+    { type: 'function', function: { name: 'read_file', description: 'read a file', parameters: { type: 'object', properties: {} } } },
+    { type: 'function', function: { name: 'write_file', description: 'write a file', parameters: { type: 'object', properties: {} } } },
+  ]
+  const rows = [entry, buildCatalog(['muse-spark-1.3-contributor-free'])[0]]
+  const mk = () => createEngine({
+    state: () => ({ catalog: rows, membership: {}, settings: { enabled: true, defaultMaxTokens: 32768 }, attributionUserAgent: '' }),
+    recordUsage: () => {},
+    settingsOf: () => ({ countries: ['US'] }),
+    poolOf: () => [{ tag: 'node-a', country: 'US' }],
+    portOf: tag => (tag === 'node-a' ? 21000 : undefined),
+    picker: () => ({ nodeKey: 'node-a', addr: 'direct', country: 'US' }),
+  })
+  const namesOf = body => (body.tools ?? []).map(t => t.name ?? t.function?.name)
+
+  // chat wire: client spoke POST /v1/chat/completions
+  await mk().complete({ model: 'mimo-v2.6-flash-free', openAi: { messages: [{ role: 'user', content: 'hi' }], tools } }, () => {})
+  const chat = fakeRequests.at(-1).body
+  assert.deepEqual(namesOf(chat).filter(n => n === 'read_file' || n === 'write_file'), ['read_file', 'write_file'])
+  assert.notEqual(chat.tool_choice, 'none') // 'none' forbids the model from calling anything
+
+  // responses wire (muse-spark): client spoke POST /v1/responses. The fake
+  // upstream answers in chat spelling, so the turn itself comes back empty —
+  // the assertion is about what WE sent.
+  await mk().complete({ model: 'muse-spark-1.3-contributor-free', openAi: { messages: [{ role: 'user', content: 'hi' }], tools }, responses: true }, () => {}).catch(() => {})
+  const responses = fakeRequests.at(-1).body
+  assert.equal(fakeRequests.at(-1).path, '/zen/v1/responses')
+  assert.ok(namesOf(responses).includes('read_file'), `flat tools must survive: ${JSON.stringify(namesOf(responses))}`)
+  assert.ok(namesOf(responses).includes('bash'), 'fingerprint quartet still appended')
 })
 
 test('unknown model is refused without dialing', async () => {

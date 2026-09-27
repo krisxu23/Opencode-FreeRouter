@@ -18,12 +18,16 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import YAML from 'yaml'
+import { ProxyAgent } from 'undici'
 import { parseLinks } from './parse-links.js'
 
 export { parseNodeUri, parseLinks } from './parse-links.js'
 
 /** 出口地区固定分组（面板按此多选，顺序即回退顺序）。 */
 export const GROUPS = ['US', 'JP', 'HK', 'TW', 'KR', 'SG', 'EU', 'OTHER']
+
+/** 默认订阅源（空 = 未配置，由调用方决定兜底；保留符号避免 ReferenceError）。 */
+export const DEFAULT_SOURCES = []
 
 /** 欧洲桶包含的国家码。 */
 const EU_CCS = new Set(['NL', 'DE', 'GB', 'FR', 'SE', 'CH', 'AT', 'PL', 'ES', 'IT', 'IE', 'FI', 'NO', 'UA', 'RO', 'BG', 'GR', 'HU', 'CZ', 'DK', 'BE', 'PT'])
@@ -247,17 +251,48 @@ export function clashProxyToOutbound(p) {
 
 // ---- 拉取与合并 ---------------------------------------------------------------
 
-/** 拉取全部订阅源并合并（不再"首个成功即用"）——多订阅共存，按 tag+server 去重。 */
-export async function fetchSub({ sources, signal } = {}) {
+/** 订阅拉取失败后经健康节点复拉的最大出口数（每个失败源最多试这么多节点）。 */
+export const SUB_RETRY_EXITS = 3
+
+/**
+ * 拉取全部订阅源并合并（不再"首个成功即用"）——多订阅共存，按 tag+server 去重。
+ *
+ * 两级拉取：先全部直连并行；直连失败的源，若调用方给了健康出口
+ * (`exitAddrs`: `http://127.0.0.1:<port>` 列表，通常是上一轮 rebuild 留下的
+ * 存活节点端口)，逐个经出口复拉（每源最多 SUB_RETRY_EXITS 个）。本机直连
+ * 被封时这是唯一的订阅更新通道；没有出口可用时退化为纯直连行为。
+ */
+export async function fetchSub({ sources, signal, exitAddrs = [] } = {}) {
   const list = (sources ?? DEFAULT_SOURCES).map(s => String(s).trim()).filter(Boolean)
   if (!list.length) throw new Error('no subscription sources configured')
-  const results = await Promise.allSettled(list.map(async url => {
-    const r = await fetch(url, { redirect: 'follow', signal, headers: { accept: 'application/json, text/yaml, text/plain, */*', 'user-agent': 'clash.meta/1.18.1' } })
+  const exits = (exitAddrs ?? []).filter(a => typeof a === 'string' && a !== '')
+  const fetchOne = async (url, exitAddr) => {
+    const dispatcher = exitAddr && exitAddr !== 'direct' ? new ProxyAgent(exitAddr) : undefined
+    const r = await fetch(url, { redirect: 'follow', signal, dispatcher, headers: { accept: 'application/json, text/yaml, text/plain, */*', 'user-agent': 'clash.meta/1.18.1' } })
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     const outbounds = parseSubscriptionBody(await r.text())
     if (!outbounds.length) throw new Error('没有识别出任何节点（格式不受支持？）')
     return outbounds
-  }))
+  }
+  // 第一轮：全部直连并行
+  const results = await Promise.allSettled(list.map(url => fetchOne(url, 'direct')))
+  // 第二轮：直连失败的源，经健康节点逐个复拉（串行 per 源，避免打爆单节点）
+  for (const [i, res] of results.entries()) {
+    if (res.status === 'fulfilled' || exits.length === 0) continue
+    let lastError = res.reason
+    for (const exitAddr of exits.slice(0, SUB_RETRY_EXITS)) {
+      try {
+        const outbounds = await fetchOne(list[i], exitAddr)
+        results[i] = { status: 'fulfilled', value: outbounds }
+        lastError = null
+        break
+      } catch (error) {
+        lastError = error
+      }
+      if (signal?.aborted) break
+    }
+    if (lastError) results[i] = { status: 'rejected', reason: lastError }
+  }
   const merged = []
   const seen = new Set()
   const details = []

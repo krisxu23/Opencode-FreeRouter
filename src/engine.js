@@ -22,10 +22,10 @@
 import { FreeModelAdapter, ROUTE_MAIN } from './adapter.js'
 import { baseModelId } from './upstream.js'
 import { buildCatalog, isFreeLane } from './catalog.js'
-import { toToolDefs } from './messages.js'
+import { applyLimitsOverlay } from './limits.js'
 import { DEFAULT_LEVEL } from './effort.js'
 import { UpstreamError, CODE } from './errors.js'
-import { pickExit, noteSticky, exitForSession, noteRegionError, noteRegionOK, unavailableEverywhere, isRestrictedModel, markRestrictedOk } from './health.js'
+import { pickExit, noteSticky, exitForSession, noteStickyFailure, clearStickyFailures, stickyBurned, noteRegionError, noteRegionOK, unavailableEverywhere, isRestrictedModel, markRestrictedOk } from './health.js'
 
 const RETRY_ON = new Set([CODE.region, CODE.transport, CODE.timeout, CODE.empty])
 
@@ -62,18 +62,30 @@ export function createEngine({ state, recordUsage, settingsOf, poolOf, portOf, p
     const openAi = request.openAi ?? {}
     const base = baseModelId(String(request.model ?? ''))
     let entry = snapshot.catalog.find(candidate => candidate.id === base)
-    if (entry === undefined && isFreeLane(base)) entry = buildCatalog([base])[0]
+    // 未见过的新免费 id 也可直接建目录行（未知模型旁路），overlay 有命中就用 Zen 行数值
+    if (entry === undefined && isFreeLane(base)) entry = applyLimitsOverlay(buildCatalog([base]), snapshot.limitsById ?? {})[0]
     if (entry === undefined) throw new UpstreamError(`unknown model "${request.model}"`, CODE.server)
 
     const sessionId = `forward:${String(openAi.user ?? openAi.conversation ?? 'shared')}`
     const messages = fromOpenAiMessages(openAi, request.responses === true)
-    const tools = toToolDefs((openAi.tools ?? []).map(normalizeTool).filter(Boolean), request.responses === true ? 'flat' : 'chat')
+    // Harness tool shape ({name, description, parameters}) goes straight to the
+    // adapter, which projects it onto whichever wire THIS model speaks. Passing a
+    // provider shape here (the old `toToolDefs(...)`) made the adapter's own
+    // `toToolDefs` read `tool.name` off a `{function:{name}}` row, find nothing
+    // and drop every real tool — the upstream then saw only the fingerprint
+    // quartet (or `tool_choice: none`), and no model ever called a tool.
+    const tools = (openAi.tools ?? []).map(normalizeTool).filter(Boolean)
     const handler = typeof onChunk === 'function' ? onChunk : () => {}
 
     let exclude
     let lastFailure
+    // sticky 熔断只统计"从 sticky 出口吃到的会前失败"：同会话在同一 sticky 上
+    // 连跪 2 次就换出口，而不是 30min 内每请求稳定多一次失败延迟。
+    const startedSticky = sessionId ? exitForSession(sessionId) : null
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const restricted = isRestrictedModel(base) || entry.regionSensitive === true
+      const staleSticky = startedSticky && stickyBurned(sessionId) ? startedSticky : null
+      if (staleSticky && !exclude) exclude = staleSticky
       const picked = pick({ model: base, sessionId: attempt === 1 ? sessionId : null, exclude, restricted })
       if (!picked) {
         throw new UpstreamError(
@@ -130,13 +142,22 @@ export function createEngine({ state, recordUsage, settingsOf, poolOf, portOf, p
       if (failure !== undefined && !sawContent && RETRY_ON.has(code) && attempt < 2) {
         exclude = picked.nodeKey
         lastFailure = failure
+        // 失败来自本轮进入时的 sticky 出口 → 记一次熔断分（换出口后清零由成功路径负责）
+        if (startedSticky && picked.nodeKey === startedSticky) noteStickyFailure(sessionId)
         continue // same session id, next exit
       }
       if (failure !== undefined && !sawContent) {
+        // 第二次尝试也跪：若 sticky 还在且就是它，同样记分（下次请求直接换）
+        if (startedSticky && picked.nodeKey === startedSticky) noteStickyFailure(sessionId)
         throw new UpstreamError(failure.message ?? 'upstream error', code ?? CODE.server, {
           status: failure.status,
           providerRetryAfterMs: failure.providerRetryAfterMs,
         })
+      }
+      // 出内容即清熔断分：sticky 出口恢复正常（非 RETRY_ON 的失败如配额/业务错
+      // 不是"出口不行"，换出口也一样，不碰熔断计数）
+      if (sawContent || (failure !== undefined && !RETRY_ON.has(code))) {
+        if (sessionId) clearStickyFailures(sessionId)
       }
 
       // A max-tokens finish means the adapter judged a tool call unexecutable

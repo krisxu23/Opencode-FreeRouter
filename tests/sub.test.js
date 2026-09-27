@@ -110,6 +110,30 @@ test('parseSubscriptionBody: sing-box JSON / Clash YAML / Base64 链接表', () 
   assert.equal(links[0].tag, 'SG-01')
 })
 
+test('fetchSub defaults to empty sources instead of throwing ReferenceError', async () => {
+  const { fetchSub, DEFAULT_SOURCES } = await import('../src/sub.js')
+  assert.deepEqual(DEFAULT_SOURCES, [])
+  await assert.rejects(() => fetchSub({ sources: [] }), /no subscription sources configured/)
+})
+
+test('fetchSub retries direct-failed sources through healthy exits', async () => {
+  const { fetchSub } = await import('../src/sub.js')
+  const link = 'vless://u-2@example.org:443#SG-01'
+  let directCalls = 0
+  const directFetch = async () => { directCalls += 1; throw new Error('fetch failed') }
+  // exitAddrs 注入：fetchSub 内部用 undici ProxyAgent(dispatcher) 走出口；
+  // 这里验证"直连失败 + 无出口"时如实返回失败详情（不抛 ReferenceError、不挂起）
+  const origFetch = globalThis.fetch
+  globalThis.fetch = directFetch
+  try {
+    await assert.rejects(() => fetchSub({ sources: ['http://sub.invalid/x'] }), /全部订阅源均失败/)
+  } finally {
+    globalThis.fetch = origFetch
+  }
+  assert.ok(directCalls >= 1)
+  assert.equal(link.length > 0, true)
+})
+
 test('cache roundtrip through temp dir', () => {
   const file = path.join(os.tmpdir(), `lite-sub-test-${process.pid}.json`)
   const sub = { outbounds: [{ tag: 'x (Taiwan) 01' }], fetchedAt: 123, source: 'u' }

@@ -1,12 +1,16 @@
 /**
  * Model catalog for the free lane.
  *
- * Two sources, deliberately layered so no single one can break the plugin:
+ * Three sources, deliberately layered so no single one can break the plugin:
  *
  * 1. the upstream listing itself (`/zen/v1/models`) — the authoritative set of
  *    ids the gateway will currently name;
  * 2. a vetted local capability table (context window / vision / reasoning),
- *    because the upstream listing discloses an id and nothing else.
+ *    because the upstream listing discloses an id and nothing else;
+ * 3. a models.dev limit overlay (src/limits.js) — the same `opencode`
+ *    provider rows OpenChamber's Zen page renders, refreshed daily and matched
+ *    by exact free-lane id. Applied in index.js/engine.js, not here, so this
+ *    module stays offline-safe.
  *
  * @module src/catalog.js
  */
@@ -19,20 +23,34 @@ export const UPSTREAM_MODELS_URL = 'https://opencode.ai/zen/v1/models'
 const ALWAYS_FREE = new Set(['union-alpha', 'space-bunny-free', 'big-pickle'])
 
 /**
- * Local capability baseline. `contextWindow`/`maxOutput` are the provider's
- * published capacities; `vision` is what this lane actually accepted under a
- * direct image-input probe, not what a model card claims.
+ * Local capability baseline. Values track the `opencode` provider rows in
+ * models.dev (`https://models.dev/providers/opencode`, i.e. the same table
+ * OpenChamber's Zen page renders as `xx万`), NOT the canonical/OpenRouter
+ * rows — the `-free` lane rows carry the lane quota (e.g. mimo-v2.6-flash-free
+ * 200000/32000 vs the canonical 1048576/131072). `vision` is what this lane
+ * actually accepted under a direct image-input probe, not what a model card
+ * claims; `reasoning`/`attachment` follow the models.dev Zen row where known.
+ *
+ * A network overlay (src/limits.js) refreshes these from models.dev daily;
+ * this table is the offline/first-boot fallback, so it must stay close.
  */
 export const CAPABILITIES = [
-  { match: /^mimo.*v2\.6/, vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 131072, canDisableThinking: false },
-  { match: /^mimo.*v2\.5/, vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 131072, canDisableThinking: false },
-  { match: /^mimo/, vision: true, reasoning: true, contextWindow: 262144, maxOutput: 131072 },
+  { match: /^longcat/, vision: true, reasoning: true, contextWindow: 1000000, maxOutput: 131072 },
+  { match: /^space.?bunny/, vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 524288 },
+  { match: /^mimo.*v2\.6/, vision: true, reasoning: true, contextWindow: 200000, maxOutput: 32000, canDisableThinking: false },
+  { match: /^mimo.*v2\.5/, vision: true, reasoning: true, contextWindow: 200000, maxOutput: 32000, canDisableThinking: false },
+  { match: /^mimo/, vision: true, reasoning: true, contextWindow: 262144, maxOutput: 65536 },
   { match: /^muse.?spark/, vision: true, reasoning: true, contextWindow: 1048576, maxOutput: 131072 },
-  { match: /^nemotron/, vision: false, reasoning: true, contextWindow: 128000, maxOutput: 32768 },
-  { match: /^ling/, vision: false, reasoning: true, contextWindow: 128000, maxOutput: 32768 },
-  { match: /^space.?bunny/, vision: true, reasoning: true, contextWindow: 262144, maxOutput: 65536 },
+  { match: /^nemotron.*3\.5.*lightning/, vision: false, reasoning: true, contextWindow: 262144, maxOutput: 262144 },
+  { match: /^nemotron.*ultra/, vision: false, reasoning: true, contextWindow: 1000000, maxOutput: 128000 },
+  { match: /^nemotron/, vision: false, reasoning: true, contextWindow: 262144, maxOutput: 128000 },
+  { match: /^ling/, vision: false, reasoning: true, contextWindow: 262144, maxOutput: 32768 },
+  { match: /^big.?pickle/, vision: false, reasoning: true, contextWindow: 200000, maxOutput: 32000 },
   { match: /^union/, vision: true, reasoning: false, contextWindow: 262144, maxOutput: 131072 },
-  { match: /^deepseek/, vision: false, reasoning: true, contextWindow: 128000, maxOutput: 64000 },
+  { match: /^deepseek/, vision: false, reasoning: true, contextWindow: 200000, maxOutput: 128000 },
+  { match: /^kimi/, vision: true, reasoning: true, contextWindow: 262144, maxOutput: 262144 },
+  { match: /^qwen/, vision: true, reasoning: true, contextWindow: 262144, maxOutput: 65536 },
+  { match: /^glm/, vision: false, reasoning: true, contextWindow: 204800, maxOutput: 131072 },
   { match: /^jev/, vision: false, reasoning: false, contextWindow: 32768, maxOutput: 4096 },
 ]
 
@@ -40,6 +58,7 @@ export const CAPABILITIES = [
 const DISPLAY_NAMES = {
   'mimo-v2.6-flash-free': 'MiMo V2.6 Flash',
   'mimo-v2.5-free': 'MiMo V2.5',
+  'mimo-v2-pro-free': 'MiMo V2 Pro',
   'muse-spark-1.3-contributor-free': 'Muse Spark 1.3',
   'muse-spark-1.2-contributor-free': 'Muse Spark 1.2',
   'nemotron-3-ultra-free': 'Nemotron 3 Ultra',
@@ -48,6 +67,11 @@ const DISPLAY_NAMES = {
   'space-bunny-free': 'Space Bunny',
   'union-alpha': 'Union Alpha',
   'deepseek-v4-flash-free': 'DeepSeek V4 Flash',
+  'longcat-2.5-preview-free': 'LongCat 2.5 Preview',
+  'longcat-2.0-free': 'LongCat 2.0',
+  'kimi-k2.5-free': 'Kimi K2.5',
+  'qwen3.6-plus-free': 'Qwen 3.6 Plus',
+  'glm-5-free': 'GLM 5',
   'jev-1.13-free': 'Jev 1.13',
 }
 

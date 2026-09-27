@@ -19,6 +19,7 @@
  */
 
 import path from 'node:path'
+import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { execFile } from 'node:child_process'
 import { generateKey, startForwardServer } from './forward.js'
@@ -28,8 +29,10 @@ import { JsonStore, SETTINGS_INITIAL } from './store.js'
 import { fetchSub, filterByGroups, loadCache, saveCache, bucketOf, countryOf, GROUPS } from './sub.js'
 import { assignPorts, sanitizeOutbound, buildConfig, writeConfig, startSingbox, watchSingbox, waitPort, waitPortFree, pidHoldingPort, pidImageName, killPid } from './singbox.js'
 import { fetchUpstreamIds, probeModel } from './probe.js'
+import { pruneDispatchers } from './http.js'
 import { probeAll } from './nodeprobe.js'
 import { buildCatalog } from './catalog.js'
+import { refreshLimits, applyLimitsOverlay, loadLimitsCache } from './limits.js'
 import { initLogger, logger } from './logger.js'
 import * as registry from './registry.js'
 import * as health from './health.js'
@@ -73,7 +76,7 @@ let rebuildAgain = null
 let probeRunning = false
 let probeRerun = false
 
-const state = () => ({ catalog, membership, settings: settingsOf(), attributionUserAgent: '' })
+const state = () => ({ catalog, membership, settings: settingsOf(), attributionUserAgent: '', limitsById })
 
 // 用量记账（README 亮点"用量看板，全部留在本机"的轻量版）：按天 + 按模型 +
 // 最近采样。stats 绝不能影响一次回答，全程 fail-soft。
@@ -109,29 +112,128 @@ const engine = createEngine({
 // ---- catalog ----------------------------------------------------------------
 
 let catalogRetryTimer
+let lastUpstreamIds = []
+const LIMITS_CACHE_FILE = path.join(DATA, 'modelsdev.json')
+const CATALOG_CACHE_FILE = path.join(DATA, 'catalog-ids.json')
+// Boot with the disk cache so the first listing already carries Zen-lane
+// numbers; the async refresh below then brings it up to date. Fail-soft:
+// absent/corrupt cache = empty overlay = local CAPABILITIES table serves.
+const _limitsCache = loadLimitsCache(LIMITS_CACHE_FILE)
+let limitsById = _limitsCache?.byId ?? {}
+let limitsFetchedAt = _limitsCache?.fetchedAt ?? null
+let limitsStale = false
+
+/** Last-good upstream id list (atomic temp+rename), so a boot with direct
+ *  blocked still shows the model list immediately. */
+function loadCatalogCache() {
+  try {
+    const j = JSON.parse(fs.readFileSync(CATALOG_CACHE_FILE, 'utf8'))
+    return Array.isArray(j?.ids) && j.ids.length > 0 ? j.ids.filter(id => typeof id === 'string') : null
+  } catch {
+    return null
+  }
+}
+function saveCatalogCache(ids) {
+  try {
+    fs.mkdirSync(path.dirname(CATALOG_CACHE_FILE), { recursive: true })
+    const tmp = `${CATALOG_CACHE_FILE}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify({ fetchedAt: Date.now(), ids }))
+    fs.renameSync(tmp, CATALOG_CACHE_FILE)
+  } catch { /* cache must never break a refresh */ }
+}
+
+// Boot straight from disk so the panel shows the list even when direct is
+// blocked on this machine (measured: direct fetch failed on the user's host
+// while models.dev + node exits worked).
+const _bootIds = loadCatalogCache()
+if (_bootIds) {
+  lastUpstreamIds = _bootIds
+  catalog = applyLimitsOverlay(buildCatalog(_bootIds), limitsById)
+  membership = { 'our-free-model': catalog.map(entry => entry.id) }
+  health.seedRestrictedModels(catalog.filter(entry => entry.regionSensitive).map(entry => entry.id))
+}
+
+function applyIds(ids, via) {
+  lastUpstreamIds = ids
+  saveCatalogCache(ids)
+  catalog = applyLimitsOverlay(buildCatalog(ids), limitsById)
+  membership = { 'our-free-model': catalog.map(entry => entry.id) }
+  // catalog 的 regionSensitive 名单（muse-spark 系）预置为受限模型，补探据此发现特殊节点
+  health.seedRestrictedModels(catalog.filter(entry => entry.regionSensitive).map(entry => entry.id))
+  clearTimeout(catalogRetryTimer)
+  log(`catalog: ${catalog.length} free models via ${via}`)
+}
 
 /**
- * Refresh the free-model catalog. Always via DIRECT connection: the models
- * listing is anonymous-200 and direct is the fastest, most deterministic path —
- * the user sees the model list seconds after the program opens, without
- * waiting for nodes to be probed.
+ * Refresh the free-model catalog. DIRECT first (anonymous-200, fastest when
+ * the machine's route to opencode.ai is open), then a healthy node exit
+ * (pool/port table may be empty before the first rebuild — then skip), then
+ * the models.dev overlay ids as last resort (proves nothing about the lane,
+ * but keeps the picker + budgets working with Zen-lane numbers).
  */
 async function refreshCatalog(attempt = 0) {
   try {
-    const ids = await fetchUpstreamIds({ exitAddr: 'direct' })
-    catalog = buildCatalog(ids)
-    membership = { 'our-free-model': catalog.map(entry => entry.id) }
-    // catalog 的 regionSensitive 名单（muse-spark 系）预置为受限模型，补探据此发现特殊节点
-    health.seedRestrictedModels(catalog.filter(entry => entry.regionSensitive).map(entry => entry.id))
-    clearTimeout(catalogRetryTimer)
-    log(`catalog: ${catalog.length} free models via direct`)
-  } catch (error) {
-    log(`catalog refresh failed (${error?.message ?? error}); retry ${Math.min(attempt + 1, 5)}/5 in 60s`)
-    if (attempt < 5) {
-      clearTimeout(catalogRetryTimer)
-      catalogRetryTimer = setTimeout(() => void refreshCatalog(attempt + 1), 60000)
-      catalogRetryTimer.unref?.()
+    const ids = await fetchUpstreamIds({ exitAddr: 'direct', timeoutMs: 12000 })
+    applyIds(ids, 'direct')
+  } catch (directError) {
+    // Fallback 1: a live node exit. ports/pool may be empty on first boot.
+    const aliveTags = Object.keys(ports)
+    if (aliveTags.length > 0) {
+      const shuffled = aliveTags.sort(() => Math.random() - 0.5).slice(0, 3)
+      for (const tag of shuffled) {
+        try {
+          const ids = await fetchUpstreamIds({ exitAddr: `http://127.0.0.1:${ports[tag]}`, timeoutMs: 20000 })
+          applyIds(ids, `node ${tag.slice(0, 32)}`)
+          return
+        } catch { /* try next exit */ }
+      }
     }
+    // Fallback 2: models.dev overlay ids (in-memory, refreshed separately).
+    const overlayIds = Object.keys(limitsById)
+    if (overlayIds.length > 0) {
+      applyIds(overlayIds, 'models.dev overlay')
+    } else {
+      log(`catalog refresh failed (${directError?.message ?? directError}); retry ${Math.min(attempt + 1, 5)}/5 in 60s`)
+      if (attempt < 5) {
+        clearTimeout(catalogRetryTimer)
+        catalogRetryTimer = setTimeout(() => void refreshCatalog(attempt + 1), 60000)
+        catalogRetryTimer.unref?.()
+      }
+    }
+  }
+}
+
+/**
+ * Refresh the models.dev limit overlay (DIRECT fetch, ~5MB snapshot, 24h TTL).
+ * Never throws: a fetch failure keeps serving the stale disk cache, and a
+ * missing cache keeps serving the local table. On success the current catalog
+ * is rebuilt from the last upstream ids so the new numbers take effect
+ * without waiting for the next catalog poll.
+ */
+async function refreshLimitsOverlay({ force = false } = {}) {
+  try {
+    const r = await refreshLimits({ cacheFile: LIMITS_CACHE_FILE, force })
+    limitsById = r.byId
+    limitsFetchedAt = r.fetchedAt
+    limitsStale = r.stale === true
+    const n = Object.keys(limitsById).length
+    if (r.error && n === 0) {
+      log(`limits overlay refresh failed (${r.error}) — serving local CAPABILITIES`)
+      return r
+    }
+    if (lastUpstreamIds.length > 0) {
+      catalog = applyLimitsOverlay(buildCatalog(lastUpstreamIds), limitsById)
+      membership = { 'our-free-model': catalog.map(entry => entry.id) }
+    } else if (Object.keys(limitsById).length > 0) {
+      // catalog 拉取从未成功（如本机直连被封）时，用 overlay 的 id 先把
+      // 列表撑起来：picker 和预算都能工作，lane 真实性由后续 probe 校验。
+      applyIds(Object.keys(limitsById), 'models.dev overlay')
+    }
+    log(`limits overlay: ${n} opencode rows${r.stale ? ' (stale cache)' : ''}${r.error ? ` (fetch failed: ${r.error})` : ''}`)
+    return r
+  } catch (error) {
+    log(`limits overlay refresh failed (${error?.message ?? error}) — keeping previous overlay`)
+    return { byId: limitsById, fetchedAt: limitsFetchedAt, stale: true, error: String(error?.message ?? error).slice(0, 160) }
   }
 }
 
@@ -165,8 +267,21 @@ async function rebuild(attempt = 0) {
     const cacheFile = path.join(DATA, 'subs_cache.json')
     let sub = null
     let stats = { total: 0, matched: 0 }
+    // `picked` is read again by the final log line, which sits OUTSIDE this
+    // branch — it has to outlive the `if (sub)` block (a block-scoped const
+    // there threw `picked is not defined` at the end of every rebuild).
+    let picked = []
     if (s.subUrls.length > 0) {
-      sub = await fetchSub({ sources: s.subUrls }).catch(() => null)
+      // 健康出口复拉：本机直连被封时，用上一轮存活节点的本地端口去拉订阅。
+      // 优先探测实测 alive 的节点；无 alive 时退化用全部已知端口（尽力而为）。
+      const snap = health.nodeSnapshot()
+      const alivePorts = Object.entries(snap)
+        .filter(([, v]) => v?.state === 'alive')
+        .map(([tag]) => ports[tag])
+        .filter(p => p != null)
+      const poolPorts = (alivePorts.length > 0 ? alivePorts : Object.values(ports).filter(p => p != null)).slice(0, 12)
+      const exitAddrs = poolPorts.map(p => `http://127.0.0.1:${p}`)
+      sub = await fetchSub({ sources: s.subUrls, exitAddrs }).catch(() => null)
       if (!sub) sub = loadCache(cacheFile)
     }
     if (sub) {
@@ -174,8 +289,9 @@ async function rebuild(attempt = 0) {
       if (sub.details) {
         log('订阅源: ' + sub.details.map(d => `${d.url.slice(0, 48)} → ${d.ok ? d.nodes + ' 节点' : '失败(' + d.error + ')'}`).join(' | '))
       }
-      const { picked, stats: st } = filterByGroups(sub.outbounds, s.countries)
-      stats = st
+      const filtered = filterByGroups(sub.outbounds, s.countries)
+      picked = filtered.picked
+      stats = filtered.stats
       // 拉取结果只是注册表的增量输入：新节点加入、重复丢弃；源抖动不会缩小池子
       const merged = registry.mergeNodes(picked)
       registry.prune()
@@ -187,6 +303,9 @@ async function rebuild(attempt = 0) {
       log('未配置订阅或全部拉取失败 — 使用注册表历史节点；注册表为空则以纯直连兜底模式启动')
     }
     const candidates = registry.all()
+    // No subscription this round (registry history / direct fallback): the final
+    // log line still wants a "共 N" figure, so it falls back to the pool size.
+    if (picked.length === 0) picked = candidates
     const sanitized = candidates.map(o => sanitizeOutbound(structuredClone(o))).filter(Boolean)
     ports = assignPorts(sanitized, ports, { base: s.portBase, span: s.portSpan, avoid: portBlacklist })
     const ported = sanitized.filter(o => ports[o.tag] != null)
@@ -194,14 +313,18 @@ async function rebuild(attempt = 0) {
       log(`端口段 ${s.portBase}+${s.portSpan} 已满：${candidates.length - ported.length} 个节点未启用 — 可在面板调大"端口段容量"`)
     }
     pool = ported.map(o => ({ tag: o.tag, country: countryOf(o.tag) }))
-    // 兜底口被占（可能是你自己的代理软件）时自动顺延，不强抢
+    // 兜底口被占（可能是你自己的代理软件）时自动顺延，不强抢。
+    // 并行扫描：串行 100×400ms 最坏卡启动 40s。
     let catchAllPort = s.catchAllPort
     if (singboxProc === null || singboxProc.exitCode !== null) {
-      for (let p = s.catchAllPort; p < s.catchAllPort + 100; p++) {
-        if (await waitPortFree(p, 400)) { catchAllPort = p; break }
-        if (p === s.catchAllPort) continue
+      const scanned = await Promise.all(
+        Array.from({ length: 100 }, (_, k) => s.catchAllPort + k).map(async p => ({ p, free: await waitPortFree(p, 400) })),
+      )
+      const hit = scanned.find(r => r.free)
+      if (hit && hit.p !== s.catchAllPort) {
+        catchAllPort = hit.p
+        log(`兜底口 ${s.catchAllPort} 被占用（可能是本机其他代理软件），改用 ${catchAllPort}`)
       }
-      if (catchAllPort !== s.catchAllPort) log(`兜底口 ${s.catchAllPort} 被占用（可能是本机其他代理软件），改用 ${catchAllPort}`)
     }
     const configPath = path.join(DATA, 'singbox.json')
     writeConfig(configPath, buildConfig(ported, ports, { catchAllPort }))
@@ -329,6 +452,9 @@ async function rebuild(attempt = 0) {
     })
     health.pruneStale(ported.map(o => o.tag))
     health.persistHealth()
+    // dispatcher 裁剪：端口表每轮 rebuild 都变，过期 ProxyAgent 必须关掉并丢弃，
+    // 否则连接泄漏（Free-Router 27k 陈旧条目事故的 dispatcher 版）。
+    pruneDispatchers(Object.values(ports).map(p => `http://127.0.0.1:${p}`))
     const portValues = Object.values(ports)
     log(`rebuild ok: ${ported.length} nodes${ported.length < picked.length ? ` (共 ${picked.length}，端口段不够)` : ''}, ports ${Math.min(...portValues)}-${Math.max(...portValues)}`)
     void refreshCatalog()
@@ -368,14 +494,28 @@ async function probeNow() {
     // Region matrix supplement: for models measured region-restricted by real
     // traffic, probe up to 24 still-unknown alive exits with the smallest real
     // request (16 tokens). Throttled/unknown verdicts stay unknown.
+    // Bounded concurrency (was: serial await — 2 models × 24 nodes × 20s worst
+    // case ≈ 16min holding the probeRunning single-flight lock).
+    const regionJobs = []
     for (const model of health.regionSnapshot().models) {
       for (const nodeKey of health.regionProbeCandidates(model, { max: 24 })) {
         const port = ports[nodeKey]
         if (port == null) continue
-        const result = await probeModel({ id: model }, { exitAddr: `http://127.0.0.1:${port}`, timeoutMs: 20000 })
-        if (result.state === 'available') { health.noteRegionOK(model, nodeKey); health.markRestrictedOk(nodeKey) }
-        else if (result.state === 'region-blocked') health.noteRegionError(model, nodeKey)
+        regionJobs.push({ model, nodeKey, port })
       }
+    }
+    if (regionJobs.length > 0) {
+      let regionCursor = 0
+      const regionRun = async () => {
+        while (regionCursor < regionJobs.length) {
+          const { model, nodeKey, port } = regionJobs[regionCursor++]
+          const result = await probeModel({ id: model }, { exitAddr: `http://127.0.0.1:${port}`, timeoutMs: 20000 }).catch(() => null)
+          if (!result) continue
+          if (result.state === 'available') { health.noteRegionOK(model, nodeKey); health.markRestrictedOk(nodeKey) }
+          else if (result.state === 'region-blocked') health.noteRegionError(model, nodeKey)
+        }
+      }
+      await Promise.all(Array.from({ length: Math.max(1, Math.min(8, regionJobs.length)) }, regionRun))
     }
   } finally {
     probeRunning = false
@@ -424,21 +564,26 @@ const panel = await startPanel({
       singbox: { running: singboxProc !== null && singboxProc.exitCode === null, pid: singboxProc?.pid ?? null, catchAllPort: settingsOf().catchAllPort },
       forward: { running: true, port: forward.port, key: settingsOf().forwardKey },
       models: catalog.map(entry => entry.id), // buildCatalog 只保留免费车道，付费模型不进目录
+      modelCaps: Object.fromEntries(catalog.map(entry => [entry.id, { contextWindow: entry.contextWindow, maxOutput: entry.maxOutput }])),
+      limits: { rows: Object.keys(limitsById).length, fetchedAt: limitsFetchedAt, stale: limitsStale },
       nodes: pool.map(node => ({ tag: node.tag, country: node.country, port: ports[node.tag], ...(health.nodeSnapshot()[node.tag] ?? { state: 'unknown', latencyMs: -1 }) })),
       regionModels: health.regionSnapshot().models,
       usage: { today: st.days?.[today] ?? { req: 0, in: 0, out: 0 }, requests: st.requests, byModel: st.models ?? {} },
     }
   },
-  actions: { probeNow, refresh: rebuild },
+  actions: { probeNow, refresh: rebuild, refreshLimits: refreshLimitsOverlay },
   log: message => logger.warn('panel:', message),
 })
 
 log(`panel   : http://127.0.0.1:${panel.port}`)
 log(`forward : http://127.0.0.1:${forward.port}/v1 (key ${settingsOf().forwardKey.slice(0, 8)}…)`)
+if (limitsFetchedAt) log(`limits overlay: ${Object.keys(limitsById).length} opencode rows from disk cache`)
 void refreshCatalog() // 直连立即拉模型列表：程序一开就能看到，不等订阅/节点
+void refreshLimitsOverlay() // models.dev Zen 行 overlay（24h TTL，失败则沿用本地表/磁盘缓存）
 await rebuild().catch(error => log(`initial rebuild failed (idle state): ${error?.message ?? error}`))
 setInterval(() => void probeNow().catch(() => {}), Math.max(5, settingsOf().probeIntervalMin) * 60_000).unref?.()
 setInterval(() => void rebuild().catch(() => {}), 6 * 3600_000).unref?.()
+setInterval(() => void refreshLimitsOverlay().catch(() => {}), 24 * 3600_000).unref?.()
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {

@@ -137,10 +137,12 @@ export async function detectEgress({ exitAddr, signal, timeoutMs = 8000 } = {}) 
 
 /**
  * Refresh the model listing from the gateway.
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs] - GET timeout (default 15000)
  * @returns {Promise<string[]>} ids, in upstream order
  */
-export async function fetchUpstreamIds({ exitAddr, attributionUserAgent, signal } = {}) {
-  const payload = await getJson('/zen/v1/models', { exitAddr, session: sessionForConversation('catalog:our-free-model'), requestId: mintRequestId(), attributionUserAgent, signal })
+export async function fetchUpstreamIds({ exitAddr, attributionUserAgent, signal, timeoutMs } = {}) {
+  const payload = await getJson('/zen/v1/models', { exitAddr, session: sessionForConversation('catalog:our-free-model'), requestId: mintRequestId(), attributionUserAgent, signal, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
   const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload?.models) ? payload.models : []
   return rows.map(row => (typeof row === 'string' ? row : row?.id)).filter(id => typeof id === 'string' && id !== '')
 }

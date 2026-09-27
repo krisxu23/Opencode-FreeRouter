@@ -5,8 +5,9 @@
 // 组件清单：
 //   Opencode-FreeRouter.exe   Go 托盘壳（已嵌图标）
 //   runtime/node.exe          Node 运行时（取自本机正在使用的 node，优先于 PATH）
-//   src/                      网关源码（ESM）
+//   src/                      网关源码（ESM，含 limits.js 的 models.dev 限额同步）
 //   node_modules/undici       唯一第三方依赖（零二级依赖）
+//   node_modules/yaml         订阅 YAML 解析依赖
 //   bin/sing-box.exe          sing-box v1.14.0 内核
 //   package.json              ESM 标记 + 元数据
 //   LICENSE / NOTICE / README.md
@@ -18,8 +19,13 @@ import { fileURLToPath } from 'node:url'
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const { version } = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 const NAME = 'Opencode-FreeRouter'
-const stage = path.join(ROOT, 'release', NAME)
-const zipPath = path.join(ROOT, 'release', `${NAME}-v${version}-windows-x64.zip`)
+// 时间后缀：node scripts/build-release.mjs 20260927-1205
+// 不传则保持旧行为（覆盖 release/Opencode-FreeRouter）。传时间戳则新旧共存，
+// 避免运行中的旧 exe 锁住目录导致 rmSync EPERM。
+const stampArg = (process.argv[2] ?? '').trim().replace(/[^0-9-]/g, '')
+const suffix = stampArg ? `-${stampArg}` : ''
+const stage = path.join(ROOT, 'release', `${NAME}${suffix}`)
+const zipPath = path.join(ROOT, 'release', `${NAME}-v${version}${suffix}-windows-x64.zip`)
 
 console.log('== 打包 Opencode-FreeRouter v' + version + ' ==')
 rmSync(stage, { recursive: true, force: true })
@@ -35,6 +41,7 @@ cpSync(process.execPath, path.join(stage, 'runtime', 'node.exe'))
 // 3. 源码 + 依赖 + 内核 + 文档
 cpSync(path.join(ROOT, 'src'), path.join(stage, 'src'), { recursive: true })
 cpSync(path.join(ROOT, 'node_modules', 'undici'), path.join(stage, 'node_modules', 'undici'), { recursive: true })
+cpSync(path.join(ROOT, 'node_modules', 'yaml'), path.join(stage, 'node_modules', 'yaml'), { recursive: true })
 cpSync(path.join(ROOT, 'bin', 'sing-box.exe'), path.join(stage, 'bin', 'sing-box.exe'), { recursive: false })
 for (const f of ['package.json', 'LICENSE', 'NOTICE', 'README.md']) {
   cpSync(path.join(ROOT, f), path.join(stage, f))
@@ -58,7 +65,8 @@ writeFileSync(path.join(stage, '运行说明.txt'), [
 const required = [
   `${NAME}.exe`, 'runtime/node.exe', 'bin/sing-box.exe',
   'src/index.js', 'src/panel.js', 'src/engine.js', 'src/singbox.js', 'src/upstream.js',
-  'node_modules/undici/index.js', 'package.json', 'LICENSE', 'NOTICE', 'README.md', '运行说明.txt',
+  'src/catalog.js', 'src/limits.js', 'src/effort.js',
+  'node_modules/undici/index.js', 'node_modules/yaml/dist/index.js', 'package.json', 'LICENSE', 'NOTICE', 'README.md', '运行说明.txt',
 ]
 for (const rel of required) {
   const p = path.join(stage, rel)

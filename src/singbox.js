@@ -136,9 +136,14 @@ export function sanitizeOutbound(ob) {
  * per node. Nodes without a port (port range exhausted) are omitted entirely.
  */
 export function buildConfig(outbounds, ports, { catchAllPort }) {
-  const list = outbounds
-    .filter(o => ports[o.tag] != null)
-    .map((o, i) => ({ tag: o.tag, port: ports[o.tag], inTag: `in-${i}` }))
+  const byTag = new Map((outbounds ?? []).map(o => [o?.tag, o]))
+  const list = []
+  let i = 0
+  for (const [tag, port] of Object.entries(ports)) {
+    const ob = byTag.get(tag)
+    if (!ob) continue
+    list.push({ tag, port, ob, inTag: `in-${i++}` })
+  }
   return {
     log: { level: 'warn' },
     // Local DNS + explicit resolver: direct-outbound domains (catch-all traffic)
@@ -149,7 +154,7 @@ export function buildConfig(outbounds, ports, { catchAllPort }) {
       ...list.map(e => ({ type: 'mixed', tag: e.inTag, listen: '127.0.0.1', listen_port: e.port })),
       { type: 'mixed', tag: CATCHALL_TAG, listen: '127.0.0.1', listen_port: catchAllPort },
     ],
-    outbounds: [...list.map(e => outbounds.find(o => o.tag === e.tag)), { type: 'direct', tag: 'direct' }],
+    outbounds: [...list.map(e => e.ob), { type: 'direct', tag: 'direct' }],
     route: {
       rules: list.map(e => ({ inbound: [e.inTag], outbound: e.tag })),
       final: 'direct',

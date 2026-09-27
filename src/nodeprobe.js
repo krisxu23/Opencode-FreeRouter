@@ -27,29 +27,48 @@ import { dispatcherFor } from './http.js'
 
 export const LIVENESS_URLS = ['https://1.1.1.1/cdn-cgi/trace', 'https://cp.cloudflare.com/generate_204']
 export const UPSTREAM_GATE_URL = 'https://opencode.ai/zen/v1/models'
+// ip-api.com 的免费档只支持 http —— 明文出境暴露出口 IP，只留两个 https 源。
+// 少一个 echo 候选的代价是可接受的：firstSuccess 本来就是"任一成功即够"。
 export const ECHO_URLS = [
   'https://api.ip.sb/geoip',
   'https://ipinfo.io/json',
-  'http://ip-api.com/json/?fields=status,countryCode,query', // free tier is http-only
 ]
 
-async function fetchVia(addr, url, timeoutMs) {
-  const init = { signal: AbortSignal.timeout(timeoutMs), redirect: 'error', headers: { accept: 'application/json', 'user-agent': 'lite-gateway-probe/0.2' } }
+async function fetchVia(addr, url, timeoutMs, externalSignal) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  timer.unref?.()
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort()
+    else externalSignal.addEventListener('abort', () => controller.abort(), { once: true })
+  }
+  const init = { signal: controller.signal, redirect: 'error', headers: { accept: 'application/json', 'user-agent': 'lite-gateway-probe/0.2' } }
   if (addr !== 'direct') init.dispatcher = dispatcherFor(addr)
-  return undiciFetch(url, init)
+  try {
+    return await undiciFetch(url, init)
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 async function drain(response) {
   try { await response.body?.cancel() } catch { /* already closed */ }
 }
 
-/** Concurrent shots; judges THROW on a non-verdict, so Promise.any resolves
- * with the first *good* value — resolving `undefined` would win the race
- * instantly and mark every node dead (measured incident). All-fail -> undefined. */
+/** Concurrent shots; winner takes the verdict. The losers are aborted on
+ *  first success — without this, ~half the peak concurrency is already-
+ *  meaningless fetches running to timeout, holding sing-box inbounds and
+ *  local ephemeral ports (measured under 128-worker rounds). All-fail ->
+ *  undefined. Judges THROW on a non-verdict, so Promise.any resolves with
+ *  the first *good* value — resolving `undefined` would win the race
+ *  instantly and mark every node dead (measured incident). */
 async function firstSuccess(urls, addr, judge, timeoutMs) {
-  const shots = urls.map(async url => judge(await fetchVia(addr, url, timeoutMs), url))
+  const controllers = urls.map(() => new AbortController())
+  const shots = urls.map((url, i) => (async () => judge(await fetchVia(addr, url, timeoutMs, controllers[i].signal), url))())
   try {
-    return await Promise.any(shots)
+    const winner = await Promise.any(shots)
+    for (const c of controllers) { try { c.abort() } catch { /* already settled */ } }
+    return winner
   } catch {
     return undefined
   }
@@ -64,23 +83,25 @@ function exitInfoOf(json) {
 
 /**
  * Probe one node exit.
+ *
+ * Stage 1 runs liveness AND the upstream gate concurrently (first success of
+ * either wins): an exit that reaches opencode.ai but not Cloudflare is usable
+ * for our purposes — the old serial gate ("Cloudflare first, gate only if
+ * liveness passed") misjudged such exits as dead without ever trying the
+ * upstream. The gate is an anonymous-200 zero-quota GET, so folding it into
+ * stage 1 costs nothing.
  * @param {string} addr - `http://127.0.0.1:<port>` (or 'direct' for the catch-all)
  * @returns {Promise<{state:'alive'|'dead', latencyMs:number, exitIp?:string, exitCountry?:string}>}
  */
 export async function probeNode(addr, { timeoutMs = 12000 } = {}) {
   const t0 = Date.now()
-  const lat = await firstSuccess(LIVENESS_URLS, addr, async r => {
+  const reachable = await firstSuccess([...LIVENESS_URLS, UPSTREAM_GATE_URL], addr, async r => {
     await drain(r)
-    if (r.status !== 204 && r.status !== 200) throw new Error(`liveness HTTP ${r.status}`)
+    if (r.status !== 204 && r.status !== 200) throw new Error(`reachability HTTP ${r.status}`)
     return Date.now() - t0
   }, timeoutMs)
-  if (lat === undefined) return { state: 'dead', latencyMs: Date.now() - t0 }
-  const gate = await firstSuccess([UPSTREAM_GATE_URL], addr, async r => {
-    await drain(r)
-    if (r.status < 200 || r.status >= 300) throw new Error(`upstream gate HTTP ${r.status}`)
-    return true
-  }, timeoutMs)
-  if (gate === undefined) return { state: 'dead', latencyMs: Date.now() - t0 }
+  if (reachable === undefined) return { state: 'dead', latencyMs: Date.now() - t0 }
+  const lat = reachable
   const echo = await firstSuccess(ECHO_URLS, addr, async r => {
     const text = await r.text()
     const info = exitInfoOf(JSON.parse(text))

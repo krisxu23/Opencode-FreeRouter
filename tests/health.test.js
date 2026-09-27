@@ -6,7 +6,7 @@ import path from 'node:path'
 import {
   markProbe, healthOf, nodeUsable, pruneStale, persistHealth,
   noteRegionError, noteRegionOK, regionUsable, regionProbeCandidates,
-  noteSticky, exitForSession,
+  noteSticky, exitForSession, noteStickyFailure, clearStickyFailures, stickyBurned,
   pickExit, setHealthFile, seedRestrictedModels, isRestrictedModel,
 } from '../src/health.js'
 
@@ -111,4 +111,42 @@ test('seedRestrictedModels 预置受限名单', () => {
   seedRestrictedModels(['muse-spark-1.3-contributor-free'])
   assert.equal(isRestrictedModel('muse-spark-1.3-contributor-free'), true)
   assert.equal(isRestrictedModel('mimo-v2.6-flash-free'), false)
+})
+
+test('pickExit: EU/OTHER 分组按分桶匹配（回归：按原始国家码查表永远落空）', () => {
+  const pool = [
+    { tag: 'nl-1', country: 'NL' },
+    { tag: 'ca-1', country: 'CA' },
+    { tag: 'us-1', country: 'US' },
+  ]
+  const portOf = tag => ({ 'nl-1': 21000, 'ca-1': 21001, 'us-1': 21002 })[tag]
+  markProbe('nl-1', { state: 'alive', latencyMs: 50 })
+  markProbe('ca-1', { state: 'alive', latencyMs: 60 })
+  markProbe('us-1', { state: 'alive', latencyMs: 70 })
+  // EU 分组必须命中荷兰节点（bucketOf NL = EU），不能穿透到兜底
+  const eu = pickExit({ model: 'eu-model', countries: ['EU'], pool, portOf })
+  assert.equal(eu.nodeKey, 'nl-1')
+  // OTHER 分组必须命中加拿大节点（bucketOf CA = OTHER）
+  const other = pickExit({ model: 'other-model-2', countries: ['OTHER'], pool, portOf })
+  assert.equal(other.nodeKey, 'ca-1')
+  // 回退顺序：EU 优先，EU 无可用时才走 OTHER
+  const both = pickExit({ model: 'both-model', countries: ['EU', 'OTHER'], pool, portOf })
+  assert.equal(both.nodeKey, 'nl-1')
+})
+
+test('sticky fuse: 同一 sticky 连跪 2 次就轮换，第 3 次请求不再撞它', () => {
+  markProbe('fuse-a', { state: 'alive', latencyMs: 10 })
+  markProbe('fuse-b', { state: 'alive', latencyMs: 20 })
+  noteSticky('fuse-sess', 'fuse-a')
+  assert.equal(exitForSession('fuse-sess'), 'fuse-a')
+  noteStickyFailure('fuse-sess')
+  assert.equal(exitForSession('fuse-sess'), 'fuse-a') // 1 次还忍
+  noteStickyFailure('fuse-sess')
+  assert.equal(stickyBurned('fuse-sess'), true)
+  assert.equal(exitForSession('fuse-sess'), null) // 第 3 次请求直接换出口
+  // 新 sticky 落定后计数清零，恢复正常
+  noteSticky('fuse-sess', 'fuse-b')
+  assert.equal(exitForSession('fuse-sess'), 'fuse-b')
+  clearStickyFailures('fuse-sess')
+  assert.equal(stickyBurned('fuse-sess'), false)
 })

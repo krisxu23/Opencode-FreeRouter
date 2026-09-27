@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { assignPorts, sanitizeOutbound, buildConfig, watchSingbox, CATCHALL_TAG } from '../src/singbox.js'
+import { dispatcherFor, pruneDispatchers, dispatcherCount } from '../src/http.js'
 
 test('watchdog: onDead fires exactly once for a dead proc (timer leak regression)', async () => {
   let calls = 0
@@ -103,4 +104,23 @@ test('buildConfig: nodes without a port are omitted entirely', () => {
   assert.equal(cfg.inbounds.length, 3) // 2 node inbounds + catch-all
   assert.deepEqual(cfg.route.rules.map(r => r.outbound), ['n1', 'n3'])
   assert.ok(!cfg.outbounds.some(o => o.tag === 'n2'))
+})
+
+test('P0: pruneDispatchers 裁掉过期出口（连接泄漏回归）', () => {
+  dispatcherFor('http://127.0.0.1:29991')
+  dispatcherFor('http://127.0.0.1:29992')
+  assert.ok(dispatcherCount() >= 2)
+  const kept = pruneDispatchers(['http://127.0.0.1:29991'])
+  assert.equal(kept, dispatcherCount())
+  pruneDispatchers([])
+  assert.equal(dispatcherCount(), 0)
+})
+
+test('P2: buildConfig 无 O(N²) find（Map 索引，输出与旧语义一致）', () => {
+  const outbounds = Array.from({ length: 50 }, (_, i) => ({ tag: `m${i}`, type: 'vless' }))
+  const ports = Object.fromEntries(outbounds.map((o, i) => [o.tag, 22000 + i]))
+  const cfg = buildConfig(outbounds, ports, { catchAllPort: 20900 })
+  assert.equal(cfg.inbounds.length, 51)
+  assert.deepEqual(cfg.route.rules.map(r => r.outbound), outbounds.map(o => o.tag))
+  assert.deepEqual(cfg.outbounds.slice(0, 50).map(o => o.tag), outbounds.map(o => o.tag))
 })
