@@ -5,14 +5,30 @@ name: release
 # 现场构建并挂到 GitHub Release，不进 git（release/ 在 .gitignore）。
 on:
   push:
+    branches: [main]
+    paths-ignore: ['**.md']
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  test:
+    if: github.ref_type != 'tag'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
   build:
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +66,7 @@ jobs:
           if-no-files-found: error
 
       - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.ref_type == 'tag'
         with:
           files: release/*.zip
           generate_release_notes: true
