@@ -1,0 +1,56 @@
+name: release
+
+# 打 tag 即发版：git tag v<package.json version>-<yyyymmdd-hhmm> && git push origin <tag>
+# 例：v0.4.5-20260927-1200。构建产物（zip）由本工作流在 windows-latest 上
+# 现场构建并挂到 GitHub Release，不进 git（release/ 在 .gitignore）。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: launcher/go.mod
+
+      - run: npm ci
+      - run: npm test
+      - run: npm run fetch-singbox
+
+      - name: Build release zip
+        shell: pwsh
+        run: |
+          $ver = (Get-Content package.json | ConvertFrom-Json).version
+          $stamp = ''
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
+            if ($tag -match ('^v' + [regex]::Escape($ver) + '-(.+)$')) { $stamp = $Matches[1] }
+          }
+          if (-not $stamp) { $stamp = Get-Date -Format 'yyyyMMdd-HHmm' }
+          Write-Host "version=$ver stamp=$stamp"
+          node scripts/build-release.mjs $stamp
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Opencode-FreeRouter-windows-x64
+          path: release/*.zip
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: release/*.zip
+          generate_release_notes: true
