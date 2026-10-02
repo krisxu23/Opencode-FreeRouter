@@ -173,3 +173,38 @@ func TestParseClashYAMLReadsProxies(t *testing.T) {
 		t.Fatal("broken YAML must report an error")
 	}
 }
+
+// TestClashNumericProxyNameKeepsTheNode 钉住 R23:YAML 里没加引号的 `name: 123`
+// 被解成 int,而 Go 用类型断言 `pr["name"].(string)` 读到空串,于是整条代理被
+// ParseClashProxy 的「tag 为空」判据拒掉,节点静默消失。JS 是 String(p.name)
+// (src/sub.js:228-231),而 Go 在同一个文件的 sing-box JSON 路径用的是宽容的
+// str() —— 同一份数据两条路径行为相反,取宽容的那条。
+func TestClashNumericProxyNameKeepsTheNode(t *testing.T) {
+	text := `proxies:
+  - name: 123
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+`
+	outs, err := ParseClashYAML(text)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(outs) != 1 {
+		t.Fatalf("proxies = %d, want 1(数字名不得丢节点)", len(outs))
+	}
+	if outs[0].Tag != "123" {
+		t.Fatalf("tag = %q, want 123", outs[0].Tag)
+	}
+}
+
+// TestParseClashYamlDuplicateKeyIsAnError 是 R25 的前提:重复键必须是**错误**
+// 而不是静默回落 —— yaml.v3 的 uniqueKeys 判定是对的,错的是调用方把 err 丢了。
+func TestParseClashYamlDuplicateKeyIsAnError(t *testing.T) {
+	text := "proxies:\n  - name: a\n    type: ss\n    server: 1.2.3.4\n    port: 8388\nproxies:\n  - name: b\n    type: ss\n    server: 5.6.7.8\n    port: 8388\n"
+	if _, err := ParseClashYAML(text); err == nil {
+		t.Fatal("重复 proxies 键必须报错(错误信息由调用方决定是否上报)")
+	}
+}

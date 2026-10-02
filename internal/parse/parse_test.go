@@ -3,6 +3,7 @@ package parse
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -51,6 +52,77 @@ func TestVmessBase64(t *testing.T) {
 	}
 	if o.Transport == nil || o.Transport.Type != "ws" || o.Transport.Path != "/ws" {
 		t.Fatalf("transport = %+v", o.Transport)
+	}
+}
+
+// TestVmessWithFragmentStillParses 钉住 B14:v2rayN/v2rayNG 导出的 vmess 链接
+// 几乎恒带 `#名字`,而载荷是 base64 —— fragment 不是载荷的一部分。旧代码把整段
+// 余下内容喂给 b64decode:它丢掉 `#` 却留下其后的字母数字,于是载荷变成
+// 「base64 + 垃圾」,StdEncoding 在 padding 位报 CorruptInputError → 空串 →
+// JSON 失败 → 整条 vmess 静默丢弃,也就是订阅里**全部** vmess 节点。
+// 其他协议解析器开头都做一次 SplitN("#"),只有 vmess 漏了;Node 的
+// Buffer.from 对尾部垃圾宽容,所以 JS 不坏 —— 这是 Go 独有回归。
+func TestVmessWithFragmentStillParses(t *testing.T) {
+	payload := `{"add":"203.0.113.10","port":"443","id":"` + testUUID + `","net":"ws","path":"/vmpath","host":"vmh.example.com","tls":"tls","sni":"vmsni.example.com"}`
+	for _, b64 := range []string{
+		base64.StdEncoding.EncodeToString([]byte(payload)),
+		// 去掉 padding 的变体:订阅商两种都发,而 fragment 接在 padding 后面
+		// 是最容易踩的形状(StdEncoding 在 '=' 位直接报 CorruptInputError)。
+		strings.TrimRight(base64.StdEncoding.EncodeToString([]byte(payload)), "="),
+	} {
+		for _, frag := range []string{"", "#US-01", "#🇺🇸 US-01", "#%F0%9F%87%BA%F0%9F%87%B8%20US-01", "#美国 01"} {
+			o, err := ParseNodeURI("vmess://" + b64 + frag)
+			if err != nil {
+				t.Fatalf("fragment %q: %v", frag, err)
+			}
+			if o.Type != "vmess" || o.Server != "203.0.113.10" || o.ServerPort != 443 || o.UUID != testUUID {
+				t.Fatalf("fragment %q: 载荷解错 %+v", frag, o)
+			}
+			if o.Transport == nil || o.Transport.Path != "/vmpath" {
+				t.Fatalf("fragment %q: transport = %+v", frag, o.Transport)
+			}
+		}
+	}
+	// tag 仍然来自 fragment(与其他协议同一规则)
+	o, err := ParseNodeURI("vmess://" + base64.StdEncoding.EncodeToString([]byte(payload)) + "#US-01")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if o.Tag != "US-01" {
+		t.Fatalf("tag = %q, want US-01", o.Tag)
+	}
+}
+
+// TestSsPasswordsAreDecodedExactlyOnce 钉住 R26:SIP002 的 userinfo 有两种写法,
+// 只有**明文**那种是百分号编码的 —— base64 解出来的 method/password 是原子的,
+// 再解一次会把密码里恰好长成 `%XX` 的部分改掉(存进错误密码、连接失败、无诊断)。
+// legacy 分支恒是 base64,同理。判据:同一逻辑输入的两条分支结果必须一致。
+func TestSsPasswordsAreDecodedExactlyOnce(t *testing.T) {
+	// 明文分支:百分号编码要解(这条不变)
+	plain, err := ParseNodeURI("ss://aes-256-gcm:p%40ss@1.2.3.4:8388")
+	if err != nil {
+		t.Fatalf("plain: %v", err)
+	}
+	if plain.Password != "p@ss" {
+		t.Fatalf("明文分支 password = %q, want p@ss", plain.Password)
+	}
+	// base64 的 userinfo:解出来的就是原子密码,不得再解一次
+	b64ui := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:p%40ss"))
+	enc, err := ParseNodeURI("ss://" + b64ui + "@1.2.3.4:8388")
+	if err != nil {
+		t.Fatalf("encoded userinfo: %v", err)
+	}
+	if enc.Password != "p%40ss" {
+		t.Fatalf("base64 分支把密码二次百分号解码了: %q, want p%%40ss", enc.Password)
+	}
+	// legacy 分支(ss://base64(method:password@host:port))同样恒是 base64
+	legacy := base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:p%40ss@1.2.3.4:8388"))
+	leg, err := ParseNodeURI("ss://" + legacy)
+	if err != nil {
+		t.Fatalf("legacy: %v", err)
+	}
+	if leg.Password != "p%40ss" || leg.Server != "1.2.3.4" || leg.ServerPort != 8388 {
+		t.Fatalf("legacy 分支 = %+v, want password p%%40ss @1.2.3.4:8388", leg)
 	}
 }
 
@@ -304,13 +376,24 @@ func TestFilterByGroupsKeepsDirectOut(t *testing.T) {
 	if len(got2) != 1 || got2[0].Tag != "unknown-node" {
 		t.Fatalf("OTHER filter = %+v", got2)
 	}
-	// 同 tag 去重
+	// 去重键是**配置指纹**而不是 tag(R21):实测 data/subs_cache.json 的 1246 个
+	// 出站里有 7 个重复 tag 压掉了 84 个节点(disney_netflix_GB 76 个只留 1),
+	// 而对同一批代理重算 IdentityOf 得到 1241 个不同身份 —— 它们是真不同的服务器。
+	// JS 的 sub.js:146-153 同款按 tag 去重,所以这是双方共有的缺陷;管线其余去重点
+	// (registry.Merge、sub.Fetch 的轮内去重)都用 IdentityOf,这里跟着改齐。
 	dup := FilterByGroups([]Outbound{
 		{Tag: "US", Type: "vless", Server: "a.example", ServerPort: 443},
 		{Tag: "US", Type: "vless", Server: "b.example", ServerPort: 443},
 	}, []string{"US"})
-	if len(dup) != 1 {
-		t.Fatalf("tag dedup = %+v", dup)
+	if len(dup) != 2 {
+		t.Fatalf("同名不同服务器的出站被压掉了: %+v", dup)
+	}
+	same := FilterByGroups([]Outbound{
+		{Tag: "US", Type: "vless", Server: "a.example", ServerPort: 443},
+		{Tag: "US-alias", Type: "vless", Server: "a.example", ServerPort: 443},
+	}, []string{"US"})
+	if len(same) != 1 {
+		t.Fatalf("同一物理节点的别名没被折叠: %+v", same)
 	}
 }
 

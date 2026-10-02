@@ -74,6 +74,14 @@ func IdentityOf(o Outbound) string {
 	if o.Obfs != nil {
 		parts = append(parts, "obfs="+o.Obfs.Type+":"+o.Obfs.Password)
 	}
+	// 顶层 path(R22):sing-box-JSON 与 Clash 两条路径把 http 类代理的 path 放在
+	// **顶层**(clash.go 的 o.Path、SingBoxMap 也按顶层 path 发出),而过去只有
+	// transport.path 进指纹 ⇒ 两个只有顶层 path 不同的代理塌缩成同一身份,轮内去重
+	// 丢掉一个、Merge 把两台服务器当一个物理节点(连败与墓碑还会互相传染)。
+	// 只在非空时才拼:没有顶层 path 的既有身份串一字不变 —— 现网墓碑键不至于全部失配。
+	if o.Path != "" {
+		parts = append(parts, "path="+o.Path)
+	}
 	return strings.Join(parts, "|")
 }
 

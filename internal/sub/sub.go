@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net/http"
 	"regexp"
 	"strings"
@@ -22,7 +21,6 @@ import (
 	"freerouter/internal/check"
 	"freerouter/internal/httpclient"
 	"freerouter/internal/parse"
-	"freerouter/internal/persistence"
 )
 
 // Exit is one working node the fetcher can retry a failing source through.
@@ -235,8 +233,12 @@ func fetchOne(ctx context.Context, c *http.Client, url string, extra map[string]
 	if err != nil {
 		return nil, err
 	}
-	outbounds := parseSubscriptionBody(string(body))
+	outbounds, reason := parseSubscriptionBodyWithReason(string(body))
+	outbounds = dropUnroutable(outbounds)
 	if len(outbounds) == 0 {
+		if reason != "" {
+			return nil, fmt.Errorf("没有识别出任何节点：%s", reason)
+		}
 		return nil, errors.New("没有识别出任何节点（格式不受支持？）")
 	}
 	return outbounds, nil
@@ -246,7 +248,52 @@ func fetchOne(ctx context.Context, c *http.Client, url string, extra map[string]
 // 这道过滤在四种格式的汇合点收口（src/sub.js parseSubscriptionBody），而不是
 // 在各解析器里各写一遍。
 func parseSubscriptionBody(text string) []parse.Outbound {
-	return dropUnroutable(parseSubscriptionBodyRaw(text))
+	obs, _ := parseSubscriptionBodyWithReason(text)
+	return dropUnroutable(obs)
+}
+
+// parseSubscriptionBodyWithReason 是四种订阅格式的分发本体，顺序逐字照抄
+// src/sub.js:202-222：sing-box JSON → Clash YAML → 明文/整段 base64 节点链接。
+// 某一种格式认输（坏了、键不存在、空数组）就静默落到下一种。
+//
+// 第二个返回值是「认输的那些格式各自为什么认输」(R25)。回落顺序本身是对的，
+// 但过去把 ParseClashYAML 的 err 直接丢弃：一份带重复键的 Clash 订阅（整份文件
+// 认输）落到 ParseLinks（没有 ://）返回 nil，运维只能看到「格式不受支持？」，
+// 真因完全不可见 —— 而这两种情况在面板上长得一模一样。JS 的
+// `try { YAML.parse } catch { /* fall through */ }` 同样吞错（同源），
+// Go 侧把原因带上来。
+func parseSubscriptionBodyWithReason(text string) ([]parse.Outbound, string) {
+	body := strings.TrimSpace(text)
+	if body == "" {
+		return nil, ""
+	}
+	var reasons []string
+	if strings.HasPrefix(body, "{") {
+		obs, err := parse.ParseSingBoxJSON(body)
+		if err == nil && len(obs) > 0 {
+			return obs, ""
+		}
+		if err != nil {
+			reasons = append(reasons, "sing-box JSON: "+err.Error())
+		} else if len(obs) == 0 {
+			reasons = append(reasons, "sing-box JSON: outbounds 为空")
+		}
+	}
+	if proxiesLineRe.MatchString(body) || strings.Contains(body, "\nproxies:") || strings.HasPrefix(body, "proxies:") {
+		obs, err := parse.ParseClashYAML(body)
+		if err == nil && len(obs) > 0 {
+			return obs, ""
+		}
+		if err != nil {
+			reasons = append(reasons, "Clash YAML: "+err.Error())
+		} else {
+			reasons = append(reasons, "Clash YAML: proxies 为空")
+		}
+	}
+	if links := parse.ParseLinks(body); len(links) > 0 {
+		return links, ""
+	}
+	return nil, strings.Join(reasons, "; ")
 }
 
 // ParseSubscriptionBody 是 parseSubscriptionBody 的导出面。单独开一个导出名
@@ -256,30 +303,6 @@ func parseSubscriptionBody(text string) []parse.Outbound {
 // 函数，而不是在测试架里重拼 ParseClashYAML + dropUnroutable。
 func ParseSubscriptionBody(text string) []parse.Outbound {
 	return parseSubscriptionBody(text)
-}
-
-// parseSubscriptionBodyRaw 是四种订阅格式的分发本体，顺序逐字照抄
-// src/sub.js:202-222：sing-box JSON → Clash YAML → 明文/整段 base64 节点链接。
-// 某一种格式认输（坏了、键不存在、空数组）就静默落到下一种。
-func parseSubscriptionBodyRaw(text string) []parse.Outbound {
-	body := strings.TrimSpace(text)
-	if body == "" {
-		return nil
-	}
-	if strings.HasPrefix(body, "{") {
-		if obs, err := parse.ParseSingBoxJSON(body); err == nil && len(obs) > 0 {
-			return obs
-		}
-	}
-	if proxiesLineRe.MatchString(body) || strings.Contains(body, "\nproxies:") || strings.HasPrefix(body, "proxies:") {
-		if obs, err := parse.ParseClashYAML(body); err == nil && len(obs) > 0 {
-			return obs
-		}
-	}
-	if links := parse.ParseLinks(body); len(links) > 0 {
-		return links
-	}
-	return nil
 }
 
 // proxiesLineRe 对应 JS /^\s*proxies:\s*$/m：某一行只有 proxies: 键。
@@ -360,27 +383,9 @@ func truncate(s string, n int) string {
 	return string(r[:n])
 }
 
-// LoadCache 读上次成功的订阅缓存（离线启动的 last-good）。
-//
-// 文件不存在返回 *fs.PathError（Err=fs.ErrNotExist）：persistence.ReadJSONFile
-// 用 %w 包装 fs.ErrNotExist，而 os.IsNotExist 只对 os 自家的错误类型做 unwrap，
-// 不认泛型 %w 链 —— 计划的测试与调用方都用 os.IsNotExist 判"首跑无缓存"，这里
-// 翻回 os 认识的形状，errors.Is(err, fs.ErrNotExist) 同样成立。
-// 解析成功但 outbounds 为空不报错：调用方按 len(r.Outbounds)==0 视为无缓存
-// （JS 版 loadCache 对空 outbounds 返回 null 的等价语义）。
-func LoadCache(file string) (Result, error) {
-	var r Result
-	if err := persistence.ReadJSONFile(file, &r); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return Result{}, &fs.PathError{Op: "open", Path: file, Err: fs.ErrNotExist}
-		}
-		return Result{}, err
-	}
-	return r, nil
-}
-
-// SaveCache 原子落盘，2 空格缩进 —— 运维要能直接读和手补这个文件。JSON 形状
-// 与 data/subs_cache.json 一致：{"outbounds","fetchedAt","sources","details"}。
-func SaveCache(file string, r Result) error {
-	return persistence.WriteJSONFile(file, r, true)
-}
+// R28：这里曾有 LoadCache/SaveCache（data/subs_cache.json 的读写），生产零调用点。
+// JS 的 loadCache/saveCache 是活的（index.js:413-422：拉取失败回落缓存、成功才
+// 回写），Go 版把同一条语义交给了节点注册表 —— registry 每次 rebuild 都落盘、
+// 带墓碑与连败记忆，rebuild.go 的失败回落读的就是它。留着第二份 last-good 缓存
+// 只会让"离线启动用哪份名单"有两个答案，所以删掉而不是接线。
+// 现网 data/subs_cache.json（432KB，JS 遗留）自此无人读写，由运维自行删除。

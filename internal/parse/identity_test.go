@@ -40,6 +40,29 @@ func TestIdentityIncludesCredentialsAndTransport(t *testing.T) {
 	}
 }
 
+// TestIdentityIncludesTopLevelPath 钉住 R22:Clash / sing-box-JSON 路径把 http 类
+// 代理的 path 放在**顶层**(clash.go 写入 o.Path、SingBoxMap 也按顶层 path 发出),
+// 而 IdentityOf 只从 transport.path 拼 `path=` ⇒ 两个只有顶层 path 不同的代理塌缩
+// 成同一身份:sub.Fetch 的轮内去重丢掉一个,registry.Merge 把它们当同一物理节点,
+// 连败与墓碑还会跨服务器传染。JS 的 identityOf 同样只看 transport.path,所以这是
+// 双方共有缺陷,但 Go 的合并与墓碑都以它为键,后果比 JS 重。
+//
+// 只在字段非空时才拼:没有顶层 path 的既有身份串(以及现网文件里的墓碑键)一字不变。
+func TestIdentityIncludesTopLevelPath(t *testing.T) {
+	a := Outbound{Type: "http", Server: "h.example", ServerPort: 8080, Path: "/one"}
+	b := Outbound{Type: "http", Server: "h.example", ServerPort: 8080, Path: "/two"}
+	c := Outbound{Type: "http", Server: "h.example", ServerPort: 8080, Path: "/one"}
+	if IdentityOf(a) == IdentityOf(b) {
+		t.Fatalf("只有顶层 path 不同的两个代理塌缩成同一身份: %q", IdentityOf(a))
+	}
+	if IdentityOf(a) != IdentityOf(c) {
+		t.Fatalf("同一配置算出了两个身份: %q vs %q", IdentityOf(a), IdentityOf(c))
+	}
+	if got, want := IdentityOf(Outbound{Type: "http", Server: "h.example", ServerPort: 8080}), "http|h.example:8080"; got != want {
+		t.Fatalf("无顶层 path 的身份串 = %q, want %q:键形状不能漂,否则现存墓碑全部失配", got, want)
+	}
+}
+
 // JS 版落盘的墓碑键形状逐字节取样（形状，不是现网数据 —— 值全是合成样例）：
 //
 //	"vless|<ip>:<port>|uuid=…|sni=…|tr=ws|path=/Ra-vl|host=…"

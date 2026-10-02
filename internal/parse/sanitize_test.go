@@ -114,6 +114,114 @@ func TestSanitizeRequiresServerAndPort(t *testing.T) {
 	}
 }
 
+// TestSanitizeNeverWritesThroughToTheCaller 钉住 B15(移植错误)。JS 是在调用点
+// 先 structuredClone 再 sanitize(index.js:438),Go 漏了那层克隆,又把 Extra 的
+// 防御性拷贝放在 delete **之后** —— 于是注释声称的「保护调用方」做不到:Extra 是
+// map,值拷贝共享同一个底层桶。TLS 是指针,同一类问题:补 enabled/utls 会写回
+// 调用方的原始出站。生产调用点(app.go、rebuild.go、sbx.go)传的都是 sub.Fetch
+// 返回的原始切片。
+func TestSanitizeNeverWritesThroughToTheCaller(t *testing.T) {
+	extra := Extra{"xtls": map[string]any{"a": 1}, "detour": "x", "username": "u"}
+	clean, ok := SanitizeOutbound(Outbound{Type: "socks", Server: "h", ServerPort: 1080, Extra: extra})
+	if !ok {
+		t.Fatal("socks must pass")
+	}
+	if _, has := clean.Extra["xtls"]; has {
+		t.Fatal("返回的 Extra 里 xtls 必须被删掉")
+	}
+	if _, has := extra["xtls"]; !has {
+		t.Fatal("调用方的 Extra 被就地改写了:拷贝必须发生在 delete 之前")
+	}
+
+	tls := &TLS{ServerName: "s.example"}
+	out, ok := SanitizeOutbound(Outbound{Type: "vless", Server: "h", ServerPort: 443, UUID: testUUID, TLS: tls})
+	if !ok {
+		t.Fatal("vless must pass")
+	}
+	if tls.Enabled != nil {
+		t.Fatalf("调用方的 tls.enabled 被写成了 %v:sanitize 必须先在块内摘一份副本", *tls.Enabled)
+	}
+	if out.TLS == tls {
+		t.Fatal("返回的 TLS 与调用方共享同一个指针")
+	}
+	if out.TLS.Enabled == nil || !*out.TLS.Enabled {
+		t.Fatalf("副本上的 enabled 应当补齐: %+v", out.TLS)
+	}
+}
+
+// TestSanitizeEnforcesThePortVocabulary 钉住 B16:端口/端口段的唯一执法点过去
+// 只在链接路径(isValidPort/isValidPortRange),Clash 与 sing-box-JSON 两条路径
+// 只判「有没有」。于是 server_port=70000 一路通过 sanitize、到 sing-box 严格解码
+// uint16 才失败,而 app 的「剔除 N 个坏节点」只统计 sanitize 的拒收 —— 那种节点
+// 既不在池里也不在任何计数里。server_ports=["1:"] 更糟:sing-quic 把它展开成
+// 65535 个端口,条目数由订阅方控制(["1:","2:","3:"] ⇒ ~20 万)。
+func TestSanitizeEnforcesThePortVocabulary(t *testing.T) {
+	rejected := []struct {
+		what string
+		ob   Outbound
+	}{
+		{"port 0", Outbound{Type: "vless", Server: "h", ServerPort: 0, UUID: testUUID}},
+		{"port 65536", Outbound{Type: "vless", Server: "h", ServerPort: 65536, UUID: testUUID}},
+		{"port 70000", Outbound{Type: "vless", Server: "h", ServerPort: 70000, UUID: testUUID}},
+		{"open range 1:", Outbound{Type: "hysteria2", Server: "h", ServerPorts: []string{"1:"}, Password: "p"}},
+		{"bare port in range", Outbound{Type: "hysteria2", Server: "h", ServerPorts: []string{"443"}, Password: "p"}},
+		{"range above uint16", Outbound{Type: "hysteria2", Server: "h", ServerPorts: []string{"70000:70001"}, Password: "p"}},
+		{"obfs without password", Outbound{Type: "hysteria2", Server: "h", ServerPort: 443, Password: "p", Obfs: &Obfs{Type: "salamander"}}},
+	}
+	for _, tc := range rejected {
+		if _, ok := SanitizeOutbound(tc.ob); ok {
+			t.Errorf("%s 必须被拒(它会在 sing-box 侧失败或被放大)", tc.what)
+		}
+	}
+	accepted := []struct {
+		what string
+		ob   Outbound
+	}{
+		{"plain port", Outbound{Type: "vless", Server: "h", ServerPort: 443, UUID: testUUID}},
+		{"mport range", Outbound{Type: "hysteria2", Server: "h", ServerPorts: []string{"20000:20100"}, Password: "p"}},
+		{"single-port range", Outbound{Type: "hysteria2", Server: "h", ServerPorts: []string{"443:443"}, Password: "p"}},
+		{"obfs with password", Outbound{Type: "hysteria2", Server: "h", ServerPort: 443, Password: "p", Obfs: &Obfs{Type: "salamander", Password: "obfsp"}}},
+	}
+	for _, tc := range accepted {
+		if _, ok := SanitizeOutbound(tc.ob); !ok {
+			t.Errorf("%s 不该被拒", tc.what)
+		}
+	}
+	// 两者同时出现时以端口段为准(sing-box 的 hysteria2 二选一;链接路径
+	// parse.go:445 早就强制了,sanitize 过去从不 enforce)。
+	both, ok := SanitizeOutbound(Outbound{Type: "hysteria2", Server: "h", ServerPort: 443,
+		ServerPorts: []string{"20000:20100"}, Password: "p"})
+	if !ok {
+		t.Fatal("server_port 与 server_ports 并存不该丢节点,该归一")
+	}
+	if both.ServerPort != 0 {
+		t.Fatalf("server_port = %d, want 0(端口段优先)", both.ServerPort)
+	}
+}
+
+// TestSanitizeKeepsTlsOnHttpOutbound 钉住 R24:tlsCapableTypes 把 http 和
+// socks/shadowsocks/ssh 归成一类,但 sing-box v1.14 的 http 出站**有** tls
+// (protocol/http/outbound.go:37 用 options.TLS 建 dialer;socks/ss/ssh 确实没有)
+// ⇒ 一个 HTTPS 代理被静默降级成明文,凭据还走 clear text。
+func TestSanitizeKeepsTlsOnHttpOutbound(t *testing.T) {
+	out, ok := SanitizeOutbound(Outbound{Type: "http", Server: "h", ServerPort: 8443,
+		TLS: &TLS{ServerName: "h.example"}})
+	if !ok {
+		t.Fatal("http 出站应当通过")
+	}
+	if out.TLS == nil {
+		t.Fatal("http 的 tls 被剥了:HTTPS 代理会静默降级成明文")
+	}
+	if out.TLS.Enabled == nil || !*out.TLS.Enabled {
+		t.Fatalf("缺 enabled 应当补成 true: %+v", out.TLS)
+	}
+	// 对照组:socks 的 tls 仍然必须剥(sing-box 的 socks 出站没有该字段,带着
+	// 会让整份配置 FATAL)。
+	if s, _ := SanitizeOutbound(Outbound{Type: "socks", Server: "h", ServerPort: 1080, TLS: &TLS{Enabled: BoolPtr(true)}}); s.TLS != nil {
+		t.Fatal("socks 仍不得带 tls")
+	}
+}
+
 func TestSanitizeNormalizesFlowTransportAndTLS(t *testing.T) {
 	// flow：只有 xtls-rprx-vision 存在；-udp443 拼法归一，其余删除
 	f, ok := SanitizeOutbound(Outbound{Type: "vless", Server: "h", ServerPort: 443, UUID: testUUID, Flow: "xtls-rprx-vision-udp443"})

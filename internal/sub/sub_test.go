@@ -7,18 +7,39 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
-
-	"freerouter/internal/parse"
 )
 
 func link(n int) string {
 	return "vless://00000000-0000-4000-8000-00000000000" + string(rune('0'+n%10)) +
 		"@n" + string(rune('a'+n)) + ".example:443?type=ws&security=tls#node" + string(rune('a'+n))
+}
+
+// TestBrokenClashSubscriptionReportsTheRealReason 钉住 R25:ParseClashYAML 的
+// err 过去被丢掉 —— 一份带重复键的 Clash 订阅(整个文件认输)落到 ParseLinks
+// (没有 ://)返回 nil,运维只看到「没有识别出任何节点（格式不受支持？）」,
+// 真因(哪个格式、为什么坏)完全不可见。按顺序回落是对的,但**为什么这一种格式
+// 认输**必须跟着上来。
+func TestBrokenClashSubscriptionReportsTheRealReason(t *testing.T) {
+	body := "proxies:\n  - name: a\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n" +
+		"proxies:\n  - name: b\n    type: ss\n    server: 5.6.7.8\n    port: 8388\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	defer srv.Close()
+	res, err := Fetch(context.Background(), []string{srv.URL}, nil)
+	if err == nil {
+		t.Fatal("一个节点都没认出来的订阅必须是错误")
+	}
+	if len(res.Details) != 1 || res.Details[0].OK {
+		t.Fatalf("details = %+v, want 一条失败明细", res.Details)
+	}
+	msg := res.Details[0].Error
+	if !strings.Contains(msg, "Clash") || !strings.Contains(msg, "already defined") {
+		t.Fatalf("Detail.Error = %q, want 它带上「哪个格式坏、为什么」", msg)
+	}
 }
 
 func TestFetchReturnsEverythingWhenAllSourcesWork(t *testing.T) {
@@ -112,43 +133,6 @@ func TestFetchRetriesFailedSourcesThroughExits(t *testing.T) {
 	}
 	if atomic.LoadInt32(&used) == 0 {
 		t.Fatal("the exit dialer was never used")
-	}
-}
-
-func TestCacheRoundTrip(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "subs_cache.json")
-	in := Result{Outbounds: []parse.Outbound{{Type: "vless", Server: "a", ServerPort: 443, Tag: "a"}},
-		Details: []Detail{{URL: "u", OK: true, Nodes: 1}}}
-	if err := SaveCache(file, in); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	out, err := LoadCache(file)
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if len(out.Outbounds) != 1 || out.Outbounds[0].Tag != "a" {
-		t.Fatalf("roundtrip lost data: %+v", out)
-	}
-}
-
-func TestLoadCacheMissingIsNotExist(t *testing.T) {
-	_, err := LoadCache(filepath.Join(t.TempDir(), "nope.json"))
-	if !os.IsNotExist(err) {
-		t.Fatalf("err = %v, want not-exist", err)
-	}
-}
-
-func TestSaveCacheIsHumanReadable(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "subs_cache.json")
-	if err := SaveCache(file, Result{}); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	b, err := os.ReadFile(file)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if !strings.Contains(string(b), "\n  ") {
-		t.Fatalf("cache must be indented so an operator can read and patch it:\n%s", b)
 	}
 }
 

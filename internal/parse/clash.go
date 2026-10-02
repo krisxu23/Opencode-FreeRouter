@@ -194,7 +194,11 @@ func ParseClashYAML(text string) ([]Outbound, error) {
 		if pr == nil {
 			continue
 		}
-		tag, _ := pr["name"].(string)
+		// 名字用宽容取值(R23):YAML 里不带引号的 `name: 123` 解出来是 int,旧的
+		// 类型断言读到空串就被「tag 为空」判据拒掉,节点静默消失。JS 是
+		// String(p.name)(src/sub.js:228-231),而同文件的 sing-box JSON 路径
+		// 用的也是 str() —— 两条路径同一套取值法。
+		tag := strings.TrimSpace(str(pr["name"]))
 		if o, ok := ParseClashProxy(tag, pr); ok {
 			out = append(out, o)
 		}

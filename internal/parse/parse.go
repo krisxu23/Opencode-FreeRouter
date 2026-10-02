@@ -247,9 +247,17 @@ func transportParams(params map[string]string) *Transport {
 }
 
 func parseVmess(uri string) *Outbound {
+	// fragment 不是载荷的一部分:vmess 的载荷是 base64,而 v2rayN/v2rayNG 导出的
+	// 链接几乎恒带 `#名字`(B14)。b64decode 只丢掉 `#`、**留下**其后的字母数字,
+	// 于是载荷变成「base64 + 垃圾」:带 padding 时 StdEncoding 在 '=' 位报
+	// CorruptInputError,不带时多余字符污染流 —— 两条路都让 JSON 解析失败,
+	// 整条 vmess 节点被静默丢弃,也就是订阅里**全部** vmess。Node 的 Buffer.from
+	// 对尾部垃圾宽容,所以 JS 不坏:这是 Go 独有回归。其他协议解析器开头都做一次
+	// SplitN("#"),只有 vmess 漏了(名字本身由 nodeName 从 fragment 取,不丢)。
+	payload := strings.SplitN(uri[len("vmess://"):], "#", 2)[0]
 	var data map[string]any
 	// b64 是 URL-safe（含 - 与 _），JSON.parse 失败 → null（畸形载荷全丢）
-	if err := json.Unmarshal([]byte(b64decode(uri[len("vmess://"):])), &data); err != nil {
+	if err := json.Unmarshal([]byte(b64decode(payload)), &data); err != nil {
 		return nil
 	}
 	server := strings.TrimSpace(str(data["add"]))
@@ -278,11 +286,11 @@ func parseVmess(uri string) *Outbound {
 	switch t := data["tls"].(type) {
 	case string:
 		if t == "tls" || t == "1" {
-			ob.TLS = &TLS{Enabled:  BoolPtr(true), ServerName: strings.TrimSpace(firstNonEmptyStr(str(data["sni"]), str(data["host"]), server))}
+			ob.TLS = &TLS{Enabled:  BoolPtr(true), ServerName: strings.TrimSpace(firstNonEmpty(str(data["sni"]), str(data["host"]), server))}
 		}
 	case bool:
 		if t {
-			ob.TLS = &TLS{Enabled:  BoolPtr(true), ServerName: strings.TrimSpace(firstNonEmptyStr(str(data["sni"]), str(data["host"]), server))}
+			ob.TLS = &TLS{Enabled:  BoolPtr(true), ServerName: strings.TrimSpace(firstNonEmpty(str(data["sni"]), str(data["host"]), server))}
 		}
 	}
 	params := map[string]string{
@@ -342,9 +350,13 @@ func parseSs(uri string) *Outbound {
 		}
 		var method, password string
 		if strings.Contains(userinfo, ":") {
+			// 明文 userinfo 是百分号编码的:解一次。
 			parts := strings.SplitN(userinfo, ":", 2)
-			method, password = parts[0], parts[1]
+			method, password = decodeSafe(parts[0]), decodeSafe(parts[1])
 		} else {
+			// base64 的 userinfo 解出来就是**原子值** —— 再解一次会把密码里恰好
+			// 长成 `%XX` 的部分改掉(存进错误密码、连接失败、无诊断),而同一个逻辑
+			// 输入走明文分支时只解一次(R26:两条分支必须一致)。
 			dec := b64decode(userinfo)
 			if !strings.Contains(dec, ":") {
 				return nil
@@ -352,14 +364,13 @@ func parseSs(uri string) *Outbound {
 			parts := strings.SplitN(dec, ":", 2)
 			method, password = parts[0], parts[1]
 		}
-		method = decodeSafe(method)
 		if method == "" {
 			return nil
 		}
 		return &Outbound{
 			Type: "shadowsocks", Server: hp.server, ServerPort: hp.port,
 			Method:   strings.ToLower(strings.TrimSpace(method)),
-			Password: decodeSafe(password),
+			Password: password,
 		}
 	}
 	// legacy: ss://base64(method:password@host:port)
@@ -377,14 +388,15 @@ func parseSs(uri string) *Outbound {
 	if i == -1 {
 		return nil
 	}
-	method := decodeSafe(userinfo[:i])
+	// 这一支恒是 base64 解出来的,同 R26:不做第二次百分号解码。
+	method := userinfo[:i]
 	if method == "" {
 		return nil
 	}
 	return &Outbound{
 		Type: "shadowsocks", Server: hp.server, ServerPort: hp.port,
 		Method:   strings.ToLower(strings.TrimSpace(method)),
-		Password: decodeSafe(userinfo[i+1:]),
+		Password: userinfo[i+1:],
 	}
 }
 
@@ -625,21 +637,21 @@ func nodeName(uri string) string {
 // b64decode 兼容 URL-safe 字母表并剥掉所有空白（订阅商爱在 base64 里插换行）。
 // 解不出返回空串，不抛 —— Buffer.from 的宽容语义在这里只影响「decoded 里是否
 // 含 ://」这一种判定，空串同样安全。
+//
+// O16c:过去是两趟(strings.Map 翻译 + allow-list 过滤),合成一趟:逐 rune 判一次,
+// 该翻的翻、该丢的丢,行为逐项等价。
 func b64decode(input string) string {
-	normalized := strings.Map(func(r rune) rune {
+	cleaned := make([]rune, 0, len(input))
+	for _, r := range input {
 		switch {
 		case r == '-':
-			return '+'
+			cleaned = append(cleaned, '+')
 		case r == '_':
-			return '/'
+			cleaned = append(cleaned, '/')
 		case unicode.IsSpace(r):
-			return -1
-		}
-		return r
-	}, input)
-	cleaned := make([]rune, 0, len(normalized))
-	for _, r := range normalized {
-		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '+' || r == '/' || r == '=' {
+			// 丢弃:订阅文本里混进换行/空格是常态。
+		case (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') ||
+			r == '+' || r == '/' || r == '=':
 			cleaned = append(cleaned, r)
 		}
 	}
@@ -803,10 +815,10 @@ var keywords = []kwRule{
 
 func mustRe(s string) *regexp.Regexp { return regexp.MustCompile(`(?i)` + s) }
 
-// isoTokenRe 是 JS /(?:^|[^A-Z])([A-Z]{2})(?=[^A-Z]|$)/g 的形状说明；RE2 不支持
-// 前瞻，真正的匹配走 isoTokens 的手写扫描（语义逐条对齐：两字母组前后都不能
-// 紧邻别的大写字母）。
-var isoTokenShape = regexp.MustCompile(`[A-Z]{2}`)
+// ISO 两字母段的识别说明：JS 用 /(?:^|[^A-Z])([A-Z]{2})(?=[^A-Z]|$)/g。RE2 不支持
+// 前瞻，所以真正的匹配走 isoTokens 的手写扫描（语义逐条对齐：两字母组前后都不能
+// 紧邻别的大写字母）。O16a：这里曾另有一个 `isoTokenShape` 正则变量只为"记录形状"，
+// 全仓没有一次匹配用它 —— 注释留下，死变量删掉。
 
 var flagRe = regexp.MustCompile(`[\x{1F1E6}-\x{1F1FF}]{2}`)
 var parenRe = regexp.MustCompile(`\(([^()]+)\)`)
@@ -907,10 +919,16 @@ func BucketOf(cc string) string {
 
 // FilterByGroups 按所选分组过滤出站。语义：
 //   - 类型不在 PROXY_TYPES 的出站（selector/urltest/direct/block）不进池
-//   - 同 tag 去重
+//   - 同**配置指纹**去重(R21)
 //   - tag 可识别国家的节点：所属分组被选中才保留
 //   - 无名节点（tag 识别不出国家）：只要选了"其他"就保留（最多
 //     unknownKeepLimit 个，探测后由出口 IP 实测归桶）
+//
+// 去重键过去是 Tag(JS sub.js:146-153 同款),实测 data/subs_cache.json 的 1246 个
+// 出站里 7 个重复 tag 压掉了 84 个真不同的节点(disney_netflix_GB 76 个只留 1),
+// 空 tag 更是把全部无命名出站塌缩成一个。管线其余去重点(registry.Merge、
+// sub.Fetch 的轮内去重)都以 IdentityOf 为键,这里跟着改齐 —— 同一个物理节点换名
+// 仍然折叠成一个,同名不同服务器不再互相顶掉。
 func FilterByGroups(outs []Outbound, groups []string) []Outbound {
 	want := map[string]bool{}
 	for _, g := range groups {
@@ -922,10 +940,11 @@ func FilterByGroups(outs []Outbound, groups []string) []Outbound {
 		if !proxyTypes[o.Type] {
 			continue
 		}
-		if seen[o.Tag] {
+		key := IdentityOf(o)
+		if seen[key] {
 			continue
 		}
-		seen[o.Tag] = true
+		seen[key] = true
 		cc := CountryOf(o.Tag)
 		if cc == "" {
 			unknown = append(unknown, o)
@@ -1001,6 +1020,10 @@ func atoi(s string) int {
 	return v
 }
 
+// firstNonEmpty 对应 JS 的 `a || b`（空串让位），用于 sni||host||server。
+//
+// O16b:这里曾经另有一个 `firstNonEmptyStr` 纯别名(注释同款、实现是转调),
+// 两个名字服务同一个语义 —— 调用点全部并到本函数,别名删掉。
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {
@@ -1009,9 +1032,6 @@ func firstNonEmpty(vals ...string) string {
 	}
 	return ""
 }
-
-// firstNonEmptyStr 对应 JS 的 `a || b`（空串让位），用于 sni||host||server。
-func firstNonEmptyStr(vals ...string) string { return firstNonEmpty(vals...) }
 
 func unbracket(h string) string {
 	// 与 JS host.replace(/^\[|\]$/g, '') 同构：只剥一对首尾方括号

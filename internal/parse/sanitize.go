@@ -77,10 +77,15 @@ var sanitizeCapableTypes = map[string]bool{
 }
 
 // tlsCapableTypes：这些协议才有 tls 字段 —— Clash 订阅会给 ss 标 tls:true，
-// 而 sing-box 的 shadowsocks/socks/http/ssh 出站没有 tls 字段，带着会整份
-// 配置 FATAL。
+// 而 sing-box 的 shadowsocks/socks/ssh 出站没有 tls 字段，带着会整份配置
+// FATAL。
+//
+// http 在列(R24):sing-box v1.14 的 http 出站**有** tls
+// (protocol/http/outbound.go:37 用 options.TLS 建 dialer),过去把它和 socks/ss
+// 归成一类 ⇒ 一个 HTTPS 代理被静默降级成明文,凭据还是 clear text 发出去的。
 var tlsCapableTypes = map[string]bool{
-	"vless": true, "vmess": true, "trojan": true, "hysteria2": true, "tuic": true, "anytls": true,
+	"vless": true, "vmess": true, "trojan": true, "hysteria2": true, "tuic": true,
+	"anytls": true, "http": true,
 }
 
 // knownTransportTypes：未知传输（xhttp 等 Xray 专属）会让 sing-box 在 decode
@@ -131,6 +136,11 @@ func SanitizeOutbound(o Outbound) (Outbound, bool) {
 	}
 
 	if o.TLS != nil {
+		// 同一类隔离(B15 的第二半):o 是值拷贝,但 TLS 是**指针**,就地补
+		// enabled/utls 会写回调用方的原始块。浅拷一份就够 —— 本函数只改块自己的
+		// 字段(Reality/UTLS 是整体替换而不是就地改),没有更深的层要隔离。
+		detached := *o.TLS
+		o.TLS = &detached
 		// JS 的判据是 `tls.enabled === false` 才删块，**缺 enabled 视为开启**
 		// 并补写 enabled:true（src/singbox.js:242-243）。指针三态才能区分
 		// 「缺」与「false」—— bool 零值曾把无 enabled 的块整块丢掉，与上面
@@ -174,15 +184,16 @@ func SanitizeOutbound(o Outbound) (Outbound, bool) {
 	}
 
 	if o.Extra != nil {
-		delete(o.Extra, "xtls")
-		delete(o.Extra, "detour")
-		// Extra 是引用语义的 map —— 删键会穿透到调用方的底层数组/桶。
-		// 返回值是值拷贝但 Extra 指针没变，这里复制一份，保证调用方的
-		// 原始出站对象不被这次"清洗"悄悄改写。
+		// 先拷贝、再删键(B15)。Extra 是引用语义的 map:旧顺序把 delete 写在拷贝
+		// 之前,于是「保护调用方」这条注释是假的 —— 调用方(sub.Fetch 返回的原始
+		// 切片,生产三个调用点都是)的对象被就地改脏。JS 是在调用点先
+		// structuredClone(index.js:438),Go 在这一个函数里补上同一层隔离。
 		copied := make(Extra, len(o.Extra))
 		for k, v := range o.Extra {
 			copied[k] = v
 		}
+		delete(copied, "xtls")
+		delete(copied, "detour")
 		o.Extra = copied
 	}
 
@@ -213,8 +224,34 @@ func SanitizeOutbound(o Outbound) (Outbound, bool) {
 	if o.Server == "" {
 		return Outbound{}, false
 	}
-	if o.ServerPort <= 0 && len(o.ServerPorts) == 0 {
+	// 端口词汇(B16):链接路径早就用 isValidPort/isValidPortRange 执法,Clash 与
+	// sing-box-JSON 两条路径过去只判「有没有」。于是 server_port=70000 一路通过
+	// sanitize、到 sing-box 严格解码 uint16 才失败(option/outbound.go:185),而
+	// app 的「剔除 N 个坏节点」只统计 sanitize 的拒收 —— 那种节点既不在池里、
+	// 也不在任何计数里。server_ports=["1:"] 更糟:sing-quic 的 ParsePorts 把它
+	// 当开区间展开成 65535 个端口,而条目数由订阅方控制(["1:","2:","3:"] ⇒ ~20 万)。
+	if len(o.ServerPorts) > 0 {
+		if !isValidPortRange(o.ServerPorts) {
+			return Outbound{}, false
+		}
+		// server_port 与 server_ports 互斥(sing-box 的 hysteria2 二选一)。链接路径
+		// parse.go 早就强制了,sanitize 过去从不 enforce:两个都发给 sing-box 时
+		// 整条出站被 abort,只留一条 warn。以端口段为准。
+		o.ServerPort = 0
+	} else if o.ServerPort > 0 {
+		if !isValidPort(o.ServerPort) {
+			return Outbound{}, false
+		}
+	} else {
 		return Outbound{}, false
+	}
+	// hysteria2 的 obfs:sing-box 以 "missing obfs password" 拒收带空密码的块
+	// (protocol/hysteria2/outbound.go:64-77),同理在这里判掉 —— 上面已经把非
+	// hysteria2 的 Obfs 清了,所以这条只会作用到真正带 obfs 的节点。
+	if o.Obfs != nil {
+		if strings.TrimSpace(o.Obfs.Password) == "" || strings.TrimSpace(o.Obfs.Type) == "" {
+			return Outbound{}, false
+		}
 	}
 	return o, true
 }
