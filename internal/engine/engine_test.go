@@ -1000,3 +1000,63 @@ func TestMimoAlwaysThinkingCeilingIsDoubled(t *testing.T) {
 		t.Fatalf("big-pickle balanced 预算 = %d, want 8192", got[1])
 	}
 }
+
+// ---- 设置里的 effortLevel / defaultMaxTokens 必须真的到线上(B2/B3) ----
+
+// TestSettingsDefaultMaxTokensCapsTheRequestBudget:B2。settings.defaultMaxTokens
+// 是面板上的「默认输出上限」,过去 Go 只把它写进 settings.json,从没接到
+// adapter.Deps.MaxTokens 上(那个字段在装配期恒为 0),于是保存了也不生效。
+// 现在它随每请求的 Settings() 回调进热路径:balanced 档上限 8192、模型上限
+// 32000,settings 的 4096 更小,预算就该是 4096。
+func TestSettingsDefaultMaxTokensCapsTheRequestBudget(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChat("ok")
+	})
+	f.setCatalog(catalog.Build([]string{"big-pickle"}))
+	f.mu.Lock()
+	f.settings.DefaultMaxTokens = 4096
+	f.mu.Unlock()
+	if _, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"), nil); err != nil {
+		t.Fatalf("请求应成功: %v", err)
+	}
+	reqs := f.up.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("应捕获一次请求,得到 %d", len(reqs))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(reqs[0].body, &body); err != nil {
+		t.Fatalf("请求体不是 JSON: %v", err)
+	}
+	got, _ := body["max_tokens"].(float64)
+	if int64(got) != 4096 {
+		t.Fatalf("max_tokens = %v, want 4096(settings.defaultMaxTokens 必须压低预算)", got)
+	}
+}
+
+// TestSettingsEffortLevelDrivesTheBudget:B3。engine 的 Settings 回调过去把
+// EffortLevel 写死成 effort.DefaultLevel,面板上选 low 也永远按 balanced 算
+// (8192);设置档低档的线上表现就该是 2048。
+func TestSettingsEffortLevelDrivesTheBudget(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChat("ok")
+	})
+	f.setCatalog(catalog.Build([]string{"big-pickle"}))
+	f.mu.Lock()
+	f.settings.EffortLevel = "low"
+	f.mu.Unlock()
+	if _, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"), nil); err != nil {
+		t.Fatalf("请求应成功: %v", err)
+	}
+	reqs := f.up.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("应捕获一次请求,得到 %d", len(reqs))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(reqs[0].body, &body); err != nil {
+		t.Fatalf("请求体不是 JSON: %v", err)
+	}
+	got, _ := body["max_tokens"].(float64)
+	if int64(got) != 2048 {
+		t.Fatalf("max_tokens = %v, want 2048(settings.effortLevel=low 的档位上限)", got)
+	}
+}

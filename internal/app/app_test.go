@@ -393,3 +393,28 @@ func TestApplyOverlayPureKernel(t *testing.T) {
 		t.Fatalf("empty overlay must return the input unchanged")
 	}
 }
+
+// TestJSONNumberOrNilIsTheSettingsBridgeToTheBudget:B2。这个函数是
+// settings.defaultMaxTokens(JSON 的 null / 数字)与 adapter 的 int 约定
+// (<=0 视同未设置)之间的唯一桥;在 T3 之前它零调用点,settings 里的值
+// 根本到不了热路径。四个分支各钉一条。
+func TestJSONNumberOrNilIsTheSettingsBridgeToTheBudget(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want int
+		ok   bool
+	}{
+		{"null 是未设置", nil, 0, false},
+		{"正数原样取出", float64(4096), 4096, true},
+		{"int 也认", 8192, 8192, true},
+		{"0 与负数视同未设置", float64(0), 0, false},
+		{"非数字是未设置", "4096", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := jsonNumberOrNil(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("%s: jsonNumberOrNil(%v) = (%d,%v), want (%d,%v)", c.name, c.in, got, ok, c.want, c.ok)
+		}
+	}
+}

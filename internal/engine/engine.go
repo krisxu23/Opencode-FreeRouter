@@ -76,10 +76,13 @@ type State struct {
 // a struct of only what routing needs, so a settings migration cannot break
 // rotation.
 type Settings struct {
-	Countries      []string
-	EffortLevel    string
-	MaxAttempts    int
-	MaxWallClockMS int64
+	Countries   []string
+	EffortLevel string
+	// DefaultMaxTokens 是 settings.defaultMaxTokens 的解析结果:<=0 表示
+	// 「未设置」(面板存 null),与 adapter.Deps.MaxTokens 的约定一致(B2)。
+	DefaultMaxTokens int
+	MaxAttempts      int
+	MaxWallClockMS   int64
 }
 
 // Request is one client turn, already normalized by the forward layer.
@@ -587,6 +590,11 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 	deps.SessionID = in.session
 	deps.Tools = in.tools
 	deps.Effort = in.settings.EffortLevel
+	// 面板上的「默认输出上限」是设置里的活值,装配期的 AdapterDeps 只是模板
+	// (B2):每请求覆盖,<=0 视同 null,保留模板兜底。
+	if in.settings.DefaultMaxTokens > 0 {
+		deps.MaxTokens = in.settings.DefaultMaxTokens
+	}
 	if deps.OnFirstToken == nil {
 		// TTFT 回灌(magpie internal/gateway/ttft.go):adapter 在第一个
 		// token 到达的那一刻就知道首字延迟,比等整条流读完再算准得多。

@@ -352,11 +352,16 @@ func Load(root string) (*Parts, error) {
 			return pool
 		},
 		Settings: func() engine.Settings {
+			// 这两个字段必须读活值:面板上保存的 effortLevel / defaultMaxTokens
+			// 会写进同一份 settings,热路径每请求取一次(B2/B3)。过去 EffortLevel
+			// 写死常量、MaxTokens 根本没接线,保存了也不生效。
+			maxTokens, _ := jsonNumberOrNil(settings.DefaultMaxTokens)
 			return engine.Settings{
-				Countries:      settings.Countries,
-				EffortLevel:    effort.DefaultLevel,
-				MaxAttempts:    settings.MaxAttempts,
-				MaxWallClockMS: settings.MaxWallClockMS,
+				Countries:        settings.Countries,
+				EffortLevel:      settings.EffortLevel,
+				DefaultMaxTokens: maxTokens,
+				MaxAttempts:      settings.MaxAttempts,
+				MaxWallClockMS:   settings.MaxWallClockMS,
 			}
 		},
 		// RecordUsage:base id 由引擎给到(stream.Usage 是 harness 形状,

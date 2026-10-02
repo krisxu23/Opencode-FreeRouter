@@ -504,7 +504,7 @@ func settingsInt(v any) (int, bool) {
 		if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) {
 			return 0, false
 		}
-		if n < -(1 << 53) || n > 1<<53 {
+		if n < -(1<<53) || n > 1<<53 {
 			return 0, false
 		}
 		return int(n), true
