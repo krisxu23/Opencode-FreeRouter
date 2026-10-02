@@ -1,0 +1,85 @@
+name: release
+
+# 2026-10-02（任务 28 冻结）：仓库的产品实现换成 Go 版，Node 版先整体进 archive/，
+# 同日再整体移出仓库（`D:\opencode-FreeRouter-frozen-2026-10-02`，见修正案 §11），
+# 本工作流随之只守 Go 版的门禁 —— 原先的 `npm ci` / `npm run check` / `npm test` /
+# `npm run fetch-singbox` 全部失效（根 package.json 已无 dependencies，check.mjs 与
+# build-release.mjs 已随 JS 版归档）。
+#
+# 三个不显然的点：
+#   - setup-node 仍然要装：CI 跑的是 scripts/*.mjs，它们是唯一的构建/测试入口
+#     （全局约束 1），不是可选的便捷封装。
+#   - `go mod download` 必须显式跑：scripts/go-build.mjs 的 goEnv() 硬写
+#     GOPROXY=off（本机 proxy 8s 超时、模块缓存已热，见该文件头注释），冷缓存的
+#     CI 不先下载就会直接失败。
+#   - 发布作业（原来打 tag 就构建 zip 并挂 GitHub Release）**删掉了**：Go 版的
+#     分发形态是 GPL-3.0 源码包，而它 2026-10-02 裁定**不外发、只本地生成**
+#     （见 docs/superpowers/plans/2026-10-01-plan-corrections.md §9-9）。没有分发点
+#     就没有需要挂源码的位置，留一个 release 作业只会构建没人要的东西。将来要发：
+#     exe 与同版本源码包必须出现在同一个分发位置，只发 exe 就是一次 GPL 违规。
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Warm the module cache (goEnv 是 GOPROXY=off，必须先下好)
+        run: go mod download
+
+      # 分层/SPDX/vet 检查：ERROR 级发现以退出码 1 拦住。单独跑一次是为了在 CI
+      # 日志里留下可读报告（哪条规则、哪个文件、哪一行）。
+      - name: Layer + SPDX + vet
+        run: node scripts/check-go.mjs
+
+      - name: Go tests
+        run: node scripts/go-test.mjs
+
+      - name: Build (console dev binary)
+        run: node scripts/go-build.mjs
+
+      - name: Build FreeRouter.exe (deliverable, windowsgui)
+        run: node scripts/build-tray-exe.mjs
+
+      # 产物是行为验收的主体，构建出来就得证明它还能起来（/health 与面板壳）。
+      # 完整差分（A/B/C 三层）要人盯着、且会改活的 data/，不放 CI。
+      # 这里冒烟的是控制台版：GUI 子系统在 runner 上没有会话窗口，起不起得来都
+      # 看不出来；两者的差异只有 `-H=windowsgui` 这一个 flag。
+      - name: Smoke the binary
+        shell: pwsh
+        run: |
+          $env:FREEROUTER_DATA = $PWD.Path
+          $p = Start-Process -FilePath freerouter.console.exe -PassThru -WindowStyle Hidden
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Milliseconds 500
+              try {
+                $h = Invoke-RestMethod http://127.0.0.1:3457/health -TimeoutSec 2
+                if ($h.ok) { $ok = $true; break }
+              } catch {}
+            }
+            if (-not $ok) { throw 'gateway did not become healthy in 15s' }
+            $shell = Invoke-WebRequest http://127.0.0.1:3458/ -UseBasicParsing -TimeoutSec 5
+            if ($shell.StatusCode -ne 200) { throw "panel shell returned $($shell.StatusCode)" }
+            Write-Host "smoke ok: health + panel shell ($($shell.RawContentLength) bytes)"
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }

@@ -1,0 +1,20 @@
+node_modules/
+bin/
+data/
+runtime/
+*.exe
+*.log
+release/
+
+# scratch of the differential harness (regenerable Go test binaries)
+difftest-tmp/
+
+# 内部工作底稿与差分固件：只留本机，不公开。
+# scripts/diff-accept.mjs 是它们的唯一入口，所以同样不上库；
+# 本地照常能跑 `node scripts/diff-accept.mjs`。
+# difftest/fixtures 当年按「用现网文件的实际条数」的裁定直接从活的
+# node-registry.json 取样，里面是别人订阅节点的身份与口令；docs/ 是
+# 重写计划、评审与验收记录，含本机路径与实例数据。两者都不该上公网。
+/docs/
+/difftest/
+/scripts/diff-accept.mjs

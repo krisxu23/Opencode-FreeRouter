@@ -1,0 +1,36 @@
+FreeRouter
+=========
+
+Copyright (C) 2026 FreeRouter contributors
+
+本程序是一个组合作品：以 GPL-3.0-or-later 许可发布。
+
+本程序链接了以下第三方组件（完整许可证见
+THIRD-PARTY-LICENSES/）：
+
+  github.com/sagernet/sing-box  — GPL-3.0-or-later
+      https://github.com/SagerNet/sing-box
+      sing-box 的源码以其许可证的附加条款发布：不得使用其名称或暗示
+      与本项目有关联。本项目因此不使用「sing-box」作为产品名。
+
+按许可证类型统计（共 70 个模块，逐个全文见 THIRD-PARTY-LICENSES/，
+清单与类型判定见其中的 INDEX.md；本段由 scripts/make-source-tarball.mjs 生成）：
+
+  MIT × 25
+  BSD × 18
+  GPL-3.0-or-later × 12
+  Apache-2.0 × 11
+  ISC × 1
+  MPL-2.0 × 1
+  Unlicense/Public-Domain × 1
+  CC0-1.0 × 1
+
+沿用与致谢：
+
+  网关逻辑移植自 dsh-our-free-model (MIT, Copyright (c) 2026 zouyuxuan122)
+    https://github.com/zouyuxuan122/dsh-our-free-model
+  节点订阅源: freesub (krisxu23/freesub)
+    https://github.com/krisxu23/freesub
+
+archive/ 下的 Node.js 版是一个独立的 MIT 作品，仅作为行为参考保留，
+不构成本项目的一部分，也不构成本项目的 GPL 衍生作品。

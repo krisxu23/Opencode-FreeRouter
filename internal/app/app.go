@@ -1,0 +1,661 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 FreeRouter contributors
+//
+// Package app is the assembly point: it is the only package allowed to know
+// about every layer at once. Its job is wiring and lifetime, not logic —
+// anything a test could reasonably assert belongs in the layer that owns it,
+// and whatever only this file knows is exactly what wiring is.
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"freerouter/internal/adapter"
+	"freerouter/internal/catalog"
+	"freerouter/internal/effort"
+	"freerouter/internal/engine"
+	"freerouter/internal/forward"
+	"freerouter/internal/gate"
+	"freerouter/internal/health"
+	"freerouter/internal/httpclient"
+	"freerouter/internal/limits"
+	"freerouter/internal/logger"
+	"freerouter/internal/nodeprobe"
+	"freerouter/internal/panel"
+	"freerouter/internal/parse"
+	"freerouter/internal/persistence"
+	"freerouter/internal/registry"
+	"freerouter/internal/sbx"
+	"freerouter/internal/stats"
+	"freerouter/internal/stream"
+	"freerouter/internal/sub"
+	"freerouter/internal/tracelog"
+	"freerouter/internal/upstream"
+)
+
+// Settings is the slice of data/settings.json this phase reads.
+//
+// The JSON names are kept identical to the JS version's so a legacy settings
+// file loads with no translation table at all. app reads the file once and
+// hands narrow copies to each part; no part re-reads it.
+type Settings struct {
+	ForwardPort      int      `json:"forwardPort"`
+	PanelPort        int      `json:"panelPort"`
+	SubURLs          []string `json:"subUrls"`
+	Countries        []string `json:"countries"`
+	Enabled          bool     `json:"enabled"`
+	ProbeEnabled     bool     `json:"probeEnabled"`
+	ProbeWorkers     int      `json:"probeWorkers"`
+	ProbeIntervalMin int      `json:"probeIntervalMin"`
+	EffortLevel      string   `json:"effortLevel"`
+	DefaultMaxTokens any      `json:"defaultMaxTokens"`
+	MaxAttempts      int      `json:"maxAttempts"`
+	MaxWallClockMS   int64    `json:"maxWallClockMs"`
+	ForwardKey       string   `json:"forwardKey"`
+}
+
+// Parts is the running gateway.
+//
+// Load returns non-nil only after the forward port can already serve a
+// request, so no caller ever has to ask "is it up yet".
+type Parts struct {
+	Root     string
+	Settings *Settings
+	Host     *sbx.Host
+	Registry *registry.Registry
+	Health   *health.Health
+	// Prober 是探测轮次的实现接口(probe.go 定义):生产装 *nodeprobe.Prober,
+	// 测试装假实现 —— 真实探测要打外网,而缓存/事故/淘汰逻辑必须能离线断言。
+	Prober  Prober
+	Engine  *engine.Engine
+	Forward *forward.Server
+	Panel   *panel.Server
+	// StatsStore 是用量记账(任务 21);RecordUsage 回调把引擎的 harness 形状
+	// usage 换算成 stats.Record —— model 由引擎一并给到。
+	StatsStore *stats.Stats
+
+	// firstFetch is closed once the opening subscription fetch settles, so the
+	// placeholder probe ticker can start on the fallback pool immediately
+	// instead of waiting out a timeout against an empty world.
+	firstFetch chan struct{}
+
+	settingsStore *persistence.Store
+	panelLn       net.Listener
+	forwardLn     net.Listener
+	cancel        context.CancelFunc
+	shutdownOnce  sync.Once
+	shutdownErr   error
+
+	// ---- 探测轮次状态(probe.go) ----
+	probing         atomic.Bool
+	probeRerunMu    sync.Mutex
+	probeRerun      bool
+	probeRerunForce bool
+	tierGate        *gate.Gate
+	tierBuckets     tierChains
+
+	// ---- 订阅重建状态(rebuild.go) ----
+	rebuildMu       sync.Mutex
+	rebuilding      bool
+	rebuildQueued   bool
+	subFetchRetries int
+
+	rebuildStateMu sync.Mutex
+	lastAdded      int
+	lastRemoved    int
+	lastDropped    int
+	lastRebuildAt  int64
+	lastRebuildOK  bool
+	lastRebuildErr string
+
+	// ---- 目录与 models.dev 覆盖层(rebuild.go / status.go) ----
+	catalog         *catalogBox
+	upstreamMu      sync.Mutex
+	lastUpstreamIDs []string
+	overlayMu       sync.Mutex
+	overlayByID     map[string]limits.OverlayRow
+	limitsMu        sync.Mutex
+	limitsRows      int
+	limitsFetchedAt int64
+	limitsStale     bool
+
+	// ---- 测试接缝(status.go):非 nil 时替换真实时钟与定时器 ----
+	clockFn     func() time.Time
+	afterFuncFn func(time.Duration, func()) *time.Timer
+	waitFn      func(time.Duration) <-chan time.Time
+	timersWG    sync.WaitGroup
+}
+
+// defaultSettings mirrors src/store.js:99-149 SETTINGS_INITIAL.
+//
+// Enabled is the one entry that is not literally in the JS table: the JS build
+// has no "enabled" key in data/settings.json at all and hard-codes
+// enabled:true when it builds the forward config (src/index.js:1004). A Go
+// zero value would be false and turn every route of a fresh install into a
+// 503, so the default map carries true — and because persistence.Store.Load
+// keeps defaults for keys the file is missing, a legacy settings.json that
+// never had the key still comes out enabled.
+func defaultSettings() Settings {
+	return Settings{
+		ForwardPort:      3457,
+		PanelPort:        3458,
+		SubURLs:          []string{},
+		Countries:        []string{"US", "JP", "HK", "TW", "KR", "SG"},
+		Enabled:          true,
+		ProbeEnabled:     true,
+		ProbeWorkers:     48,
+		ProbeIntervalMin: 30,
+		EffortLevel:      effort.DefaultLevel,
+		DefaultMaxTokens: nil,
+		MaxAttempts:      20,
+		MaxWallClockMS:   0,
+		ForwardKey:       "",
+	}
+}
+
+// settingsMap renders Settings through JSON so the store's map keys are
+// exactly the struct's json tags. persistence.NewStore only accepts a
+// map[string]any initial value; anything else is silently ignored.
+func settingsMap(s Settings) map[string]any {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func settingsFromStore(store *persistence.Store) (Settings, error) {
+	var out Settings
+	raw, err := json.Marshal(store.Get())
+	if err != nil {
+		return out, fmt.Errorf("app: 设置无法序列化: %w", err)
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return out, fmt.Errorf("app: 设置格式不对: %w", err)
+	}
+	return out, nil
+}
+
+// Load resolves every part and starts the forward listener. It returns before
+// serving; the caller owns Shutdown. On error nothing is left listening: each
+// listener opened so far is closed before returning.
+//
+// The order below is not stylistic. The registry is loaded before the first
+// subscription pull because the fail counts inside it are the starting point
+// of that pull; the listener is opened last because the moment the port is
+// open it must be able to answer for real.
+func Load(root string) (*Parts, error) {
+	dataDir := filepath.Join(root, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("app: 建数据目录 %s: %w", dataDir, err)
+	}
+	// logger.Init and tracelog.Init both swallow a failing MkdirAll and go
+	// quietly file-less. Degradation rule 4 says an unwritable data directory
+	// must fail startup instead, so the check has to live here.
+	if err := probeWritable(dataDir); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var closers []func() error
+	fail := func(err error) (*Parts, error) {
+		for i := len(closers) - 1; i >= 0; i-- {
+			_ = closers[i]()
+		}
+		cancel()
+		return nil, err
+	}
+
+	logger.Init(filepath.Join(dataDir, "gateway.log"))
+	tracelog.Init(filepath.Join(dataDir, "route"))
+
+	// logf adapts the (level, msg) shape that sbx and nodeprobe ask for onto
+	// the package-level logger.
+	logf := func(level, msg string) {
+		switch level {
+		case "warn":
+			logger.Warn(msg)
+		case "error":
+			logger.Error(msg)
+		default:
+			logger.Info(msg)
+		}
+	}
+
+	// 1. settings
+	store := persistence.NewStore("settings", filepath.Join(dataDir, "settings.json"), settingsMap(defaultSettings()))
+	if err := store.Load(); err != nil {
+		return fail(fmt.Errorf("app: 读设置: %w", err))
+	}
+	settings, err := settingsFromStore(store)
+	if err != nil {
+		return fail(err)
+	}
+	if settings.ForwardKey == "" {
+		// 首启就生成密钥并立刻落盘：JS 的 openStore + flush 也是这个时机
+		// （src/index.js:56-59），密钥只有在重启之间保持稳定才有意义。
+		settings.ForwardKey = forward.GenerateKey()
+		store.Update(map[string]any{"forwardKey": settings.ForwardKey})
+	}
+	if err := store.Flush(); err != nil {
+		return fail(fmt.Errorf("app: 写设置: %w", err))
+	}
+
+	// 2. sing-box, with an empty pool first: it takes seconds to come up, so
+	// it runs in parallel with the subscription pull instead of behind it.
+	host := sbx.NewHost(logf)
+	if err := host.Start(ctx, nil); err != nil {
+		// Degradation rule 3: if sing-box cannot start the process must exit.
+		// Falling back to a direct dial would send every request out of the
+		// user's real address.
+		return fail(fmt.Errorf("app: 起 sing-box: %w", err))
+	}
+	closers = append(closers, host.Close)
+
+	// 3. registry, then hand its outbounds to the host before pulling anything.
+	reg := registry.NewRegistry(filepath.Join(dataDir, "node-registry.json"))
+	if err := reg.Load(); err != nil {
+		return fail(fmt.Errorf("app: 读注册表: %w", err))
+	}
+	closers = append(closers, reg.Flush)
+	// Materialize the file on a first run. JS's openStore flushes as soon as
+	// it is constructed (src/store.js:69), so a fresh data directory always
+	// contains every store even before the first node arrives; Go's Load only
+	// reads, and an operator (or the acceptance script) looking for the file
+	// would otherwise find nothing until the opening subscription settles.
+	if err := reg.Flush(); err != nil {
+		logger.Warn(fmt.Sprintf("[app] 注册表首次落盘失败（继续启动）: %v", err))
+	}
+	if _, _, err := host.SyncOutbounds(reg.All()); err != nil {
+		return fail(fmt.Errorf("app: 装载注册表出口: %w", err))
+	}
+
+	// 4. the opening subscription pull, off the critical path. Degradation
+	// rule 1: a total failure keeps the outbounds from step 3 and still opens
+	// the listener.
+	firstFetch := make(chan struct{})
+	go func() {
+		defer close(firstFetch)
+		subURLs := settings.SubURLs
+		if len(subURLs) == 0 {
+			logger.Info(fmt.Sprintf("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（%d 个）；注册表为空则以纯直连兜底模式启动", reg.Len()))
+			return
+		}
+		exits := make([]sub.Exit, 0, reg.Len())
+		for _, o := range reg.All() {
+			d, derr := host.Dialer(o.Tag)
+			if derr != nil {
+				continue
+			}
+			exits = append(exits, sub.Exit{Name: o.Tag, Dial: d})
+		}
+		res, ferr := sub.Fetch(ctx, subURLs, exits)
+		if ferr != nil {
+			logger.Warn(fmt.Sprintf("[app] 订阅失败，沿用 %d 个已知出口: %v", reg.Len(), ferr))
+			return
+		}
+		picked := parse.FilterByGroups(res.Outbounds, settings.Countries)
+		clean := make([]parse.Outbound, 0, len(picked))
+		for _, o := range picked {
+			if ok, keep := parse.SanitizeOutbound(o); keep {
+				clean = append(clean, ok)
+			}
+		}
+		merged := reg.Merge(clean)
+		evicted := reg.EnforceCap(registry.PoolCap)
+		if err := reg.Flush(); err != nil {
+			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
+		}
+		syncAdded, syncRemoved, serr := host.SyncOutbounds(reg.All())
+		if serr != nil {
+			logger.Warn(fmt.Sprintf("[app] 热插出站失败: %v", serr))
+			return
+		}
+		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，淘汰 %d），池内现有 %d 个（热插 %d，撤下 %d）",
+			len(clean), merged, evicted, reg.Len(), syncAdded, syncRemoved))
+	}()
+
+	// 5. health
+	h := health.NewHealth(filepath.Join(dataDir, "node-health.json"))
+	closers = append(closers, h.Persist)
+	// Same reason as the registry above: NewHealth only loads, so write the
+	// empty table now and the file exists from the first second of the first
+	// run instead of only after the first probe lands.
+	if err := h.Persist(); err != nil {
+		logger.Warn(fmt.Sprintf("[app] 健康表首次落盘失败（继续启动）: %v", err))
+	}
+
+	// 5.5 用量记账。RecordUsage 永不 panic(stats 自己保证),它挂了不能拖累
+	// 一次已经成功的回答(src/index.js:172/:202 的两条注释)。
+	statStore := stats.New(filepath.Join(dataDir, "stats.json"))
+	if err := statStore.Load(); err != nil {
+		logger.Warn(fmt.Sprintf("[app] 用量统计读取失败（继续启动）: %v", err))
+	}
+	closers = append(closers, statStore.Flush)
+
+	// 6. engine, then limits. The plan's wiring table puts limits before the
+	// engine, but limits.New takes the stats provider as an argument, so the
+	// engine has to exist first. Nothing about limits can block startup:
+	// a missing snapshot file is simply an empty one.
+	//
+	// 目录挂在 catalogBox 上:rebuild.go 的 applyIDs 是唯一换代入口,engine 的
+	// State 回调每轮路由读一次 —— 换代对在途请求不可见,它们用旧的一代跑完。
+	// 冷启动优先读上一轮落盘的上游 id 列表(data/catalog-ids.json,JS
+	// src/index.js:219/235 同名同语义):本机实测直连被封而节点可用,若只能等
+	// 上游,面板 opening 就是一张空模型表。缓存里没有才播静态回退表 —— 静态表
+	// 18 行,上游实测 34 行,少了 16 个模型也是「用户以为没额度」。
+	cachedIDs := catalog.LoadCache(filepath.Join(dataDir, "catalog-ids.json"))
+	catList := catalog.Static()
+	if len(cachedIDs) > 0 {
+		catList = catalog.Build(cachedIDs)
+	}
+	catBox := &catalogBox{list: catList}
+	eng := engine.NewEngine(engine.Deps{
+		State: func() engine.State {
+			return engine.State{Catalog: catBox.get(), Health: h}
+		},
+		Pool: func() []health.PoolNode {
+			outs := reg.All()
+			pool := make([]health.PoolNode, 0, len(outs))
+			for _, o := range outs {
+				pool = append(pool, health.PoolNode{Tag: o.Tag, Country: parse.CountryOf(o.Tag)})
+			}
+			return pool
+		},
+		Settings: func() engine.Settings {
+			return engine.Settings{
+				Countries:      settings.Countries,
+				EffortLevel:    effort.DefaultLevel,
+				MaxAttempts:    settings.MaxAttempts,
+				MaxWallClockMS: settings.MaxWallClockMS,
+			}
+		},
+		// RecordUsage:base id 由引擎给到(stream.Usage 是 harness 形状,
+		// In 已是未缓存净输入 —— 任务 21 的 a471bcf 裁决)。
+		RecordUsage: func(model string, u stream.Usage) {
+			statStore.Record(stats.Record{
+				At:     time.Now().UnixMilli(),
+				Model:  model,
+				OK:     true,
+				Input:  u.In,
+				Output: u.Out,
+				TTFTMS: u.TTFTMS,
+			})
+		},
+		Dialer: func(tag string) (*http.Client, error) {
+			d, err := host.Dialer(tag)
+			if err != nil {
+				return nil, err
+			}
+			// One connection pool per exit: sharing http.DefaultTransport's
+			// idle connections would let one exit's socket be reused for
+			// another exit's request.
+			return httpclient.NewClient(d, 20*time.Second), nil
+		},
+		AdapterDeps: adapter.Deps{
+			Base: upstream.UpstreamBase,
+			// Effort/Entry/Model/Wire/SessionID/NodeKey/Tools/Client are all
+			// overwritten per attempt by engine; only the assembly-level
+			// template lives here.
+			Effort: effort.DefaultLevel,
+		},
+		RecordTrace: tracelog.Record,
+		Log:         func(msg string) { logger.Info(fmt.Sprintf("engine: %s", msg)) },
+	})
+
+	// 探测轮次的两个闸门:全局错峰(B 档 60ms 一个时隙)与按出口 IP 的串行链。
+	// tierGate 必须是 Parts 上的字段而不是每轮新建 —— 每轮新建会让上一轮的
+	// 排队成果全部丢失,开局重新失去错峰(src/index.js:756 的原注释)。
+	// 覆盖层磁盘缓存先于一切目录动作装载(JS 启动即 loadLimitsCache,
+	// src/index.js:223):boot 目录因此能带上上一份的额度值。
+	bootOverlay, bootFetchedAt, _ := limits.LoadOverlayCache(filepath.Join(dataDir, "modelsdev.json"))
+	if bootOverlay == nil {
+		bootOverlay = map[string]limits.OverlayRow{}
+	}
+	parts := &Parts{
+		Root:          root,
+		Settings:      &settings,
+		Host:          host,
+		Registry:      reg,
+		Health:        h,
+		Prober:        nodeprobe.NewProber(logf),
+		Engine:        eng,
+		StatsStore:    statStore,
+		firstFetch:    firstFetch,
+		tierGate:      gate.New(tierGapMS),
+		catalog:       catBox,
+		overlayByID:   bootOverlay,
+		settingsStore: store,
+		cancel:        cancel,
+	}
+
+	parts.limitsFetchedAt = bootFetchedAt
+	parts.limitsRows = len(bootOverlay)
+	if len(bootOverlay) > 0 {
+		catBox.set(parts.applyOverlay(catBox.get()))
+	}
+
+	// 7. the forward listener, last: the port may only open once it can serve.
+	srv := forward.New(forward.Config{
+		Enabled:    func() bool { return settings.Enabled },
+		ForwardKey: func() string { return settings.ForwardKey },
+		Complete: func(cctx context.Context, req engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+			// Degradation rule 2. The engine answers an empty pool with a 503
+			// -flavoured failure, but forward maps every error from Complete
+			// onto 502 (forward.go:330, pinned by task 19's 31 tests) and the
+			// JS build never handed a 503 to forward either. The thing the
+			// user has to be able to read is "there is no exit", so say it
+			// here, before the engine has a chance to describe it as a
+			// model-level failure.
+			if reg.Len() == 0 {
+				return engine.Outcome{}, fmt.Errorf("no usable exit: 注册表里一个出口都没有（订阅未配置或全部失败）")
+			}
+			return eng.Complete(cctx, req, onChunk)
+		},
+		ModelRows: func() []engine.Row { return eng.ModelRows() },
+		Log:       func(msg string) { logger.Warn(fmt.Sprintf("forward: %s", msg)) },
+	})
+
+	fwdLn, err := net.Listen("tcp", listenAddr(settings.ForwardPort))
+	if err != nil {
+		return fail(fmt.Errorf("app: 监听转发端口 %d: %w", settings.ForwardPort, err))
+	}
+	closers = append(closers, fwdLn.Close)
+	go func() {
+		if err := srv.Serve(fwdLn); err != nil {
+			logger.Error(fmt.Sprintf("[app] 转发监听退出: %v", err))
+		}
+	}()
+	closers = append(closers, srv.Close)
+	parts.Forward = srv
+	parts.forwardLn = fwdLn
+
+	// 8. the panel port — the real console now, not the phase-3 stand-in.
+	// PanelDeps 全是函数值,panel 不认识 engine/health/registry 的任何类型
+	// (它自己也是 L5,同层不 import app,方向永远 app → panel)。
+	panelLn, err := net.Listen("tcp", listenAddr(settings.PanelPort))
+	if err != nil {
+		return fail(fmt.Errorf("app: 监听面板端口 %d: %w", settings.PanelPort, err))
+	}
+	closers = append(closers, panelLn.Close)
+	console := panel.New(panel.PanelDeps{
+		Status:      parts.Status,
+		GetSettings: func() any { return parts.SettingsView() },
+		ApplySettings: func(patch map[string]any) any {
+			if _, err := parts.ApplySettings(patch); err != nil {
+				logger.Warn(fmt.Sprintf("panel: 应用设置失败: %v", err))
+			}
+			return parts.SettingsView()
+		},
+		Actions: panel.PanelActions{
+			ProbeNow: func(ctx context.Context, force bool) error {
+				_, err := parts.ProbeNow(ctx, force)
+				return err
+			},
+			// Refresh/RefreshLimits 的签名没有 ctx:重建自带 180s 总预算,
+			// 限额刷新自带单次超时,都不需要外层取消。
+			Refresh:       func() error { return parts.Rebuild(context.Background()) },
+			RefreshLimits: func() error { return parts.refreshLimitsOverlay(context.Background()) },
+		},
+		Logs:        logger.Recent,
+		RouteRecent: tracelog.Recent,
+		Version:     Version,
+		AssetDir:    resolveWebDir(root),
+		Log:         func(msg string) { logger.Info(fmt.Sprintf("panel: %s", msg)) },
+		Limits:      parts.LimitsView,
+	})
+	go func() {
+		if err := console.Serve(panelLn); err != nil && err != http.ErrServerClosed {
+			logger.Error(fmt.Sprintf("[app] 面板监听退出: %v", err))
+		}
+	}()
+	closers = append(closers, console.Close)
+
+	parts.Panel = console
+	parts.panelLn = panelLn
+
+	logger.Info(fmt.Sprintf("[app] 注册表 %d 个出口（本进程 0 个本地端口）", reg.Len()))
+	logger.Info(fmt.Sprintf("[app] 转发端口 %d 已监听", portOf(fwdLn)))
+	logger.Info(fmt.Sprintf("[app] 面板端口 %d 已监听（控制台 %s）", portOf(panelLn), resolveWebDir(root)))
+	return parts, nil
+}
+
+// Shutdown stops the listener, flushes every store and closes the sing-box
+// host. Safe to call twice, and safe on the zero Parts after a failed Load.
+func (p *Parts) Shutdown(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	_ = ctx
+	p.shutdownOnce.Do(func() {
+		if p.cancel != nil {
+			p.cancel()
+		}
+		if p.Forward != nil {
+			_ = p.Forward.Close()
+		}
+		if p.forwardLn != nil {
+			_ = p.forwardLn.Close()
+		}
+		if p.Panel != nil {
+			_ = p.Panel.Close()
+		}
+		if p.panelLn != nil {
+			_ = p.panelLn.Close()
+		}
+		// Flush before closing the host: an exit that is still in the registry
+		// must survive the restart even though its socket just went away.
+		flushes := []struct {
+			name string
+			fn   func() error
+		}{
+			{"health", func() error {
+				if p.Health == nil {
+					return nil
+				}
+				return p.Health.Persist()
+			}},
+			{"registry", func() error {
+				if p.Registry == nil {
+					return nil
+				}
+				return p.Registry.Flush()
+			}},
+			{"settings", func() error {
+				if p.settingsStore == nil {
+					return nil
+				}
+				return p.settingsStore.Flush()
+			}},
+			{"stats", func() error {
+				if p.StatsStore == nil {
+					return nil
+				}
+				return p.StatsStore.Flush()
+			}},
+		}
+		for _, f := range flushes {
+			if err := f.fn(); err != nil && p.shutdownErr == nil {
+				p.shutdownErr = fmt.Errorf("app: 关停时落盘 %s: %w", f.name, err)
+			}
+		}
+		if p.Host != nil {
+			if err := p.Host.Close(); err != nil && p.shutdownErr == nil {
+				p.shutdownErr = fmt.Errorf("app: 关停 sing-box: %w", err)
+			}
+		}
+	})
+	return p.shutdownErr
+}
+
+// RootDir resolves where data/ lives. FREEROUTER_DATA wins so a test or an
+// operator can point the gateway at an empty directory; otherwise data/ sits
+// next to the executable.
+func RootDir() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("FREEROUTER_DATA")); v != "" {
+		if filepath.IsAbs(v) {
+			return filepath.Clean(v), nil
+		}
+		abs, err := filepath.Abs(v)
+		if err != nil {
+			return "", fmt.Errorf("app: FREEROUTER_DATA=%q 不是可用路径: %w", v, err)
+		}
+		return abs, nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("app: 找不到可执行文件: %w", err)
+	}
+	// A symlinked or deleted executable must not stop the gateway: keep the
+	// path os.Executable handed us and resolve it only when possible.
+	//
+	// 返回值是「包含 data/ 的那一层」,不是 data/ 本身 —— Load(root) 会再拼
+	// 一层 data。这里若返回 <exeDir>/data,生产双击就会把数据落进
+	// <exeDir>/data/data(JS 版的布局是 exe 旁一份 data)。任务 25 验收时
+	// 实测发现,修于此处。
+	if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+		exe = resolved
+	}
+	return filepath.Dir(exe), nil
+}
+
+// probeWritable proves the data directory can actually be written to. Both
+// logger.Init and tracelog.Init report a failed MkdirAll by silently going
+// file-less, so without this check a read-only data directory would start a
+// gateway that logs nowhere and remembers nothing.
+func probeWritable(dir string) error {
+	f, err := os.CreateTemp(dir, ".freerouter-write-probe-*")
+	if err != nil {
+		return fmt.Errorf("app: 数据目录 %s 不可写: %w", dir, err)
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return nil
+}
+
+func listenAddr(port int) string {
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+}
+
+func portOf(ln net.Listener) int {
+	if tcp, ok := ln.Addr().(*net.TCPAddr); ok {
+		return tcp.Port
+	}
+	return 0
+}

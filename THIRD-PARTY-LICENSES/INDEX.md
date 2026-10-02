@@ -1,0 +1,79 @@
+# THIRD-PARTY-LICENSES —— 由 scripts/make-source-tarball.mjs 生成，勿手改
+
+本目录共 70 个模块的许可证全文，原样拷贝自模块缓存目录。
+本文件与这些全文都由 `npm run release` 重新生成，判据是 `go list -deps ./cmd/freerouter`（与 buildGo 同一组构建标签）。
+
+## 清单
+
+| 模块 | 版本 | 许可证 | 文件 | 是否 GPL |
+| --- | --- | --- | --- | --- |
+| fyne.io/systray | v1.12.2 | Apache-2.0 | `THIRD-PARTY-LICENSES/fyne.io/systray@v1.12.2/LICENSE` | 否 |
+| github.com/ajg/form | v1.5.1 | BSD | `THIRD-PARTY-LICENSES/github.com/ajg/form@v1.5.1/LICENSE` | 否 |
+| github.com/andybalholm/brotli | v1.1.0 | MIT | `THIRD-PARTY-LICENSES/github.com/andybalholm/brotli@v1.1.0/LICENSE` | 否 |
+| github.com/anytls/sing-anytls | v0.0.11 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/anytls/sing-anytls@v0.0.11/LICENSE` | 是 |
+| github.com/caddyserver/certmagic | v0.25.3-0.20260421143802-60d9d8b415d6 | Apache-2.0 | `THIRD-PARTY-LICENSES/github.com/caddyserver/certmagic@v0.25.3-0.20260421143802-60d9d8b415d6/LICENSE.txt` | 否 |
+| github.com/caddyserver/zerossl | v0.1.5 | MIT | `THIRD-PARTY-LICENSES/github.com/caddyserver/zerossl@v0.1.5/LICENSE` | 否 |
+| github.com/coder/websocket | v1.8.14 | ISC | `THIRD-PARTY-LICENSES/github.com/coder/websocket@v1.8.14/LICENSE.txt` | 否 |
+| github.com/cretz/bine | v0.2.0 | MIT | `THIRD-PARTY-LICENSES/github.com/cretz/bine@v0.2.0/LICENSE` | 否 |
+| github.com/database64128/netx-go | v0.1.1 | BSD | `THIRD-PARTY-LICENSES/github.com/database64128/netx-go@v0.1.1/LICENSE` | 否 |
+| github.com/database64128/tfo-go/v2 | v2.3.2 | MIT | `THIRD-PARTY-LICENSES/github.com/database64128/tfo-go/v2@v2.3.2/LICENSE` | 否 |
+| github.com/fsnotify/fsnotify | v1.9.0 | BSD | `THIRD-PARTY-LICENSES/github.com/fsnotify/fsnotify@v1.9.0/LICENSE` | 否 |
+| github.com/go-chi/chi/v5 | v5.2.5 | MIT | `THIRD-PARTY-LICENSES/github.com/go-chi/chi/v5@v5.2.5/LICENSE` | 否 |
+| github.com/go-chi/render | v1.0.3 | MIT | `THIRD-PARTY-LICENSES/github.com/go-chi/render@v1.0.3/LICENSE` | 否 |
+| github.com/go-ole/go-ole | v1.3.0 | MIT | `THIRD-PARTY-LICENSES/github.com/go-ole/go-ole@v1.3.0/LICENSE` | 否 |
+| github.com/gobwas/httphead | v0.1.0 | MIT | `THIRD-PARTY-LICENSES/github.com/gobwas/httphead@v0.1.0/LICENSE` | 否 |
+| github.com/gobwas/pool | v0.2.1 | MIT | `THIRD-PARTY-LICENSES/github.com/gobwas/pool@v0.2.1/LICENSE` | 否 |
+| github.com/godbus/dbus/v5 | v5.2.2 | BSD | `THIRD-PARTY-LICENSES/github.com/godbus/dbus/v5@v5.2.2/LICENSE` | 否 |
+| github.com/gofrs/uuid/v5 | v5.5.1 | MIT | `THIRD-PARTY-LICENSES/github.com/gofrs/uuid/v5@v5.5.1/LICENSE` | 否 |
+| github.com/google/btree | v1.1.3 | Apache-2.0 | `THIRD-PARTY-LICENSES/github.com/google/btree@v1.1.3/LICENSE` | 否 |
+| github.com/google/gopacket | v1.1.19 | BSD | `THIRD-PARTY-LICENSES/github.com/google/gopacket@v1.1.19/LICENSE` | 否 |
+| github.com/hashicorp/yamux | v0.1.2 | MPL-2.0 | `THIRD-PARTY-LICENSES/github.com/hashicorp/yamux@v0.1.2/LICENSE` | 否 |
+| github.com/huin/goupnp | v1.3.0 | BSD | `THIRD-PARTY-LICENSES/github.com/huin/goupnp@v1.3.0/LICENSE` | 否 |
+| github.com/jackpal/go-nat-pmp | v1.0.2 | Apache-2.0 | `THIRD-PARTY-LICENSES/github.com/jackpal/go-nat-pmp@v1.0.2/LICENSE` | 否 |
+| github.com/klauspost/compress | v1.19.1 | Apache-2.0 | `THIRD-PARTY-LICENSES/github.com/klauspost/compress@v1.19.1/LICENSE` | 否 |
+| github.com/klauspost/cpuid/v2 | v2.3.0 | MIT | `THIRD-PARTY-LICENSES/github.com/klauspost/cpuid/v2@v2.3.0/LICENSE` | 否 |
+| github.com/koron/go-ssdp | v0.0.4 | MIT | `THIRD-PARTY-LICENSES/github.com/koron/go-ssdp@v0.0.4/LICENSE` | 否 |
+| github.com/libdns/libdns | v1.1.1 | MIT | `THIRD-PARTY-LICENSES/github.com/libdns/libdns@v1.1.1/LICENSE` | 否 |
+| github.com/libp2p/go-nat | v1.0.1-0.20250821073202-01afc089f138 | Apache-2.0 | `THIRD-PARTY-LICENSES/github.com/libp2p/go-nat@v1.0.1-0.20250821073202-01afc089f138/LICENSE` | 否 |
+| github.com/libp2p/go-netroute | v0.2.1 | BSD | `THIRD-PARTY-LICENSES/github.com/libp2p/go-netroute@v0.2.1/LICENSE` | 否 |
+| github.com/logrusorgru/aurora | v2.0.3+incompatible | Unlicense/Public-Domain | `THIRD-PARTY-LICENSES/github.com/logrusorgru/aurora@v2.0.3+incompatible/LICENSE` | 否 |
+| github.com/metacubex/utls | v1.8.7 | BSD | `THIRD-PARTY-LICENSES/github.com/metacubex/utls@v1.8.7/LICENSE` | 否 |
+| github.com/mholt/acmez/v3 | v3.1.6 | Apache-2.0 | `THIRD-PARTY-LICENSES/github.com/mholt/acmez/v3@v3.1.6/LICENSE` | 否 |
+| github.com/miekg/dns | v1.1.72 | BSD | `THIRD-PARTY-LICENSES/github.com/miekg/dns@v1.1.72/LICENSE` | 否 |
+| github.com/quic-go/qpack | v0.6.0 | MIT | `THIRD-PARTY-LICENSES/github.com/quic-go/qpack@v0.6.0/LICENSE.md` | 否 |
+| github.com/sagernet/bbolt | v0.0.0-20260823094646-e24805439c9c | MIT | `THIRD-PARTY-LICENSES/github.com/sagernet/bbolt@v0.0.0-20260823094646-e24805439c9c/LICENSE` | 否 |
+| github.com/sagernet/cors | v1.2.1 | MIT | `THIRD-PARTY-LICENSES/github.com/sagernet/cors@v1.2.1/LICENSE` | 否 |
+| github.com/sagernet/fswatch | v0.1.2 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/fswatch@v0.1.2/LICENSE` | 是 |
+| github.com/sagernet/quic-go | v0.61.0-sing-box-mod.7 | MIT | `THIRD-PARTY-LICENSES/github.com/sagernet/quic-go@v0.61.0-sing-box-mod.7/LICENSE` | 否 |
+| github.com/sagernet/sing-box | v1.14.0 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-box@v1.14.0/LICENSE` | 是 |
+| github.com/sagernet/sing-mux | v0.3.5 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-mux@v0.3.5/LICENSE` | 是 |
+| github.com/sagernet/sing-quic | v0.7.0-beta.4 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-quic@v0.7.0-beta.4/LICENSE` | 是 |
+| github.com/sagernet/sing-shadowsocks2 | v0.2.1 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-shadowsocks2@v0.2.1/LICENSE` | 是 |
+| github.com/sagernet/sing-shadowsocks | v0.2.8 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-shadowsocks@v0.2.8/LICENSE` | 是 |
+| github.com/sagernet/sing-shadowtls | v0.2.1 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-shadowtls@v0.2.1/LICENSE` | 是 |
+| github.com/sagernet/sing-snell | v0.0.0-20260829071736-20f2eaec77c3 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-snell@v0.0.0-20260829071736-20f2eaec77c3/LICENSE` | 是 |
+| github.com/sagernet/sing-tun | v0.9.0-beta.4 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-tun@v0.9.0-beta.4/LICENSE` | 是 |
+| github.com/sagernet/sing-vmess | v0.2.8-0.20250909125414-3aed155119a1 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing-vmess@v0.2.8-0.20250909125414-3aed155119a1/LICENSE` | 是 |
+| github.com/sagernet/sing | v0.9.0-beta.4 | GPL-3.0-or-later | `THIRD-PARTY-LICENSES/github.com/sagernet/sing@v0.9.0-beta.4/LICENSE` | 是 |
+| github.com/sagernet/smux | v1.5.50-sing-box-mod.1 | MIT | `THIRD-PARTY-LICENSES/github.com/sagernet/smux@v1.5.50-sing-box-mod.1/LICENSE` | 否 |
+| github.com/sagernet/wireguard-go | v0.0.5-0.20260823125007-8bd032a91a30 | MIT | `THIRD-PARTY-LICENSES/github.com/sagernet/wireguard-go@v0.0.5-0.20260823125007-8bd032a91a30/LICENSE` | 否 |
+| github.com/sagernet/ws | v0.0.0-20231204124109-acfe8907c854 | MIT | `THIRD-PARTY-LICENSES/github.com/sagernet/ws@v0.0.0-20231204124109-acfe8907c854/LICENSE` | 否 |
+| github.com/vishvananda/netns | v0.0.5 | Apache-2.0 | `THIRD-PARTY-LICENSES/github.com/vishvananda/netns@v0.0.5/LICENSE` | 否 |
+| github.com/zeebo/blake3 | v0.2.4 | CC0-1.0 | `THIRD-PARTY-LICENSES/github.com/zeebo/blake3@v0.2.4/LICENSE` | 否 |
+| go.uber.org/multierr | v1.11.0 | MIT | `THIRD-PARTY-LICENSES/go.uber.org/multierr@v1.11.0/LICENSE.txt` | 否 |
+| go.uber.org/zap/exp | v0.3.0 | MIT | `THIRD-PARTY-LICENSES/go.uber.org/zap/exp@v0.3.0/LICENSE` | 否 |
+| go.uber.org/zap | v1.27.1 | MIT | `THIRD-PARTY-LICENSES/go.uber.org/zap@v1.27.1/LICENSE` | 否 |
+| go4.org/netipx | v0.0.0-20231129151722-fdeea329fbba | BSD | `THIRD-PARTY-LICENSES/go4.org/netipx@v0.0.0-20231129151722-fdeea329fbba/LICENSE` | 否 |
+| golang.org/x/crypto | v0.54.0 | BSD | `THIRD-PARTY-LICENSES/golang.org/x/crypto@v0.54.0/LICENSE` | 否 |
+| golang.org/x/exp | v0.0.0-20260410095643-746e56fc9e2f | BSD | `THIRD-PARTY-LICENSES/golang.org/x/exp@v0.0.0-20260410095643-746e56fc9e2f/LICENSE` | 否 |
+| golang.org/x/mod | v0.37.0 | BSD | `THIRD-PARTY-LICENSES/golang.org/x/mod@v0.37.0/LICENSE` | 否 |
+| golang.org/x/net | v0.57.0 | BSD | `THIRD-PARTY-LICENSES/golang.org/x/net@v0.57.0/LICENSE` | 否 |
+| golang.org/x/sync | v0.22.0 | BSD | `THIRD-PARTY-LICENSES/golang.org/x/sync@v0.22.0/LICENSE` | 否 |
+| golang.org/x/sys | v0.47.0 | BSD | `THIRD-PARTY-LICENSES/golang.org/x/sys@v0.47.0/LICENSE` | 否 |
+| golang.org/x/text | v0.40.0 | BSD | `THIRD-PARTY-LICENSES/golang.org/x/text@v0.40.0/LICENSE` | 否 |
+| golang.zx2c4.com/wintun | v0.0.0-20230126152724-0fa3db229ce2 | MIT | `THIRD-PARTY-LICENSES/golang.zx2c4.com/wintun@v0.0.0-20230126152724-0fa3db229ce2/LICENSE` | 否 |
+| google.golang.org/genproto/googleapis/rpc | v0.0.0-20251202230838-ff82c1b0f217 | Apache-2.0 | `THIRD-PARTY-LICENSES/google.golang.org/genproto/googleapis/rpc@v0.0.0-20251202230838-ff82c1b0f217/LICENSE` | 否 |
+| google.golang.org/grpc | v1.79.1 | Apache-2.0 | `THIRD-PARTY-LICENSES/google.golang.org/grpc@v1.79.1/LICENSE` | 否 |
+| google.golang.org/protobuf | v1.36.11 | BSD | `THIRD-PARTY-LICENSES/google.golang.org/protobuf@v1.36.11/LICENSE` | 否 |
+| gopkg.in/yaml.v3 | v3.0.1 | Apache-2.0 | `THIRD-PARTY-LICENSES/gopkg.in/yaml.v3@v3.0.1/LICENSE` | 否 |
+| lukechampine.com/blake3 | v1.3.0 | MIT | `THIRD-PARTY-LICENSES/lukechampine.com/blake3@v1.3.0/LICENSE` | 否 |

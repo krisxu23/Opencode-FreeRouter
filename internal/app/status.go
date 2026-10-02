@@ -1,0 +1,413 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 FreeRouter contributors
+//
+// 状态快照、设置读写与三个周期定时器。单独成文件是因为形状即契约:这里的每
+// 一个 JSON 键名都会被逐字搬运来的 web/app.js 消费,拼错一个字母,面板上就
+// 是一块安静的空白而不是一行报错。
+
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"freerouter/internal/health"
+	"freerouter/internal/logger"
+	"freerouter/internal/panel"
+	"freerouter/internal/parse"
+	"freerouter/internal/stats"
+	"freerouter/internal/upstream"
+)
+
+// Version 是控制台显示的产品版本。来源与 package.json 的 version 字段一致
+// (阶段 5 任务 29 改为 1.0.0 后同步这里)。
+const Version = "0.4.5"
+
+// ---- 时钟与定时器接缝 ----
+//
+// 测试不能真的等 5 分钟或 6 小时:now/afterFunc/wait 走 Parts 上的可替换字段,
+// 生产路径零开销(time.Now / time.AfterFunc / time.After)。
+
+func (p *Parts) now() time.Time {
+	if p.clockFn != nil {
+		return p.clockFn()
+	}
+	return time.Now()
+}
+
+func (p *Parts) nowMS() int64 { return p.now().UnixMilli() }
+
+func (p *Parts) afterFunc(d time.Duration, fn func()) *time.Timer {
+	p.timersWG.Add(1)
+	wrapped := func() {
+		defer p.timersWG.Done()
+		fn()
+	}
+	if p.afterFuncFn != nil {
+		return p.afterFuncFn(d, wrapped)
+	}
+	return time.AfterFunc(d, wrapped)
+}
+
+// wait 返回一个在 d 后闭合的通道。probeTicker 间隔每轮重读
+// (面板改 probeIntervalMin 立即生效),所以是逐轮 wait 而不是固定 Ticker。
+// wait 返回一个在 d 后闭合的通道。probeTicker 间隔每轮重读
+// (面板改 probeIntervalMin 立即生效),所以是逐轮 wait 而不是固定 Ticker。
+// waitFn 是测试接缝:注入后三个循环的节拍完全由测试驱动。
+func (p *Parts) wait(d time.Duration) <-chan time.Time {
+	if p.waitFn != nil {
+		return p.waitFn(d)
+	}
+	return time.After(d)
+}
+
+// base 是上游根地址。OUR_FREE_MODEL_BASE 覆盖它 —— 与 JS 的
+// upstream.js:24 同一开关;catalog 刷新与 B 档探针都从这里拼 URL,
+// 测试把它指向本地 httptest 服务。
+func (p *Parts) base() string {
+	if v := os.Getenv("OUR_FREE_MODEL_BASE"); v != "" {
+		return v
+	}
+	return upstream.UpstreamBase
+}
+
+// probeInterval 是探测周期:max(5, probeIntervalMin) 分钟。下限 5 分钟来自
+// src/index.js:1102 —— 更密的探测只会烧配额、把出口 IP 打成 429,不会让
+// 池子更健康。
+func (p *Parts) probeInterval() time.Duration {
+	minutes := p.Settings.ProbeIntervalMin
+	if minutes < 5 {
+		minutes = 5
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+// StartTimers 起三个周期任务:探测、订阅重建、限额覆盖层刷新
+// (间隔照抄 src/index.js:1102-1104)。它们都阻塞在 firstFetch 上再进第一轮:
+// 宁可晚几秒,也不要对着空池子空转。
+func (p *Parts) StartTimers(ctx context.Context) {
+	if p.firstFetch != nil {
+		p.timersWG.Add(1)
+		go func() {
+			defer p.timersWG.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.firstFetch:
+			}
+			p.probeLoop(ctx)
+		}()
+
+		p.timersWG.Add(1)
+		go func() {
+			defer p.timersWG.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.firstFetch:
+			}
+			p.rebuildLoop(ctx)
+		}()
+	} else {
+		p.timersWG.Add(2)
+		go func() { defer p.timersWG.Done(); p.probeLoop(ctx) }()
+		go func() { defer p.timersWG.Done(); p.rebuildLoop(ctx) }()
+	}
+	p.timersWG.Add(1)
+	go func() { defer p.timersWG.Done(); p.limitsLoop(ctx) }()
+}
+
+func (p *Parts) probeLoop(ctx context.Context) {
+	for {
+		interval := p.probeInterval()
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.wait(interval):
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		// ProbeNow 自己用 probing 标志串行化:上一轮没跑完时这一轮只记
+		// 重跑意图,绝不并发 —— 两轮并发会让淘汰判决互相覆盖。
+		if _, err := p.ProbeNow(ctx, false); err != nil {
+			logger.Info(fmt.Sprintf("[app] 定时探测跳过: %v", err))
+		}
+	}
+}
+
+func (p *Parts) rebuildLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.wait(rebuildInterval):
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err := p.Rebuild(ctx); err != nil {
+			logger.Warn(fmt.Sprintf("[app] 定时重建失败: %v", err))
+		}
+	}
+}
+
+func (p *Parts) limitsLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.wait(limitsInterval):
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err := p.refreshLimitsOverlay(ctx); err != nil {
+			logger.Warn(fmt.Sprintf("[app] 定时限额刷新失败: %v", err))
+		}
+	}
+}
+
+// ---- 状态快照 ----
+//
+// 形状逐字段对照 src/index.js:1060-1085 的 status() —— web/app.js 的 derive()
+// 按这些键名取数,多一个少一个都是面板上的静默空白。
+
+// Status 是喂给面板与 /api/status 的完整快照。
+//
+// forward.key 会出现在这里:控制台监听 127.0.0.1,JS 版同样把它交给本地面板
+// (src/index.js:1072),设置页的「测试请求」按钮靠它带 Authorization。计划
+// 正文写「绝不回显 key」并称 JS 也没回显 —— 那半句与 JS 源码相反,按 JS 裁决
+// (修正案阶段 4 条目)。
+func (p *Parts) Status() any {
+	lastRebuildAt, lastOK, lastErr, dropped := func() (int64, bool, string, int) {
+		p.rebuildStateMu.Lock()
+		defer p.rebuildStateMu.Unlock()
+		return p.lastRebuildAt, p.lastRebuildOK, p.lastRebuildErr, p.lastDropped
+	}()
+
+	// lastCheck 的形状对齐 src/index.js:1070:ok 为 null 表示「还没跑过重建」,
+	// 前端 checkBadge 对 ok==null 返回空串(不显示任何徽标)。
+	var okValue any
+	if lastRebuildAt != 0 {
+		okValue = lastOK
+	}
+	mode := ""
+	p.rebuildStateMu.Lock()
+	if lastRebuildAt != 0 && p.Registry.Len() == 0 && (p.lastAdded == 0 && p.lastRemoved == 0) {
+		mode = "direct" // 纯直连兜底:注册表空且本轮没有热插任何出站
+	}
+	p.rebuildStateMu.Unlock()
+
+	singbox := map[string]any{
+		"running": true, // 零端口架构:sing-box 与本进程同生死,进程在即 running
+		"pid":     os.Getpid(),
+		"lastCheck": map[string]any{
+			"ok":        okValue,
+			"dropped":   dropped,
+			"probation": p.probationCount(),
+			"at":        lastRebuildAt,
+			"mode":      mode,
+			"error":     lastErr,
+		},
+		"lastRebuild": map[string]any{
+			"ok":      lastOK,
+			"added":   p.lastAdded,
+			"removed": p.lastRemoved,
+			"at":      lastRebuildAt,
+		},
+	}
+
+	models := p.catalog.get()
+	ids := make([]string, 0, len(models))
+	caps := map[string]any{}
+	for _, m := range models {
+		ids = append(ids, m.ID)
+		caps[m.ID] = map[string]any{
+			"contextWindow": m.ContextWindow,
+			"maxOutput":     m.MaxOutput,
+		}
+	}
+
+	p.limitsMu.Lock()
+	limits := map[string]any{
+		"rows":      p.limitsRows,
+		"fetchedAt": p.limitsFetchedAt,
+		"stale":     p.limitsStale,
+	}
+	p.limitsMu.Unlock()
+
+	region := p.Health.RegionSnapshot()
+	regionModels := make([]any, 0, len(region.Models))
+	for _, m := range region.Models {
+		regionModels = append(regionModels, m)
+	}
+
+	// nodes = 注册表(=本代池子)逐节点一行,健康行从内存表取,缺席按 unknown。
+	// JS 逐字搬运的前端按 n.state/n.latencyMs/n.country/n.tier 取数;零端口
+	// 架构没有 per-node 端口,NodeRow 不带 port(节点表的 port 列恒显示 —,
+	// 这是任务 23 登记过的已知差异)。
+	snap := p.Health.NodeSnapshot()
+	nodes := make([]any, 0, p.Registry.Len())
+	for _, o := range p.Registry.All() {
+		row := map[string]any{
+			"tag":       o.Tag,
+			"country":   parse.CountryOf(o.Tag),
+			"state":     string(health.StateUnknown),
+			"latencyMs": -1,
+		}
+		if view, ok := snap[o.Tag]; ok {
+			b, err := json.Marshal(view)
+			if err == nil {
+				var m map[string]any
+				if json.Unmarshal(b, &m) == nil {
+					for k, v := range m {
+						row[k] = v
+					}
+				}
+			}
+		}
+		nodes = append(nodes, row)
+	}
+
+	return map[string]any{
+		"singbox":      singbox,
+		"forward":      map[string]any{"running": true, "port": p.Settings.ForwardPort, "key": p.Settings.ForwardKey},
+		"models":       ids,
+		"modelCaps":    caps,
+		"limits":       limits,
+		"regionModels": regionModels,
+		"nodes":        nodes,
+		"usage":        p.usageView(),
+	}
+}
+
+// usageView 换算 stats 落盘形状 → 前端形状(src/index.js:1078-1083):
+// today 是 UTC 今天,history 是升序 7 天。stats.Bucket 的 JSON 标签
+// (req/in/out)与前端一致,直接复用。
+func (p *Parts) usageView() map[string]any {
+	var snap stats.Snapshot
+	var history []stats.HistoryRow
+	if p.StatsStore != nil {
+		snap = p.StatsStore.Snapshot()
+		// usageHistory(st, 7):升序 7 天,缺日补零(src/index.js:1027-1037)。
+		history = p.StatsStore.History(usageHistoryDays, p.nowMS())
+	}
+	if history == nil {
+		history = []stats.HistoryRow{}
+	}
+	today := p.now().UTC().Format("2006-01-02")
+	todayBucket, ok := snap.Days[today]
+	if !ok {
+		todayBucket = stats.Bucket{}
+	}
+	return map[string]any{
+		"today":    todayBucket,
+		"requests": snap.Requests,
+		"byModel":  snap.Models,
+		"history":  history,
+	}
+}
+
+// usageHistoryDays 照抄 src/index.js:178 USAGE_HISTORY_DAYS。
+const usageHistoryDays = 7
+
+// ---- 设置视图与写入 ----
+
+// SettingsView 是 /api/settings 的响应:settings 的面板子集(照抄
+// src/panel.js:171-184 的键清单,但删掉 portBase/portSpan/catchAllPort)。
+// forwardKey 绝不进这个视图 —— 设置页没有显示它的需求,测试请求走的是
+// Status() 的 forward.key。
+func (p *Parts) SettingsView() map[string]any {
+	s := *p.Settings
+	return map[string]any{
+		"subUrls":          s.SubURLs,
+		"countries":        s.Countries,
+		"probeEnabled":     s.ProbeEnabled,
+		"probeWorkers":     s.ProbeWorkers,
+		"probeIntervalMin": s.ProbeIntervalMin,
+		"effortLevel":      s.EffortLevel,
+		"defaultMaxTokens": s.DefaultMaxTokens,
+		"forwardPort":      s.ForwardPort,
+		"panelPort":        s.PanelPort,
+	}
+}
+
+// ApplySettings 应用面板发来的设置补丁并落盘。
+//
+// 只收白名单键:forwardKey 不在清单里,伪造的补丁改不掉密钥。defaultMaxTokens
+// 的 null 是「不额外设限」的线上形式,必须原样存进 store 而不是删键 —— 浅层
+// merge 下删键会让旧值活过整个往返,字段永远清不掉(src/index.js:1047-1054)。
+// 端口字段的改动要重启后生效(转发端口已绑定,运行中重绑会断在途连接);
+// 其余字段下一轮探测/重建立即可见。
+func (p *Parts) ApplySettings(patch map[string]any) (Settings, error) {
+	if len(patch) == 0 {
+		return *p.Settings, nil
+	}
+	clean := map[string]any{}
+	for _, key := range []string{
+		"subUrls", "countries", "probeEnabled", "probeWorkers", "probeIntervalMin",
+		"effortLevel", "defaultMaxTokens", "forwardPort", "panelPort",
+	} {
+		if v, ok := patch[key]; ok {
+			clean[key] = v
+		}
+	}
+	if v, ok := clean["subUrls"].([]any); ok {
+		clean["subUrls"] = trimAll(anyToStrings(v))
+	}
+	if v, ok := clean["countries"].([]any); ok {
+		clean["countries"] = trimAll(anyToStrings(v))
+	}
+	p.settingsStore.Update(clean)
+	if err := p.settingsStore.Flush(); err != nil {
+		return *p.Settings, fmt.Errorf("app: 写设置: %w", err)
+	}
+	next, err := settingsFromStore(p.settingsStore)
+	if err != nil {
+		return *p.Settings, err
+	}
+	*p.Settings = next
+	return next, nil
+}
+
+func anyToStrings(v []any) []string {
+	out := make([]string, 0, len(v))
+	for _, e := range v {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// LimitsView 是 /api/limits 的摘要面板读回的那一半(刷新在 refreshLimitsOverlay)。
+func (p *Parts) LimitsView() panel.LimitsView {
+	p.limitsMu.Lock()
+	defer p.limitsMu.Unlock()
+	return panel.LimitsView{Rows: p.limitsRows, Stale: p.limitsStale}
+}
+
+// resolveWebDir 找 web/ 静态资产目录。exe 与 web/ 同在 Go 树根
+// (buildGo 的产物路径决定),从 exe 目录找;找不到退回工作目录 —— 测试从
+// 仓库任意目录跑时仍能命中。
+func resolveWebDir(root string) string {
+	candidates := []string{}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "web"))
+	}
+	candidates = append(candidates,
+		filepath.Join(root, "web"),
+		"web",
+	)
+	for _, c := range candidates {
+		if st, err := os.Stat(filepath.Join(c, "index.html")); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
+}

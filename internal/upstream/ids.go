@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 FreeRouter contributors
+
+package upstream
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+)
+
+// SessionRe is the canonical 1.x session shape: ses_ + 12 LOWERCASE hex +
+// 14 mixed-case base62. The lowercase hex is required, not incidental ——
+// Go 的 regexp 与 JS 一样区分大小写,这里**不要**加 (?i);反过来
+// [0-9A-Za-z]{14} 混大小写是故意的。
+//
+// v2 会话形状(ses_ + 64 个小写 hex,取自真 v2 CLI 二进制的 promptCacheKey
+// 正则)刻意**不**实现:实测两条 wire 都回 403 FreeTierError,与所有其它
+// 非规范形状一样 —— 闸门就是本正则的位置模式,没有别的(src/upstream.js:
+// 202-210;曾经的 SESSION_RE_V2/isV2Session 对因无生产调用方被删除,免得
+// 留下一个看起来承重的陷阱)。
+var SessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+// RequestRe is the same shape under the msg_ prefix.
+var RequestRe = regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+
+const base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+var lastStamp, seq atomic.Int64
+
+func base62From(b []byte) string {
+	var sb strings.Builder
+	sb.Grow(len(b))
+	for _, c := range b {
+		sb.WriteByte(base62[int(c)%62])
+	}
+	return sb.String()
+}
+
+// digestID renders a sha256 digest in the canonical identifier shape: the
+// first 6 bytes as hex, bytes 6..20 as base62.
+//
+// 把 20 字节全渲染成 hex 会得到更长、形状不同的串,SessionRe 直接拒绝 ——
+// 而闸门对坏形状的拒绝文案恰好是 "free tier can only be used from within
+// OpenCode",每个出口都一样,完全不会提示是形状出了问题;那是最难查的一类
+// 故障,所以摘要在构造时就必须落在正确形状上。
+func digestID(prefix string, sum []byte, re *regexp.Regexp) string {
+	id := prefix + hex.EncodeToString(sum[:6]) + base62From(sum[6:20])
+	if re.MatchString(id) {
+		return id
+	}
+	return ""
+}
+
+// mintID mints a fresh id: a time prefix folded into 48 bits (so ids minted in
+// the same millisecond still order), then 14 random base62 characters for
+// entropy. Same layout as src/upstream.js:147-162.
+func mintID(prefix string, timestamp int64) string {
+	if lastStamp.Swap(timestamp) != timestamp {
+		seq.Store(0)
+	}
+	n := seq.Add(1)
+	v := ^(uint64(timestamp) * 0x1000 + uint64(n))
+	var head strings.Builder
+	for i := 0; i < 6; i++ {
+		var b [1]byte
+		b[0] = byte((v >> (40 - 8*uint(i))) & 0xff)
+		head.WriteString(hex.EncodeToString(b[:]))
+	}
+	entropy := make([]byte, 14)
+	if _, err := rand.Read(entropy); err != nil {
+		// crypto/rand 在 Windows 上实际不会失败;真失败了,时间派生的 id
+		// 仍然形状合法,只是唯一性变弱 —— 比 panic 拖垮整个请求循环强。
+		for i := range entropy {
+			entropy[i] = byte(v >> (8 * uint(i%8)))
+		}
+	}
+	return prefix + head.String() + base62From(entropy)
+}
+
+// SessionForConversation maps one downstream conversation onto one stable
+// upstream session: a pure function of the id.
+//
+// 一个会话跨轮次、跨重启保持同一个 id —— 真客户端就是这么发的;每请求一个
+// 新会话被实测换来 429 + 递增的 retry-after(src/upstream.js:164-178)。配额
+// 到底按会话还是按出口 IP 计数并无定论(见 src/probe.js 的注),但稳定会话
+// 规则在两种解读下都对,因为它也是真客户端发送的形状。空 id 回落 "global"
+// 桶(js :180)。
+func SessionForConversation(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = "global"
+	}
+	sum := sha256.Sum256([]byte("our-free-model\x00" + id))
+	if out := digestID("ses_", sum[:], SessionRe); out != "" {
+		return out
+	}
+	return mintID("ses_", time.Now().UnixMilli())
+}
+
+// RequestIDFor is stable per turn: retries of the same turn must share it.
+// turnSeed 为空时没有稳定素材,退回即时铸造(js :187);摘要派生串万一过不了
+// 正则,同样退回铸造而不是发一个必被 403 的形状。
+func RequestIDFor(sessionID, turnSeed string) string {
+	if turnSeed == "" {
+		return mintID("msg_", time.Now().UnixMilli())
+	}
+	sum := sha256.Sum256([]byte("our-free-model-req\x00" + sessionID + "\x00" + turnSeed))
+	if out := digestID("msg_", sum[:], RequestRe); out != "" {
+		return out
+	}
+	return mintID("msg_", time.Now().UnixMilli())
+}
+
+// UserIDFor mints a fresh per-turn request id. A stable per-session value was
+// tried (matching the official input.user.id) and the gated models refused it
+// on every exit; random-per-turn passes (src/upstream.js:193-200)。
+func UserIDFor() string { return mintID("msg_", time.Now().UnixMilli()) }
+
+// TruncateSession 把会话值绑定在 maxSessionLength 内并去首尾空白
+// (src/upstream.js:435-439)。JS 的 .length/.slice 按 UTF-16 码元计;Go 侧按
+// rune 计数 —— BMP 字符上等价,且不会在多字节序列中间切出半个字符。
+func TruncateSession(v string) string {
+	trimmed := strings.TrimSpace(v)
+	if utf8.RuneCountInString(trimmed) > maxSessionLength {
+		runes := []rune(trimmed)
+		return string(runes[:maxSessionLength])
+	}
+	return trimmed
+}

@@ -1,0 +1,688 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 FreeRouter contributors
+//
+// Package adapter speaks the three upstream wires the free lane exposes:
+// chat/completions, responses, and the Anthropic-shaped messages path. They
+// differ only in request encoding and response parsing, so they share one
+// transport, one fingerprint and one failure classification.
+package adapter
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"math"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+
+	"freerouter/internal/check"
+	"freerouter/internal/effort"
+	"freerouter/internal/errors"
+	"freerouter/internal/messages"
+	"freerouter/internal/stream"
+	"freerouter/internal/upstream"
+)
+
+// maxBodyBytes 封顶非 2xx 与整包 JSON 的读取:失败路径要的是错误信封,不是
+// 整个响应体(计划:封顶 1MB)。
+const maxBodyBytes = 1 << 20
+
+// Deps is everything one adapter needs. A struct rather than a dozen arguments
+// because app builds it once and hands it to the rotation engine per exit.
+type Deps struct {
+	Client    *http.Client
+	Base      string
+	Model     string
+	Effort    string
+	MaxTokens int
+	Tools     []messages.Tool
+	SessionID string
+	Wire      upstream.Wire
+	// NodeKey identifies the exit this adapter dials; it is what the
+	// first-token report is attributed to.
+	NodeKey string
+	// OnFirstToken reports first-token latency at the instant the first delta
+	// lands, not at the end of the stream: a 40s reply that answered in 300ms
+	// must not delay the routing table learning that. Failures never report —
+	// the time to a refused connection says nothing about token speed.
+	OnFirstToken func(nodeKey string, ms int64)
+	// Entry 是目录行的 effort 投影(计划骨架的最小扩展):build 要在本地算
+	// max_tokens,而 budgetFor/resolveLevel 都需要模型自己的上限与推理支持位。
+	// 不放 Request 是因为模型身份固定在 adapter 上,一轮之内不随请求变。
+	Entry effort.Entry
+	// Tools 是**原始**工具模式(计划骨架写 []messages.ToolDef,但 ToolDef 的
+	// 线形状由构造时的 style 定死且不可从包外改写;JS 的 toToolDefs 是逐请求
+	// 带着当前 wire 的 style 调的,所以 Deps 持原始模式、build 时套样式)。
+}
+
+// Request is one turn as handed in by the rotation engine.
+type Request struct {
+	Messages []messages.Message
+	Stream   bool
+	Model    string
+	Stop     []string
+	// Temperature:JS 只在「是有限数字」时写;Go 的零值兼作「未设」——显式 0
+	// 与未设不可区分,统一按未设省略(实测它不在指纹闸门内,不惩罚省略)。
+	Temperature float64
+	// TurnSeed 把同一轮的重试钉在同一个 x-opencode-request 上:上游按请求 id
+	// 做会话内画像,每试一次换一个 id 就是每分钟 N 个身份(js upstream.js:186)。
+	TurnSeed string
+	// MaxTokens 是客户端本轮显式要的输出上限(requested;计划骨架的最小扩展,
+	// 注释见 Deps)。<=0 视为「未指定」,回落 Deps.MaxTokens(即
+	// settings.defaultMaxTokens),再回落 Entry.MaxOutput —— effort.BudgetFor
+	// 的三段回落链。
+	MaxTokens int
+	// ReasoningEffort 是客户端 reasoning_effort 的原词("" 视同未指定),与
+	// Deps.Effort(设置档)一起在 build 时经 effort.ResolveLevel 折叠。
+	ReasoningEffort string
+}
+
+// Adapter holds no mutable state; Complete is safe for concurrent use.
+type Adapter struct{ deps Deps }
+
+// NewAdapter returns an adapter bound to deps.
+func NewAdapter(deps Deps) *Adapter { return &Adapter{deps: deps} }
+
+// Wire reports which upstream shape this adapter speaks.
+func (a *Adapter) Wire() upstream.Wire { return a.deps.Wire }
+
+// turn 携带一次尝试在传输辅助函数之间穿行的全部状态。body 保留成 map 是因为
+// stale-reasoning 重放要就地剥字段后再重序列化。
+type turn struct {
+	req     Request
+	body    map[string]any
+	payload []byte
+	renames map[string]string
+	t0      time.Time
+}
+
+// Complete performs one turn. onChunk receives text deltas in arrival order;
+// returning an error from it aborts the turn and closes the upstream body.
+func (a *Adapter) Complete(ctx context.Context, req Request, onChunk func(string) error) (stream.Usage, error) {
+	var acc stream.Usage
+	firstContent := false
+	t0 := time.Now()
+
+	body, err := a.build(req)
+	if err != nil {
+		return acc, err
+	}
+	renames := upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return acc, err
+	}
+
+	t := &turn{req: req, body: body, payload: payload, renames: renames, t0: t0}
+	// 骨架的发送/状态处理段落落在 exchange:stale-reasoning 的重放路径必须能
+	// 拿到剥过字段的 body map 与原 400 的分类素材,整段搬过去才可测。
+	return a.exchange(ctx, t, onChunk, &acc, &firstContent)
+}
+
+// exchange 发一次请求并处理状态分岔:非 2xx 分类(400 命中过期推理引用时剥字段
+// 重放一次),2xx 交 readReply。调用方保证 payload 与 body 同源。
+func (a *Adapter) exchange(ctx context.Context, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool) (stream.Usage, error) {
+	httpReq, err := a.newRequest(ctx, t)
+	if err != nil {
+		return *acc, err
+	}
+	resp, err := a.deps.Client.Do(httpReq)
+	if err != nil {
+		// JS 对中止与传输失败分开记码(http.js:110-111):客户端取消不是
+		// 「换个出口」能治的传输抖动,引擎对 CodeAborted 也不冷却。
+		if ctx.Err() != nil {
+			return *acc, errors.Failure{Code: check.CodeAborted, Message: "request aborted"}
+		}
+		return *acc, errors.Failure{Code: check.CodeTransport, Message: err.Error(), Retryable: true}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		raw, _ := readAllCapped(resp.Body, maxBodyBytes)
+		// A 400 naming a reasoning item the server no longer knows is not a
+		// client error: drop the server-issued references and replay once.
+		// Replaying unconditionally would double every genuine 400, and a
+		// doubled 400 looks like the provider refusing the model.
+		if resp.StatusCode == http.StatusBadRequest && upstream.IsStaleReasoningReference(string(raw)) {
+			if upstream.StripStaleReasoningInputs(t.body) {
+				return a.replay(ctx, t, onChunk, acc, firstContent,
+					resp.StatusCode, raw, errors.RetryAfter(resp.Header.Get("Retry-After")))
+			}
+		}
+		return *acc, errors.Classify(resp.StatusCode, raw, errors.RetryAfter(resp.Header.Get("Retry-After")))
+	}
+	if err := a.readReply(resp, t, onChunk, acc, firstContent); err != nil {
+		return *acc, err
+	}
+	return *acc, nil
+}
+
+// replay 把剥过字段的 body 重发**一次**(js http.js:128-136)。重放又被拒时按
+// 重放的响应分类,不再剥第二次;重放连传输都没走通时回落**原始** 400 的分类
+// —— 第二条重试连不上,不改变第一条失败的形状。
+func (a *Adapter) replay(ctx context.Context, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool,
+	status int, raw []byte, retryAfter int64) (stream.Usage, error) {
+	payload, err := json.Marshal(t.body)
+	if err != nil {
+		return *acc, err
+	}
+	retry := &turn{req: t.req, body: t.body, payload: payload, renames: t.renames, t0: t.t0}
+	httpReq, err := a.newRequest(ctx, retry)
+	if err != nil {
+		return *acc, err
+	}
+	resp, err := a.deps.Client.Do(httpReq)
+	if err != nil {
+		return *acc, errors.Classify(status, raw, retryAfter)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		replayRaw, _ := readAllCapped(resp.Body, maxBodyBytes)
+		return *acc, errors.Classify(resp.StatusCode, replayRaw, errors.RetryAfter(resp.Header.Get("Retry-After")))
+	}
+	if err := a.readReply(resp, retry, onChunk, acc, firstContent); err != nil {
+		return *acc, err
+	}
+	return *acc, nil
+}
+
+// newRequest 组装 POST:端点按模型选线(js adapter.js:190),指纹头由 upstream
+// 出,会话与请求 id 分别由会话 id 与轮次种子派生 —— 同一轮重试复用同一 id。
+func (a *Adapter) newRequest(ctx context.Context, t *turn) (*http.Request, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		a.deps.Base+upstream.EndpointFor(a.deps.Model), bytes.NewReader(t.payload))
+	if err != nil {
+		return nil, err
+	}
+	session := upstream.SessionForConversation(a.deps.SessionID)
+	for name, value := range upstream.GatewayHeaders(upstream.HeaderOptions{
+		Session:   session,
+		RequestID: upstream.RequestIDFor(session, t.req.TurnSeed),
+		Stream:    t.req.Stream,
+	}) {
+		httpReq.Header.Set(name, value)
+	}
+	// anthropic-version 只在 messages 线上带。JS 把 ANTHROPIC_API_VERSION 定义
+	// 并导出却从未挂到任何请求上(死导出);真实的 Anthropic Messages API 要求
+	// 该头,计划的端点测试也断言它,故在此按线补挂。
+	if a.deps.Wire == upstream.WireMessages {
+		httpReq.Header.Set("anthropic-version", upstream.AnthropicAPIVersion)
+	}
+	return httpReq, nil
+}
+
+// build 按三条线构造请求体(js adapter.js:278-309 buildPayload + :176-185 的
+// 工具/温度/stop/指纹周边)。
+func (a *Adapter) build(req Request) (map[string]any, error) {
+	// repairToolPairing 在 wire 转换之前(js adapter.js:172):一轮被打断会在
+	// 持久历史里留下孤立的 tool_result,回放它不只是难看 —— 免费车道会答 400
+	// 并且拖死该会话之后的每一轮。在这里修一次,三条线同时覆盖。
+	repaired := messages.RepairToolPairing(req.Messages)
+	level := effort.ResolveLevel(req.ReasoningEffort, a.deps.Effort, a.deps.Entry)
+	var settingsDefault *int
+	if a.deps.MaxTokens > 0 { // Deps.MaxTokens 就是 settings.defaultMaxTokens 的解析结果;<=0 视同 null
+		v := a.deps.MaxTokens
+		settingsDefault = &v
+	}
+	budget := effort.BudgetFor(level, a.deps.Entry, req.MaxTokens, settingsDefault)
+
+	var payload map[string]any
+	var tools []messages.ToolDef
+	switch a.deps.Wire {
+	case upstream.WireResponses:
+		input, _, err := messages.ToResponseInput(repaired, nil)
+		if err != nil {
+			return nil, err
+		}
+		if len(input) == 0 {
+			// 全被投影丢掉时给一个占位轮:空 input 会被上游拒
+			input = []messages.ResponseItem{{Type: "message", Role: "user",
+				Content: []messages.RespPart{{Type: "input_text", Text: "..."}}}}
+		}
+		payload = map[string]any{
+			"model":             a.deps.Model,
+			"input":             input,
+			"stream":            true,
+			"store":             false,
+			"max_output_tokens": budget,
+		}
+		tools = messages.ToolDefs(a.deps.Tools, messages.ToolStyleFlat)
+	case upstream.WireMessages:
+		shape, _, err := messages.ToClaudeMessages(repaired, nil)
+		if err != nil {
+			return nil, err
+		}
+		payload = map[string]any{
+			"model":      a.deps.Model,
+			"messages":   shape.Messages,
+			"stream":     true,
+			"max_tokens": budget,
+		}
+		if shape.System != "" {
+			payload["system"] = shape.System
+		}
+		tools = messages.ToolDefs(a.deps.Tools, messages.ToolStyleClaude)
+	default: // chat
+		chat, _, err := messages.ToChatMessages(repaired, nil)
+		if err != nil {
+			return nil, err
+		}
+		payload = map[string]any{
+			"model":      a.deps.Model,
+			"messages":   chat,
+			"stream":     true,
+			"max_tokens": budget,
+		}
+		tools = messages.ToolDefs(a.deps.Tools, messages.ToolStyleChat)
+	}
+	// 免费档的闸门是对声明工具集的指纹校验,调用方一个工具都不带也要过
+	// (js adapter.js:181-183)。
+	if len(tools) > 0 {
+		payload["tools"] = tools
+	}
+	if req.Temperature != 0 && !math.IsNaN(req.Temperature) && !math.IsInf(req.Temperature, 0) {
+		payload["temperature"] = req.Temperature
+	}
+	// responses 线没有 stop 形状;chat 与 messages 线照写(js adapter.js:179)。
+	if a.deps.Wire != upstream.WireResponses && len(req.Stop) > 0 {
+		payload["stop"] = req.Stop
+	}
+	// chat 线强制 usage 尾包:折叠回非流式的回复也要报得出 token
+	// (js adapter.js:184-185,移植自 opencode2api 的 ensureAnonymousChatUsage)。
+	if a.deps.Wire == upstream.WireChat {
+		upstream.EnsureChatUsage(payload)
+	}
+	return payload, nil
+}
+
+var (
+	// 首块形状判定(js http.js:264-270):SSE 帧头与 JSON 首字符各一条,
+	// 形状不明才回落 Content-Type。
+	headSSERe  = regexp.MustCompile(`^\s*(data:|event:|id:|retry:|:)`)
+	headJSONRe = regexp.MustCompile(`^\s*[[{]`)
+)
+
+// readReply 分两条分支消费 2xx 响应体。
+//
+// 上游 issue #6:高负载下网关会返回非 event-stream 的 Content-Type 但 SSE 形状
+// 的响应体 —— 仅凭 Content-Type 分支会把整条流当 JSON 误杀。所以先嗅探首块
+// 字节按形状分类,Content-Type 只作兜底,且永不把流式响应整条读进内存
+// (js http.js:143-174 的实现语义)。
+func (a *Adapter) readReply(resp *http.Response, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool) error {
+	head := make([]byte, 8)
+	n, _ := io.ReadFull(resp.Body, head)
+	head = head[:n]
+	if n == 0 {
+		// JS:body 为空的 2xx 是「上游什么都没产」,归 EMPTY_RESPONSE —— 它在
+		// 引擎的可重试码表里,换出口是对的应对。
+		return errors.Failure{Code: check.CodeEmpty, Message: "our-free-model: upstream returned no body", Retryable: true}
+	}
+	body := io.MultiReader(bytes.NewReader(head), resp.Body)
+	if headSSERe.Match(head) || (!headJSONRe.Match(head) && strings.Contains(resp.Header.Get("Content-Type"), "event-stream")) {
+		return a.readSSE(body, t, onChunk, acc, firstContent)
+	}
+	raw, _ := readAllCapped(body, maxBodyBytes)
+	return a.readJSON(raw, resp.StatusCode, errors.RetryAfter(resp.Header.Get("Retry-After")), t, onChunk, acc, firstContent)
+}
+
+// readSSE 逐事件喂 feed;[DONE] 与非 JSON 帧在 feed 的入口被跳过。
+func (a *Adapter) readSSE(r io.Reader, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool) error {
+	return stream.ReadSSE(r, func(ev stream.Event) error {
+		return a.feed(t, []byte(ev.Data), 0, onChunk, acc, firstContent)
+	})
+}
+
+// readJSON 消费非流式的整包回复(js http.js:157-170 的 JSON 分支)。usage 的
+// 字段名以 JS readStream 的非流式分支为准(mapUsage 的双拼写);全文一次性
+// 回调 —— 这是 Go 版对 JS 的一个刻意补齐:JS 的 feedChat 只读 delta,非流式
+// JSON 的正文会被丢掉,而计划要求 onChunk 拿到全文。
+func (a *Adapter) readJSON(raw []byte, status int, retryAfter int64, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool) error {
+	var p map[string]any
+	if err := json.Unmarshal(raw, &p); err != nil || p == nil {
+		return errors.Failure{Code: check.CodeServer,
+			Message: "our-free-model: unexpected non-SSE response: " + snippet(raw)}
+	}
+	if _, has := p["error"]; has {
+		return errors.Classify(status, raw, retryAfter)
+	}
+	if err := a.feed(t, raw, status, onChunk, acc, firstContent); err != nil {
+		return err
+	}
+	if text := fullTextOf(p, a.deps.Wire); text != "" {
+		if !*firstContent {
+			*firstContent = true
+			acc.TTFTMS = time.Since(t.t0).Milliseconds()
+			a.reportTtft(acc.TTFTMS)
+		}
+		return onChunk(text)
+	}
+	return nil
+}
+
+// feed 是三条线共用的逐帧投影(js readStream → feedChat/feedClaude/
+// feedResponses)。本包的契约只搬运**文本增量**与 usage:reasoning 增量与
+// tool-call 增量没有上行通道(onChunk 只有一个 string 参数),由任务 18 的
+// engine 扩展 chunk 词汇时接管 —— renames 已随 turn 穿到位,tool 名还原届时
+// 挂在 tool_call delta 的处理点。
+func (a *Adapter) feed(t *turn, chunk []byte, status int, onChunk func(string) error, acc *stream.Usage, firstContent *bool) error {
+	var p map[string]any
+	if err := json.Unmarshal(chunk, &p); err != nil {
+		return nil // 畸形帧与 [DONE] 一律跳过(js readStream:300-302 的 try/catch)
+	}
+	// 流内错误帧按错误**信封**同款分类(js stream.js:303-315):分类错成
+	// 可重试码会让 harness 重发一个已流出半个答案的轮次。
+	if p["type"] == "error" || p["error"] != nil {
+		return errors.Classify(status, chunk, 0)
+	}
+	// TTFT 锚在第一个 delta 上,而不是第一个可见文本上:推理重的模型几分钟
+	// 后才吐可见文本(js carriesDelta:333-353)。
+	if a.carriesDelta(p) && !*firstContent {
+		*firstContent = true
+		acc.TTFTMS = time.Since(t.t0).Milliseconds()
+		a.reportTtft(acc.TTFTMS)
+	}
+	prior := *acc
+	// ScanUsage 折叠顶层 usage(chat 线的双拼写 + cache 细节)与 claude 文本
+	// 增量检测;三条线的嵌套落点与合并缺口在下面各线的补充里修。
+	stream.ScanUsage(chunk, acc, firstContent, t.t0)
+	switch a.deps.Wire {
+	case upstream.WireChat:
+		return a.feedChat(p, onChunk)
+	case upstream.WireResponses:
+		feedResponsesUsage(p, acc)
+		return feedResponses(p, onChunk)
+	default:
+		feedClaudeUsage(p, prior, acc)
+		return feedClaude(p, onChunk)
+	}
+}
+
+// carriesDelta 对应 js stream.js:333-353。`choices` 是外部数据:可能是 [null],
+// 也可能根本不是数组 —— 这条判断跑在流的最开头,是畸形帧最容易打到的地方。
+func (a *Adapter) carriesDelta(p map[string]any) bool {
+	switch a.deps.Wire {
+	case upstream.WireChat:
+		choices, ok := p["choices"].([]any)
+		if !ok {
+			return false
+		}
+		for _, choice := range choices {
+			cm, ok := choice.(map[string]any)
+			if !ok {
+				continue
+			}
+			delta, _ := cm["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			if s, _ := delta["content"].(string); s != "" {
+				return true
+			}
+			if s, _ := delta["reasoning"].(string); s != "" {
+				return true
+			}
+			if details, ok := delta["reasoning_details"].([]any); ok {
+				for _, part := range details {
+					pm, _ := part.(map[string]any)
+					if s, _ := pm["text"].(string); s != "" {
+						return true
+					}
+				}
+			}
+			if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
+				return true
+			}
+		}
+		return false
+	case upstream.WireResponses:
+		if s, _ := p["delta"].(string); s != "" {
+			return true
+		}
+		return p["type"] == "response.output_item.added"
+	default:
+		return p["type"] == "content_block_delta" || p["type"] == "content_block_start"
+	}
+}
+
+// feedChat 提取 chat 线的文本增量。畸形 choice([null]/"nope")跳过而不是
+// 抛 TypeError —— 上游帧是外部数据,那个 TypeError 曾让调用方拿到裸错误
+// (js feedChat:143-146 的实测注释)。
+func (a *Adapter) feedChat(p map[string]any, onChunk func(string) error) error {
+	choices, _ := p["choices"].([]any)
+	for _, choice := range choices {
+		cm, ok := choice.(map[string]any)
+		if !ok {
+			continue
+		}
+		delta, _ := cm["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if s, _ := delta["content"].(string); s != "" {
+			if err := onChunk(s); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// feedClaude 提取 messages 线的文本增量;thinking_delta 与 input_json_delta 在
+// 文本契约之外。
+func feedClaude(p map[string]any, onChunk func(string) error) error {
+	if p["type"] != "content_block_delta" {
+		return nil
+	}
+	delta, _ := p["delta"].(map[string]any)
+	if delta == nil || delta["type"] != "text_delta" {
+		return nil
+	}
+	if s, _ := delta["text"].(string); s != "" {
+		return onChunk(s)
+	}
+	return nil
+}
+
+// feedResponses 提取 responses 线的文本增量。
+func feedResponses(p map[string]any, onChunk func(string) error) error {
+	if p["type"] != "response.output_text.delta" {
+		return nil
+	}
+	if s, _ := p["delta"].(string); s != "" {
+		return onChunk(s)
+	}
+	return nil
+}
+
+// feedClaudeUsage 修 claude 线 usage 的两个 ScanUsage 盲区:
+//   - message_start 的 usage 藏在 message 下,且缓存计数字段名是
+//     cache_read_input_tokens(ScanUsage 只认顶层与 OpenAI 细节拼写);
+//   - message_delta 只带 {output_tokens},ScanUsage 折叠时会把 In 清零 ——
+//     js stream.js:284-293 的合并规则:只带输出侧的报告并入既有值。
+func feedClaudeUsage(p map[string]any, prior stream.Usage, acc *stream.Usage) {
+	usage, _ := p["usage"].(map[string]any)
+	switch p["type"] {
+	case "message_start":
+		msg, _ := p["message"].(map[string]any)
+		if msg != nil {
+			usage, _ = msg["usage"].(map[string]any)
+		}
+		if usage == nil {
+			return
+		}
+		acc.HasUsage = true
+		if v, ok := numOf(usage["cache_read_input_tokens"]); ok && v > 0 {
+			acc.CacheRead = v
+		}
+		if v, ok := numOf(usage["input_tokens"]); ok {
+			// disjoint-count:input_tokens 是毛值,减去缓存命中才是 harness 的
+			// 未缓存输入(js stream.js:122 的 Math.max(0, prompt - cached))。
+			acc.In = v - acc.CacheRead
+			if acc.In < 0 {
+				acc.In = 0
+			}
+		}
+		if v, ok := numOf(usage["output_tokens"]); ok {
+			acc.Out = v
+		}
+	case "message_delta":
+		if usage == nil {
+			return
+		}
+		if _, has := numOf(usage["input_tokens"]); !has {
+			acc.In = prior.In
+			acc.CacheRead = prior.CacheRead
+		}
+	default:
+		// 非流式 JSON:cache_read_input_tokens 在顶层 usage 里
+		if usage == nil {
+			return
+		}
+		if v, ok := numOf(usage["cache_read_input_tokens"]); ok && v > 0 {
+			// ScanUsage 只认 OpenAI 的 cached_tokens 拼写,所以它刚把 In 记成
+			// 了毛值:这里补做那次减法,只减新学到的差额以免重复扣。
+			delta := v - acc.CacheRead
+			acc.CacheRead = v
+			if delta > 0 {
+				acc.In -= delta
+				if acc.In < 0 {
+					acc.In = 0
+				}
+			}
+		}
+	}
+}
+
+// feedResponsesUsage 修 responses 线的 usage 盲区:response.completed 的 usage
+// 挂在 response 下,ScanUsage 的顶层折叠看不到它(js feedResponses:221-236)。
+func feedResponsesUsage(p map[string]any, acc *stream.Usage) {
+	if p["type"] != "response.completed" {
+		return
+	}
+	resp, _ := p["response"].(map[string]any)
+	if resp == nil {
+		return
+	}
+	usage, _ := resp["usage"].(map[string]any)
+	if usage == nil {
+		return
+	}
+	acc.HasUsage = true
+	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+		if v, ok := numOf(details["cached_tokens"]); ok && v > 0 {
+			acc.CacheRead = v
+		}
+	}
+	if v, ok := numOf(usage["input_tokens"]); ok {
+		// disjoint-count:input_tokens 是毛值(含缓存命中),harness 的
+		// inputTokens 只记未缓存部分(js stream.js:122)。
+		acc.In = v - acc.CacheRead
+		if acc.In < 0 {
+			acc.In = 0
+		}
+	}
+	if v, ok := numOf(usage["output_tokens"]); ok {
+		acc.Out = v
+	}
+}
+
+// fullTextOf 从非流式 JSON 里取出全文(逐线形状;feed 只处理 delta 形状,这条
+// 是它的非流式补集)。
+func fullTextOf(p map[string]any, wire upstream.Wire) string {
+	var parts []string
+	appendText := func(s string) {
+		if s != "" {
+			parts = append(parts, s)
+		}
+	}
+	switch wire {
+	case upstream.WireChat:
+		choices, _ := p["choices"].([]any)
+		for _, choice := range choices {
+			cm, ok := choice.(map[string]any)
+			if !ok {
+				continue
+			}
+			msg, _ := cm["message"].(map[string]any)
+			if msg == nil {
+				continue
+			}
+			if s, ok := msg["content"].(string); ok {
+				appendText(s)
+				continue
+			}
+			if blocks, ok := msg["content"].([]any); ok {
+				for _, block := range blocks {
+					bm, _ := block.(map[string]any)
+					if bm != nil && bm["type"] == "text" {
+						s, _ := bm["text"].(string)
+						appendText(s)
+					}
+				}
+			}
+		}
+	case upstream.WireMessages:
+		blocks, _ := p["content"].([]any)
+		for _, block := range blocks {
+			bm, ok := block.(map[string]any)
+			if ok && bm["type"] == "text" {
+				s, _ := bm["text"].(string)
+				appendText(s)
+			}
+		}
+	default:
+		items, _ := p["output"].([]any)
+		for _, item := range items {
+			im, ok := item.(map[string]any)
+			if !ok || im["type"] != "message" {
+				continue
+			}
+			blocks, _ := im["content"].([]any)
+			for _, block := range blocks {
+				bm, _ := block.(map[string]any)
+				if bm != nil && bm["type"] == "output_text" {
+					s, _ := bm["text"].(string)
+					appendText(s)
+				}
+			}
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+// reportTtft 把首 token 延迟报给路由层。panic 必须被吞掉:路由信号绝不能打断
+// 一轮请求(js adapter.js:61-66);OnFirstToken 为 nil 时静默(引擎任务 18 才
+// 会装配它)。
+func (a *Adapter) reportTtft(ms int64) {
+	if a.deps.OnFirstToken == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	a.deps.OnFirstToken(a.deps.NodeKey, ms)
+}
+
+// numOf 取 JSON 数字(json.Unmarshal 把数字解成 float64)。
+func numOf(v any) (int64, bool) {
+	f, ok := v.(float64)
+	if !ok {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// snippet 把非 JSON 响应体的开头截进错误消息(js http.js:166 的 slice(0,200);
+// 字节截断即可 —— 它只进错误消息,不再被解析)。
+func snippet(raw []byte) string {
+	if len(raw) > 200 {
+		return string(raw[:200])
+	}
+	return string(raw)
+}
+
+// readAllCapped 读至多 limit 字节(计划:非 2xx 响应体封顶 1MB)。
+func readAllCapped(r io.Reader, limit int64) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r, limit))
+}

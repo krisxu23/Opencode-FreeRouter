@@ -1,0 +1,14 @@
+{
+  "name": "freerouter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "FreeRouter: OpenAI-compatible forward to opencode.ai free lane, with sing-box linked in as a library",
+  "scripts": {
+    "build": "node scripts/go-build.mjs",
+    "build:exe": "node scripts/build-tray-exe.mjs",
+    "test": "node scripts/go-test.mjs",
+    "check": "node scripts/check-go.mjs",
+    "release": "node scripts/make-source-tarball.mjs"
+  }
+}
