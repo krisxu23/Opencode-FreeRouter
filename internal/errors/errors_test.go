@@ -74,6 +74,27 @@ func TestClassifyEmptyBodyFallsBackToStatusMessage(t *testing.T) {
 	}
 }
 
+// R8:Retry-After 提示不能只有配额分支带。5xx + Retry-After 是供应商真实会发
+// 的组合(网关过载时),而 engine 只在 cooldownOn={transport,timeout} 里消费它。
+// 从前 default 分支把 retryAfterMS 丢掉,于是这条提示永远到不了 NoteCooldown,
+// health 里 `if retryAfterMS > 0` 成了死分支。
+func TestClassifyKeepsRetryAfterOnServerErrors(t *testing.T) {
+	f := Classify(503, []byte(`{"error":{"message":"upstream overloaded"}}`), 12000)
+	if f.Code != check.CodeServer {
+		t.Fatalf("Code = %q, want %q", f.Code, check.CodeServer)
+	}
+	if !f.Retryable {
+		t.Fatal("503 must stay retryable")
+	}
+	if f.RetryAfterMS != 12000 {
+		t.Fatalf("RetryAfterMS = %d, want 12000(5xx 的 Retry-After 必须带到 engine)", f.RetryAfterMS)
+	}
+	// 不可重试的分支不该开始携带提示:401 是配置错误,退避语义没有意义。
+	if got := Classify(401, []byte(`{"error":{"message":"bad key"}}`), 12000); got.RetryAfterMS != 0 {
+		t.Fatalf("401 RetryAfterMS = %d, want 0(凭证失败不是退避)", got.RetryAfterMS)
+	}
+}
+
 func TestRetryAfterParsesSecondsOnly(t *testing.T) {
 	cases := []struct {
 		header string

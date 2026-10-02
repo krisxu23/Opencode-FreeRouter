@@ -109,8 +109,13 @@ func Classify(status int, body []byte, retryAfterMS int64) Failure {
 	case typ == "ModelError" || modelRe.MatchString(flat):
 		return Failure{Code: check.CodeServer, Status: status, Type: typ, Message: msg, Unavailable: true}
 
+	// R8: Retry-After 提示必须在这一支也带上。从前只有配额两支设 RetryAfterMS,
+	// 而唯一的消费者是 engine 的 `if cooldownOn[code] { NoteCooldown(…, RetryAfterMS) }`,
+	// 其中 cooldownOn = {transport, timeout} —— 于是「5xx + Retry-After」这条真实
+	// 存在的组合永远传不到 NoteCooldown,health 里的 `if retryAfterMS > 0` 成了死分支。
+	// 现在 5xx(以及其它落到 default 的可重试码)能把供应商的退避提示带到 engine。
 	default:
-		return Failure{Code: check.CodeServer, Status: status, Type: typ, Message: msg, Retryable: status >= 500}
+		return Failure{Code: check.CodeServer, Status: status, Type: typ, Message: msg, RetryAfterMS: retryAfterMS, Retryable: status >= 500}
 	}
 }
 

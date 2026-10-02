@@ -42,6 +42,14 @@ func New(gapMS int) *Gate {
 // 排期,没必要再分辨原因。取消的请求不回收时隙 —— 回收要和并发分配竞争,
 // 多留一格只影响错峰密度,不影响正确性。
 func (g *Gate) Wait(ctx context.Context) error {
+	// 取消检查必须覆盖**直通路径**(R4):delay <= 0 时下面的 select 根本不会
+	// 执行,所以只在 select 里看 ctx 是不够的 —— 常态(无间隔或时隙已过)下
+	// Wait 会拿着一个已死的 ctx 返回 nil,调用方以为排期成功,继续跑完一整轮
+	// 探测。这里先查一次,让「ctx 结束」在所有路径上都是同一个结果。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	g.mu.Lock()
 	now := time.Now().UnixMilli()
 	slot := g.nextAt

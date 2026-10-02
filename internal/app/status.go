@@ -396,6 +396,18 @@ func (p *Parts) Status() any {
 	// 面板 PUT 就会回出「旧端口配新 key」这种从未存在过的组合。
 	cur := p.settingsSnapshot()
 
+	// R7 + O9:落盘失败此前是死信息。stats 的 LastError() 在注释里被承诺给
+	// /api/status(:186 与 :366 两处),但状态里根本没有它的位置;注册表/健康表
+	// 的 Flush 失败也只进日志。这里给它们一个统一的出口,面板与运维脚本就能
+	// 在网关「看起来一切正常」时看到「写盘一直在失败」。
+	diagnostics := map[string]any{
+		"stats":        map[string]any{"lastError": ""},
+		"subscription": map[string]any{"lastError": lastErr},
+	}
+	if p.StatsStore != nil {
+		diagnostics["stats"] = map[string]any{"lastError": p.StatsStore.LastError()}
+	}
+
 	return map[string]any{
 		"singbox":      singbox,
 		"forward":      map[string]any{"running": true, "port": cur.ForwardPort, "key": cur.ForwardKey},
@@ -405,6 +417,7 @@ func (p *Parts) Status() any {
 		"regionModels": regionModels,
 		"nodes":        nodes,
 		"usage":        p.usageView(),
+		"diagnostics":  diagnostics,
 	}
 }
 

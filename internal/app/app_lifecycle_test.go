@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,6 +144,56 @@ func TestRebuildReportsSubscriptionFailure(t *testing.T) {
 	}
 	if p.Registry.Len() != 2 {
 		t.Fatalf("注册表 = %d, want 2(降级照旧:失败不清池子)", p.Registry.Len())
+	}
+}
+
+// TestJoinBootWaitsForTheGoroutine 钉住 R12 的一半:等待是真的等待。
+// Load 失败路径从前只 cancel,不 join —— 那个开场订阅协程仍可能在 Load 返回
+// 错误之后继续 reg.Merge/Flush/Host.SyncOutbounds,调用方却以为一切已经收场。
+func TestJoinBootWaitsForTheGoroutine(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	released := make(chan struct{})
+	go func() {
+		defer wg.Done()
+		<-released
+	}()
+
+	begin := time.Now()
+	done := make(chan struct{})
+	go func() {
+		joinBoot(&wg, 5*time.Second)
+		close(done)
+	}()
+	// 200ms 内 joinBoot 不能返回:协程还卡着。
+	select {
+	case <-done:
+		t.Fatal("joinBoot 在协程仍在跑时就返回了")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(released)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("协程退出后 joinBoot 仍未返回(等了 %v)", time.Since(begin))
+	}
+}
+
+// TestJoinBootCapsTheWait 钉住另一半:上限必须生效。订阅源若无视 ctx,没有上限
+// 的等待会让 Load 永不返回 —— 调用方拿不到「启动失败」这个错误,只能看着进程
+// 挂在那里。
+func TestJoinBootCapsTheWait(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1) // 永不 Done:模拟一个卡死的订阅协程。
+
+	begin := time.Now()
+	joinBoot(&wg, 50*time.Millisecond)
+	elapsed := time.Since(begin)
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("joinBoot 只等了 %v, want >= 50ms(不能提前放行)", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("joinBoot 等了 %v:上限没有生效", elapsed)
 	}
 }
 

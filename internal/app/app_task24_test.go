@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,7 @@ import (
 	"freerouter/internal/persistence"
 	"freerouter/internal/registry"
 	"freerouter/internal/sbx"
+	"freerouter/internal/stats"
 )
 
 // ---- 夹具 ----
@@ -737,6 +739,52 @@ func TestStatusReadsNodeRowsFromHealthMemory(t *testing.T) {
 	}
 	if _, has := byTag["n0"]["port"]; has {
 		t.Fatal("零端口架构的 NodeRow 不该有 port 字段")
+	}
+}
+
+// R7 + O9:stats 的落盘失败必须能从 /api/status 看到。stats.LastError() 的
+// 注释承诺它给 /api/status 用,但状态里从前没有它的位置 —— 一个「写盘一直
+// 失败、内存计数照常」的网关在面板上看起来完全健康。
+func TestStatusSurfacesTheStatsWriteFailure(t *testing.T) {
+	p := newProbeParts(t, 1)
+	// 零值 Parts 也必须有这个键:面板的启动帧直接读它。
+	st := p.Status().(map[string]any)
+	diag, ok := st["diagnostics"].(map[string]any)
+	if !ok {
+		t.Fatal("Status 缺 diagnostics 子对象")
+	}
+	if _, ok := diag["stats"]; !ok {
+		t.Fatal("diagnostics 缺 stats 子对象")
+	}
+	if _, ok := diag["subscription"]; !ok {
+		t.Fatal("diagnostics 缺 subscription 子对象(订阅最后失败原因)")
+	}
+
+	// 挂一个必然写不进去的 stats:父路径是普通文件 ⇒ Flush 必失败。
+	blocker := filepath.Join(p.Root, "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("准备阻断文件: %v", err)
+	}
+	s := stats.New(filepath.Join(blocker, "stats.json"))
+	s.Record(stats.Record{At: time.Now().UnixMilli(), Model: "m", OK: true, Output: 1})
+	if err := s.Flush(); err == nil {
+		t.Fatal("Flush 写不进去应返回 error")
+	}
+	p.StatsStore = s
+
+	diag = p.Status().(map[string]any)["diagnostics"].(map[string]any)
+	statsView := diag["stats"].(map[string]any)
+	if got, _ := statsView["lastError"].(string); got == "" {
+		t.Fatal("stats 落盘失败必须出现在 diagnostics.stats.lastError 里")
+	}
+
+	// 订阅失败原因同样要露出来:B11 之后 lastRebuildErr 记的是这轮重建的
+	// 合并错误,面板据此给 toast,运维脚本据此告警。
+	p.setRebuildResult(0, 0, 0, errors.New("订阅源全部超时"))
+	diag = p.Status().(map[string]any)["diagnostics"].(map[string]any)
+	subView := diag["subscription"].(map[string]any)
+	if got, _ := subView["lastError"].(string); got != "订阅源全部超时" {
+		t.Fatalf("diagnostics.subscription.lastError = %q, want 订阅源全部超时", got)
 	}
 }
 

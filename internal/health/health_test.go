@@ -445,16 +445,46 @@ func TestExitBusySurvivesAnOverlongRequest(t *testing.T) {
 	if got := h.exitBusyCountLocked("9.9.9.9", now); got != 1 {
 		t.Fatalf("exitBusyCount = %d, want 1", got)
 	}
+	// 刚归还到 0 的条目必须留下(Resin Dec 注释):删掉再建会把并发 Inc
+	// 的那一次丢掉,那个 IP 从此永远少算一条在途请求。
+	h.ReleaseExitBusy("9.9.9.9")
+	if _, ok := h.busy["9.9.9.9"]; !ok {
+		t.Fatal("刚归零的条目被删除:并发 Inc 会丢计数")
+	}
 	// at 拨到 11 分钟前(> 10min 窗口,而上游单次超时只有 300s):只可能来自
-	// 漏调的 Release,归零回收
+	// 漏调的 Release。R9:过窗条目必须**删掉**,不能只原地归零 —— 这张表按
+	// 出口 IP 建键,订阅轮换会让 IP 不断换代,原地归零就是无界增长。
 	h.busy["9.9.9.9"].At = now - 11*60*1000
 	if got := h.exitBusyCountLocked("9.9.9.9", now); got != 0 {
 		t.Fatalf("stale exitBusyCount = %d, want 0", got)
 	}
-	// 零值条目不删(Resin Dec 注释):删掉再建会把并发 Inc 的那一次丢掉
-	h.ReleaseExitBusy("9.9.9.9")
-	if _, ok := h.busy["9.9.9.9"]; !ok {
-		t.Fatal("零值条目被删除:并发 Inc 会丢计数")
+	if _, ok := h.busy["9.9.9.9"]; ok {
+		t.Fatal("过窗条目没被回收:busy 表会随订阅轮换无界增长")
+	}
+}
+
+func TestPruneBusyReclaimsOnlyStaleEntries(t *testing.T) {
+	h := NewHealth("")
+	now := time.Now().UnixMilli()
+	// 三条:新鲜、窗内零值、过窗。
+	h.NoteExitBusy("fresh.example")
+	h.NoteExitBusy("zero.example")
+	h.ReleaseExitBusy("zero.example")
+	h.NoteExitBusy("stale.example")
+	h.busy["stale.example"].At = now - exitBusyStale - 1000
+
+	h.mu.Lock()
+	h.pruneBusyLocked(now)
+	h.mu.Unlock()
+
+	if _, ok := h.busy["stale.example"]; ok {
+		t.Fatal("过窗条目没被回收")
+	}
+	if _, ok := h.busy["fresh.example"]; !ok {
+		t.Fatal("窗内条目被误删")
+	}
+	if _, ok := h.busy["zero.example"]; !ok {
+		t.Fatal("窗内零值条目被误删:并发 Inc 会丢计数")
 	}
 }
 

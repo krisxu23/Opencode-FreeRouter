@@ -39,6 +39,16 @@ type fakeUpstream struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 	got []captured
+	// retryAfter 非空时给每个响应带上 Retry-After 头(R8 的测试要造出
+	// 「5xx + Retry-After」这条真实组合;script 只能设状态码与 Content-Type)。
+	retryAfter string
+}
+
+// setRetryAfter 让后续响应带上 Retry-After 头。
+func (f *fakeUpstream) setRetryAfter(v string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retryAfter = v
 }
 
 func (f *fakeUpstream) requests() []captured {
@@ -70,6 +80,12 @@ func newFakeUpstream(t *testing.T, script func(n int) (int, string, string), onR
 		}
 		status, ctype, body := script(n)
 		w.Header().Set("Content-Type", ctype)
+		f.mu.Lock()
+		ra := f.retryAfter
+		f.mu.Unlock()
+		if ra != "" {
+			w.Header().Set("Retry-After", ra)
+		}
 		w.WriteHeader(status)
 		_, _ = fmt.Fprint(w, body)
 	}))
@@ -512,6 +528,31 @@ func TestTransportFailureCoolsTheNode(t *testing.T) {
 	snap := f.h.CooldownSnapshot()
 	if _, ok := snap["node-0"]; !ok {
 		t.Fatalf("拨号被拒(transport)应冷却该节点: %+v", snap)
+	}
+}
+
+// R8:errors.Classify 现在会给 5xx 带上 Retry-After 提示,但 engine 的冷却
+// 白名单没有因此扩大 —— server 是全局性失败(上游整体过载),把整池冻住只会
+// 让网关在供应商恢复后仍然拒绝服务。这条测试同时钉住两件事:提示确实被带到
+// 了 engine(否则下面的失败码会走别的分支),而冷却表依旧为空。
+func TestServerFailureWithRetryAfterDoesNotCoolTheNode(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		if n == 0 {
+			return 503, "application/json", `{"error":{"message":"upstream overloaded"}}`
+		}
+		return 200, "text/event-stream", sseChat("ok")
+	})
+	f.up.setRetryAfter("12")
+	if _, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"), nil); err != nil {
+		t.Fatalf("503 应换出口成功: %v", err)
+	}
+	if snap := f.h.CooldownSnapshot(); len(snap) != 0 {
+		t.Fatalf("cooldownOn 不含 server: CooldownSnapshot = %+v", snap)
+	}
+	// 出口确实换了(第一个请求打到 node-0,第二个打到别的节点),说明这轮
+	// 走的是「可重试 + 换出口」路径而不是凭证/不可重试的短路路径。
+	if got := f.up.count(); got != 2 {
+		t.Fatalf("上游被请求 %d 次, want 2(换一个出口重试)", got)
 	}
 }
 

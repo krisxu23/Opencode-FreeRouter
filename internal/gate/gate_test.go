@@ -131,6 +131,19 @@ func TestZeroGapAdmitsImmediately(t *testing.T) {
 	}
 }
 
+// R4:直通路径也必须看 ctx。gap<=0 时 Wait 根本不会进 select,从前那条路径
+// 直接 return nil —— 即使调用方的 ctx 早已取消。契约(见 Wait 的文档注释)是
+// 「ctx 结束时返回 ctx.Err()」,而 probe.go 的重跑回调正是靠这个错误判断
+// 网关是否已经关停。gap 为 0 是常态,所以这个洞覆盖了绝大多数调用。
+func TestWaitOnDirectPathStillReportsACancelledContext(t *testing.T) {
+	g := New(0)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 取消在 Wait 之前:delay <= 0 的那条直通路径必须自己检查。
+	if err := g.Wait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled(gap<=0 也不能吞掉已取消的 ctx)", err)
+	}
+}
+
 func TestSlotAnchoredToActualRelease(t *testing.T) {
 	g := New(50)
 	if err := g.Wait(context.Background()); err != nil {

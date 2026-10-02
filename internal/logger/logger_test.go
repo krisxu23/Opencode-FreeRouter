@@ -103,3 +103,52 @@ func TestLongMessageIsTruncatedOnRuneBoundary(t *testing.T) {
 		t.Fatalf("truncation mangled the head: %q", got.Msg[:20])
 	}
 }
+
+// R10:轮转失败时不能把 size 归零。从前 `_ = os.Rename(...)` 丢掉错误后无条件
+// `size = 0`,于是 Windows 上 .old.log 被占用(MoveFileEx 失败)时,记账归零而文件
+// 还在原地 —— 下一次写又从头累加,data/gateway.log 无界增长且永远不会再轮转。
+// 这里直接摆一个同名目录占住轮转目标,让 rename 必然失败。
+func TestRotationKeepsTheSizeWhenRenameFails(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "freerouter.log")
+	// 轮转目标是 <file 去掉 .log>.old.log;把它做成目录,rename 必失败。
+	if err := os.Mkdir(filepath.Join(dir, "freerouter.old.log"), 0o755); err != nil {
+		t.Fatalf("mkdir rotation target: %v", err)
+	}
+	Init(file)
+	// 白盒:直接推到轮转阈值,省掉 5MB 的落盘。
+	size = maxFileBytes
+	Info("after a failed rotation")
+
+	if size <= maxFileBytes {
+		t.Fatalf("size = %d after a failed rotation, want > %d:轮转失败不能把记账归零,否则文件无界增长", size, maxFileBytes)
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(b), "after a failed rotation") {
+		t.Fatalf("轮转失败后这一行仍必须落盘:\n%s", b)
+	}
+}
+
+// 轮转成功的正常路径:size 归零,旧文件改名成 .old.log。
+func TestRotationResetsTheSizeOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "freerouter.log")
+	Init(file)
+	Info("first generation")
+	size = maxFileBytes
+	Info("second generation")
+
+	if size > maxFileBytes {
+		t.Fatalf("size = %d, want <= %d(成功轮转后重新记账)", size, maxFileBytes)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "freerouter.old.log"))
+	if err != nil {
+		t.Fatalf("read rotated file: %v", err)
+	}
+	if !strings.Contains(string(b), "first generation") {
+		t.Fatalf(".old.log 应当是被轮转出去的那一代:\n%s", b)
+	}
+}

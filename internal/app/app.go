@@ -50,6 +50,11 @@ import (
 // 腰斩，而客户端看到的是一个被截断的回复加一个 502。
 const streamIdleTimeout = 300 * time.Second
 
+// bootJoinTimeout 是 Load 失败路径等待开场订阅 goroutine 的上限(R12)。正常情况下
+// cancel 之后它会立刻从 sub.Fetch 的 ctx 上返回,这个上限只在订阅源把 ctx 当耳旁风
+// 时兜底 —— 它换来的是「启动失败一定会返回错误」,而不是一个卡死的进程。
+const bootJoinTimeout = 5 * time.Second
+
 // Settings is the slice of data/settings.json this phase reads.
 //
 // The JSON names are kept identical to the JS version's so a legacy settings
@@ -251,11 +256,23 @@ func Load(root string) (*Parts, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var closers []func() error
+	// R12:开场订阅 goroutine 在后面才启动,但 fail 可能在任何一步触发。从前
+	// fail 只关 closers + cancel,从不 join 那个 goroutine —— cancel 只是告诉
+	// 它「该退出了」,它仍可能在 Load 返回错误之后继续 reg.Merge / EnforceCap /
+	// Flush / Host.SyncOutbounds,把一次失败启动的结果写进盘;下次启动读到的就是
+	// 一份从未成功过的注册表。这里用一个在 fail 之前就能捕获的 WaitGroup 等它。
+	var bootWG sync.WaitGroup
 	fail := func(err error) (*Parts, error) {
+		// 顺序与 Shutdown 一致:先取消、再等后台协程收手、最后关资源。
+		// 反过来的话,那个还在跑的开场订阅协程会对着一个已经 Close 的
+		// Host 调 SyncOutbounds。
+		cancel()
+		// 带超时兜底:订阅源卡在网络上时,宁可放弃等待(留下一个已经 cancel 的
+		// 协程)也不能让 Load 永久挂起 —— 启动失败必须能把错误返回给调用方。
+		joinBoot(&bootWG, bootJoinTimeout)
 		for i := len(closers) - 1; i >= 0; i-- {
 			_ = closers[i]()
 		}
-		cancel()
 		return nil, err
 	}
 
@@ -475,7 +492,10 @@ func Load(root string) (*Parts, error) {
 	// 于是冷启动路径上没有任何人调用 setRebuildResult —— lastRebuildAt 恒为 0、
 	// lastCheck.ok 恒为 null,前端 checkBadge/checkAlert 对 ok==null 直接返回空串,
 	// 面板顶部的「上次检查」在每次开机后都是永久空白,看起来就像网关什么都没做。
+	// R12:Add 必须在 go 语句之前,否则 fail 可能先读到零计数并直接放行。
+	bootWG.Add(1)
 	go func() {
+		defer bootWG.Done()
 		defer close(firstFetch)
 		// 订阅地址与放行国家取**活值**:面板上保存的设置要能影响这一轮,而不是
 		// 开机那一瞬间的副本(B7)。监听端口不在此列 —— 端口已经绑定,改端口
@@ -738,6 +758,30 @@ func RootDir() (string, error) {
 		exe = resolved
 	}
 	return filepath.Dir(exe), nil
+}
+
+// joinBoot 等开场订阅协程收手,最多等 limit。
+//
+// R12:Load 失败时 cancel 只是「通知」,不是「等待」。那个协程可能正卡在
+// sub.Fetch 的返回路上,随后继续 reg.Merge / EnforceCap / Flush /
+// Host.SyncOutbounds —— 把一次从未成功的启动写进注册表。超时上限是必须的:
+// 订阅源若无视 ctx,没有上限的等待会让 Load 永不返回,调用方拿不到那个
+// 「启动失败」的错误。
+//
+// 单独抽出来是为了可测:测试可以直接传一个永不 Done 的 WaitGroup 验证
+// 上限真的生效,而不必去构造一个会卡死的订阅源。
+func joinBoot(wg *sync.WaitGroup, limit time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(limit)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+	}
 }
 
 // probeWritable proves the data directory can actually be written to. Both

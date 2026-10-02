@@ -220,12 +220,16 @@ func (h *Health) Persist() error {
 	if h.file == "" {
 		return nil
 	}
-	h.mu.RLock()
+	h.mu.Lock()
+	// R9:顺带回收过窗的在途计数条目。这张表按出口 IP 建键,订阅轮换会让
+	// IP 不断换代,不回收就是无界增长。选这里是因为 Persist 每轮 rebuild/
+	// probe 各一次 —— 频率远低于每次请求,却足以跟上 IP 换代速度。
+	h.pruneBusyLocked(time.Now().UnixMilli())
 	snap := make(map[string]row, len(h.nodes))
 	for key, r := range h.nodes {
 		snap[key] = r
 	}
-	h.mu.RUnlock()
+	h.mu.Unlock()
 	if err := persistence.WriteJSONFile(h.file, diskFile{Nodes: snap}, true); err != nil {
 		return fmt.Errorf("health: %w", err)
 	}
@@ -1205,7 +1209,7 @@ func (h *Health) ReleaseExitBusy(exitIP string) {
 }
 
 // exitBusyCountLocked 这个出口 IP 当前的在途请求数(已过窗的陈旧计数按 0 处理,
-// 顺手归零回收)。(src/health.js:860-871)
+// 顺手回收)。(src/health.js:860-871)
 func (h *Health) exitBusyCountLocked(exitIP string, now int64) int {
 	if exitIP == "" {
 		return 0
@@ -1215,9 +1219,23 @@ func (h *Health) exitBusyCountLocked(exitIP string, now int64) int {
 		return 0
 	}
 	if now-r.At > exitBusyStale {
-		r.Count = 0
-		r.At = now
+		// R9:过窗条目直接删掉,不再原地归零。原地归零会保留条目,而这张表
+		// 按出口 IP 建键 —— 订阅轮换会让 IP 不断换代,条目数只增不减。
+		delete(h.busy, exitIP)
 		return 0
 	}
 	return r.Count
+}
+
+// pruneBusyLocked 批量回收所有已过窗的在途计数条目(R9)。调用方必须已持写锁。
+//
+// 只删过窗的,不动窗内的零值条目:ReleaseExitBusy 的注释说明过,删掉刚归零的
+// 条目再重建会把并发 Inc 的那一次丢掉。窗口(10 分钟)远大于上游单次超时
+// (300s),所以过窗条目只可能来自漏调的 Release,不可能还有在途请求挂着。
+func (h *Health) pruneBusyLocked(now int64) {
+	for ip, r := range h.busy {
+		if now-r.At > exitBusyStale {
+			delete(h.busy, ip)
+		}
+	}
 }
