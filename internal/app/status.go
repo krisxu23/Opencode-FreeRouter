@@ -98,6 +98,7 @@ func (p *Parts) StartTimers(ctx context.Context) {
 				return
 			case <-p.firstFetch:
 			}
+			p.warmUp(ctx)
 			p.probeLoop(ctx)
 		}()
 
@@ -118,6 +119,31 @@ func (p *Parts) StartTimers(ctx context.Context) {
 	}
 	p.timersWG.Add(1)
 	go func() { defer p.timersWG.Done(); p.limitsLoop(ctx) }()
+}
+
+// warmUp 是开场订阅落定与周期循环之间的那段:刷新模型目录,并在 firstProbeDelay
+// 后跑首轮探测。JS 版这两步挂在启动那次 rebuild 的尾巴上(src/index.js:1099 的
+// refreshCatalog、:1101 await rebuild() 走到 :736 的 setTimeout(probeNow, 3000));
+// Go 版把开场拉取内联进了 Build(app.go 步骤 4 —— 监听端口不该等订阅),那条路径
+// 不经过 Rebuild,于是两个尾巴一起丢了:面板只吃 data/catalog-ids.json 的磁盘缓存,
+// 节点状态要等满一个探测周期(实测 probeIntervalMin=30 就是 30 分钟)才出现第一轮实测。
+//
+// 用 wait 而不是 afterFunc:后者在 timersWG 上记一笔、只有回调真跑完才 Done,于是
+// 一个被 ctx 取消掉的定时器会把 Wait 挂到超时为止。
+func (p *Parts) warmUp(ctx context.Context) {
+	p.refreshCatalog(ctx)
+	p.timersWG.Add(1)
+	go func() {
+		defer p.timersWG.Done()
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.wait(firstProbeDelay):
+		}
+		// 与 Rebuild 的首探同口径:force=false,新鲜结果不重测。已有轮在跑就放弃
+		// —— 首探是尽力而为,排队只会让它变成紧接着的第二轮全量实测。
+		_, _ = p.ProbeNow(ctx, false)
+	}()
 }
 
 func (p *Parts) probeLoop(ctx context.Context) {

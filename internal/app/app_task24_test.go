@@ -795,6 +795,63 @@ func TestFirstProbeRunsThreeSecondsAfterReady(t *testing.T) {
 	}
 }
 
+// TestWarmUpProbesWithoutWaitingForTheInterval:开场订阅落定之后必须立刻有一轮
+// 首探,不能等满一个探测周期。JS 版的首探来自启动那次 rebuild 的尾巴
+// (src/index.js:1101 + :739-740);Go 版把开场拉取内联进 Build(app.go 步骤 4),
+// 那条路径不经过 Rebuild —— 少了这一轮,probeIntervalMin=30 时面板半小时全是「–」。
+func TestWarmUpProbesWithoutWaitingForTheInterval(t *testing.T) {
+	p := newProbeParts(t, 1)
+	swallowTimers(p) // 目录刷新失败时的 60s 重试定时器与本测试无关
+	p.Settings.ProbeIntervalMin = 30
+	p.waitFn = func(d time.Duration) <-chan time.Time {
+		if d == firstProbeDelay {
+			c := make(chan time.Time, 1)
+			c <- time.Now()
+			return c
+		}
+		return make(chan time.Time) // 周期循环保持沉默
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.StartTimers(ctx)
+	fp := p.Prober.(*fakeProber)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		fp.mu.Lock()
+		n := fp.allCnt
+		fp.mu.Unlock()
+		if n > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("开场订阅落定后没有首探:第一轮实测被推到了整个探测周期之后")
+}
+
+// TestWarmUpRefreshesCatalogAtStartup:启动即刷一次上游模型列表。JS 版是
+// src/index.js:1099 那句 void refreshCatalog();没有它,面板的模型表只能吃
+// data/catalog-ids.json 的磁盘缓存,要等 6 小时后的第一次重建才见新列表。
+func TestWarmUpRefreshesCatalogAtStartup(t *testing.T) {
+	p := newProbeParts(t, 0)
+	url := subAndCatalogServer(t, "", `{"data":[{"id":"warm-a"},{"id":"warm-b"}]}`, http.StatusOK)
+	t.Setenv("OUR_FREE_MODEL_BASE", url)
+	p.waitFn = func(time.Duration) <-chan time.Time { return make(chan time.Time) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.StartTimers(ctx)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		p.upstreamMu.Lock()
+		ids := append([]string(nil), p.lastUpstreamIDs...)
+		p.upstreamMu.Unlock()
+		if len(ids) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("启动后没有刷新模型目录")
+}
+
 // ---- 设置写入 ----
 
 func TestApplySettingsKeepsNullAndGuardsKey(t *testing.T) {
