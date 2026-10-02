@@ -364,7 +364,6 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			stickyNode = ""
 		}
 		picked := snapshot.Health.Pick(health.PickRequest{
-			Model:      base,
 			Restricted: restricted,
 			Countries:  settings.Countries,
 			Pool:       candidates,

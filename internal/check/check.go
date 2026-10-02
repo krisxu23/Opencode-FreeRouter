@@ -36,10 +36,10 @@ var RegionGroups = []string{"US", "JP", "HK", "TW", "KR", "SG", "EU", "OTHER"}
 // first two exits answered ECONNRESET and only the third worked.
 const SubRetryExits = 12
 
-// EphemeralPortFloor is where Windows starts handing ports to outbound
-// connections. The Go build has no per-node local ports, but the panel still
-// renders the old port-range setting and its help text quotes this number.
-const EphemeralPortFloor = 49152
+// EphemeralPortFloor 删掉了(审计 O6):它是「每节点一个本地端口」时代的遗留物。
+// Go 版没有任何per-node 端口可判,面板上那格端口范围设置与它帮助文案里的 49152
+// 是前端常量(web/app.js 冻结),不读这里的值 —— 留一个只有测试断言的数字,只会
+// 让人以为后端还在用它做判定。
 
 // ProbeSummaryPattern is the shape of the one log line per probe round that the
 // console scrapes with probeFromLogs (web/app.js:192). It lives here, next to

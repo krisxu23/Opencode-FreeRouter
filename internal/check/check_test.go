@@ -23,13 +23,9 @@ func TestSubRetryExitsKeepsTheMeasuredRaise(t *testing.T) {
 	}
 }
 
-func TestEphemeralPortFloorIsTheWindowsBoundary(t *testing.T) {
-	// Windows 从 49152 起把端口动态分配给出站连接。Go 版已不用每节点本地端口，
-	// 但面板仍显示旧端口区间设置，帮助文案里的数字必须一致。
-	if EphemeralPortFloor != 49152 {
-		t.Fatalf("EphemeralPortFloor = %d, want 49152", EphemeralPortFloor)
-	}
-}
+// TestEphemeralPortFloorIsTheWindowsBoundary 随 EphemeralPortFloor 一起删了
+// (审计 O6):每节点本地端口在零端口架构下已不存在,那个数字只剩面板帮助文案里
+// 的前端字面量(web/app.js 冻结),后端没有任何判据读它。
 
 func TestFailureCodesAreDistinctAndNonEmpty(t *testing.T) {
 	codes := map[string]string{

@@ -213,27 +213,7 @@ func TestStoreLoadWithoutFileKeepsDefaults(t *testing.T) {
 // Update 必须浅层 merge、Load 必须让磁盘赢过默认值（TestStoreLoadLetsDiskWinOverDefaults
 // 与 TestStoreLoadKeepsDefaultsForAbsentKeys）。这三件事在 JS 版里互相纠缠：
 // Get 返回引用、Update 浅合并且写回、Load 整表替换。Go 版把它们拆成三个可单测的语义。
-func TestPromoteFileReplacesAtomically(t *testing.T) {
-	dir := t.TempDir()
-	from := filepath.Join(dir, "b.json.tmp")
-	to := filepath.Join(dir, "a.json")
-	if err := os.WriteFile(from, []byte(`{"k":2}`), 0o644); err != nil {
-		t.Fatalf("seed from: %v", err)
-	}
-	if err := os.WriteFile(to, []byte(`{"k":1}`), 0o644); err != nil {
-		t.Fatalf("seed to: %v", err)
-	}
-	if err := PromoteFile(from, to); err != nil {
-		t.Fatalf("promote: %v", err)
-	}
-	b, err := os.ReadFile(to)
-	if err != nil {
-		t.Fatalf("read to: %v", err)
-	}
-	if string(b) != `{"k":2}` {
-		t.Fatalf("to = %s, want the promoted content", b)
-	}
-	if _, err := os.Stat(from); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("from still exists, err = %v", err)
-	}
-}
+//
+// 原来钉在这里的 TestPromoteFileReplacesAtomically 随 PromoteFile 一起删了(审计
+// O6):原子替换的契约由 TestWriteJSONFileConcurrentWritersAllSucceed 那一条在
+// **唯一入口**上钉住,单独测一个可绕锁的 rename 反而会把那条路径写成"支持"。

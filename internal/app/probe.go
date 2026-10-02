@@ -72,9 +72,10 @@ type ProbeSummary struct {
 	MS        int64
 	At        int64
 
-	Skipped    bool   // 探测源不通,整轮跳过
-	Accident   bool   // 探测源事故(alive 掉一半以上)
-	SourceAddr string // 探测用的直连出口,诊断用
+	Skipped  bool // 探测源不通,整轮跳过
+	Accident bool // 探测源事故(alive 掉一半以上)
+	// SourceAddr 删掉了(审计 O6):它恒被写成 "direct"、从未被读过 —— 零端口架构
+	// 下「这一轮从哪个地址探的」不是一个事实,JS 版的 sourceAddr 同理。
 }
 
 // Prober 是探测轮次对 nodeprobe 的全部依赖。做成接口是为了让测试注入假实现:
@@ -185,7 +186,7 @@ func (p *Parts) cacheWindowMS() int64 {
 // 必须处理的 error 只会让面板的按钮弹出一个没人能处理的对话框。
 func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) {
 	started := p.nowMS()
-	summary := ProbeSummary{At: started, SourceAddr: "direct"}
+	summary := ProbeSummary{At: started}
 
 	cur := p.settingsSnapshot()
 	if !cur.ProbeEnabled {

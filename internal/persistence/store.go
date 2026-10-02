@@ -128,13 +128,10 @@ func ReadJSONFile(file string, out any) error {
 	return nil
 }
 
-// PromoteFile renames a fully written temp file over its target.
-func PromoteFile(from, to string) error {
-	if err := os.Rename(from, to); err != nil {
-		return fmt.Errorf("persistence: 提升 %s -> %s: %w", from, to, err)
-	}
-	return nil
-}
+// PromoteFile 删掉了(审计 O6):它是 WriteJSONFile 内部那一步 rename 的公开外壳,
+// 生产从未单独调用 —— 而 B5 之后,提升必须与「同一目标路径的写锁」「唯一临时文件名」
+// 两件事一起做,单独暴露一个 rename 等于提供一个能绕过这两条保护的入口。
+// 原子替换的唯一路径是 WriteJSONFile。
 
 // Store is the settings-shaped bag of top-level keys the rest of the program
 // reads and writes. It is deliberately not generic: every persisted file in

@@ -364,10 +364,16 @@ func Load(root string) (*Parts, error) {
 	}
 	closers = append(closers, statStore.Flush)
 
-	// 6. engine, then limits. The plan's wiring table puts limits before the
-	// engine, but limits.New takes the stats provider as an argument, so the
-	// engine has to exist first. Nothing about limits can block startup:
-	// a missing snapshot file is simply an empty one.
+	// 6. engine. 面板上那格「限额」其实是 models.dev 覆盖层的行数,由 overlay.go 提供
+	// (`limits.rows/stale/fetchedAt`),冷启动优先读上一轮落盘的缓存 —— 上游不可达时
+	// 面板也不空。
+	//
+	// 这里曾经还接着一个配额表(limits.New/Refresh/Total/Snapshot,~291 行):计划的
+	// 接线表把它排在 engine 之前,但它的 stats 提供者就是 engine,所以只能在
+	// engine 之后建 —— 而真到接线那天,它依赖的 `Engine.Stats(context.Context)`
+	// 根本不存在,`Refresh` 会立刻返回「未实现」。生产从未调用过它一次(审计 O5),
+	// 于是整半删掉:留下来的只会是「一次接线即变活」的隐患,包括 appendHistory
+	// 每次读整份 jsonl 再整份重写、坏行无条件永久累积。
 	//
 	// 目录挂在 catalogBox 上:rebuild.go 的 applyIDs 是唯一换代入口,engine 的
 	// State 回调每轮路由读一次 —— 换代对在途请求不可见,它们用旧的一代跑完。

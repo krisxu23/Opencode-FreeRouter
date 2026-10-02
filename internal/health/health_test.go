@@ -280,13 +280,13 @@ func TestStickyTTLFollowsMeasuredCacheSavings(t *testing.T) {
 	}
 	// 0 命中且 prompt 大到本该命中(≥4096)→ 缩到 5min
 	h.NoteSticky("s2", "n1", false)
-	h.NoteStickyUsage("s2", StickyUsage{PromptTokens: 9000})
+	h.NoteStickyUsage("s2", StickyUsage{InputTokens: 9000})
 	if ttl, ok := h.StickyTTL("s2"); !ok || ttl != cacheCold {
 		t.Fatalf("cacheRead=0 prompt=9000 ttl = %d, want %d", ttl, cacheCold)
 	}
 	// 0 命中但 prompt 很小 → 没有信息,保守基线
 	h.NoteSticky("s3", "n1", false)
-	h.NoteStickyUsage("s3", StickyUsage{PromptTokens: 100})
+	h.NoteStickyUsage("s3", StickyUsage{InputTokens: 100})
 	if ttl, ok := h.StickyTTL("s3"); !ok || ttl != stickyTTLBase {
 		t.Fatalf("cacheRead=0 prompt=100 ttl = %d, want %d", ttl, stickyTTLBase)
 	}
@@ -387,7 +387,7 @@ func TestStickyDoesNotInheritCacheSavingsOnIPChange(t *testing.T) {
 func TestWithinTurnNeverShrinksSticky(t *testing.T) {
 	h := NewHealth("")
 	h.NoteSticky("s", "a", false)
-	h.NoteStickyUsage("s", StickyUsage{PromptTokens: 9000}) // 缩到 5min
+	h.NoteStickyUsage("s", StickyUsage{InputTokens: 9000}) // 缩到 5min
 	if ttl, _ := h.StickyTTL("s"); ttl != cacheCold {
 		t.Fatalf("setup ttl = %d, want %d", ttl, cacheCold)
 	}
@@ -397,7 +397,7 @@ func TestWithinTurnNeverShrinksSticky(t *testing.T) {
 	}
 	// 对照:非轮内的同情形不抬
 	h.NoteSticky("s2", "a", false)
-	h.NoteStickyUsage("s2", StickyUsage{PromptTokens: 9000})
+	h.NoteStickyUsage("s2", StickyUsage{InputTokens: 9000})
 	h.NoteSticky("s2", "a", false)
 	if ttl, _ := h.StickyTTL("s2"); ttl != cacheCold {
 		t.Fatalf("non-withinTurn ttl = %d, want %d(保持 5min)", ttl, cacheCold)

@@ -758,23 +758,19 @@ func (h *Health) NoteRegionOK(model, nodeKey string) {
 	}
 }
 
-// RegionSnapshot:{models: [RegionProbeModel], tiered: {tag: tier}}。
+// RegionSnapshot:/api/status 的「哪些模型是 region-gated」名单。
 // (src/health.js:520-522)
+//
+// JS 的形状里还有 `tiered: {tag: tier}`,Go 曾一并构造它(审计 O6):唯一读者
+// status.go 只取 `.Models`,面板的每节点档位走 NodeSnapshot 的 row.Tier —— 一个
+// 构造 + 序列化后没人读的观测面,每 5 秒随节点数扫一遍全表。删掉;真要它的时候
+// 按 row 加回来,而不是留一份没人看的副本。
 type RegionSnapshot struct {
-	Models []string        `json:"models"`
-	Tiered map[string]Tier `json:"tiered"`
+	Models []string `json:"models"`
 }
 
 func (h *Health) RegionSnapshot() RegionSnapshot {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	tiered := make(map[string]Tier, len(h.nodes))
-	for key, r := range h.nodes {
-		if r.Tier != TierNone {
-			tiered[key] = r.Tier
-		}
-	}
-	return RegionSnapshot{Models: []string{RegionProbeModel}, Tiered: tiered}
+	return RegionSnapshot{Models: []string{RegionProbeModel}}
 }
 
 // SeedRestrictedModels 不移植:JS 里它只是为 index.js 的调用保形的空壳
@@ -787,35 +783,11 @@ func IsRestrictedModel(model string) bool {
 	return strings.HasPrefix(model, "muse-spark")
 }
 
-// RegionProbeCandidates:alive 且还没有 B 判决的节点 —— 第二段探针的名单。
-// (src/health.js:536-546) B 已证明,不用每轮重新证明。max <= 0 视为不限量。
-// 按 tag 字典序输出:Go map 无序,而名单顺序决定谁先拿到当轮探测名额,不确定
-// 性会变成每轮探到不同子集 —— 与 pick 排序加 tag 键是同一条确定性纪律。
-func (h *Health) RegionProbeCandidates(max int) []string {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	keys := make([]string, 0, len(h.nodes))
-	for key := range h.nodes {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	out := make([]string, 0)
-	for _, key := range keys {
-		r := h.nodes[key]
-		if r.State != StateAlive {
-			continue
-		}
-		if r.Tier == TierB {
-			continue
-		}
-		out = append(out, key)
-		if max > 0 && len(out) >= max {
-			break
-		}
-	}
-	return out
-}
-
+// RegionProbeCandidates 不移植(审计 O6):JS 的 regionProbeCandidates
+// (src/health.js:536-546)在 Go 里零调用 —— 第二段 B 探针的名单由 app 的
+// tier 流水线从探测结果自己组,不需要这张表。留一个没人调的名单,只会让人以为
+// B 档证明还有第二条入口。
+//
 // UnavailableEverywhere:这个模型是不是因为没有任何 alive 的 B 出口而不可服务?
 // (src/health.js:548-558) 只有 gated 模型可能是:非受限模型(big-pickle)每个
 // A 出口都能服务,忘了传 model 就会把整个目录藏起来 —— 非受限模型必须返回
@@ -893,21 +865,23 @@ func (h *Health) stickyTTLOfLocked(s *sticky, now int64) int64 {
 }
 
 // StickyUsage 是一次成功请求交回粘性表的 token 记账(src/health.js:626 的
-// usage 对象形状)。零值 = 上游没报,按「没命中/没信息」处理 —— 与 JS 的
-// Number.isFinite 判定唯一的分歧在「inputTokens 真的为 0 且 promptTokens 非 0」
-// 这种自相矛盾的上游报告上,它定档到哪一档都无意义。
+// usage 对象形状)。零值 = 上游没报,按「没命中/没信息」处理。
+//
+// JS 的形状还有 promptTokens(OpenAI 拼写,含缓存),src/health.js:634-636 为此
+// 有一条「inputTokens 缺席就用 promptTokens 减缓存」的兜底;Go 的 usage 只有一个
+// 来源 —— stream.Usage 的 In 在 ScanUsage 里**已经**按 disjoint-count 减过缓存了
+// (B4/O15),所以那条兜底在这里是死支,字段一并删掉:留着等于宣称还有第二条
+// 入口,而它永远不会被填。
 type StickyUsage struct {
 	CacheReadTokens float64
 	InputTokens     float64
-	PromptTokens    float64
 }
 
 // NoteStickyUsage 把一次请求的缓存收益交回粘性表(engine 成功路径调用)。
 // (src/health.js:616-639) 收 usage 对象而不是裸数字,是因为定档需要两个量:
-// 命中量(cacheReadTokens)和「本次本该命中多少」(inputTokens —— 上游把
-// prompt_tokens 算成 input + cacheRead,所以这里减回去)。拿不到任何 usage 就
-// 什么都不做:那次请求对「值不值得粘」没有发言权,不能让它覆盖上一次已经量到
-// 的收益。
+// 命中量(cacheReadTokens)和「本次本该命中多少」(inputTokens,已是不含缓存的
+// 净输入)。拿不到任何 usage 就什么都不做:那次请求对「值不值得粘」没有发言权,
+// 不能让它覆盖上一次已经量到的收益。
 func (h *Health) NoteStickyUsage(session string, usage StickyUsage) {
 	if session == "" {
 		return
@@ -919,14 +893,7 @@ func (h *Health) NoteStickyUsage(session string, usage StickyUsage) {
 		return
 	}
 	cacheRead := finiteNonNegative(usage.CacheReadTokens)
-	// 上游若只给 OpenAI 形状(prompt_tokens 含缓存),减回来得到真实新增量。
-	input := usage.InputTokens
-	if input == 0 && usage.PromptTokens != 0 {
-		input = usage.PromptTokens - cacheRead
-		if input < 0 {
-			input = 0
-		}
-	}
+	input := finiteNonNegative(usage.InputTokens)
 	hit.PromptTokens = input
 	hit.CacheRead = cacheRead
 	hit.CacheAt = time.Now().UnixMilli()
@@ -1024,6 +991,10 @@ func (h *Health) NoteSticky(session, nodeKey string, withinTurn bool) {
 // noteStickyTtl) 只给观测与测试用 —— 读路径一律走 ExitForSession/busyExitIps,
 // 它们自己按行里的 ttlMs 计时。第二个返回值 false = 没有 sticky 行(JS 的
 // null),区别于「有行且等于基线」。
+//
+// 审计 O6 把它列为「仅测试使用」的死符号,这里**保留**:粘性 TTL 的三档定档是
+// L1 的内部状态,而钉住它的用例在 L4 的 engine 包(轮内不许改档那条)—— 跨包没有
+// 别的观察窗口,删掉它等于删掉那条行为的测试。同一条理由保住了 gate.NextAt。
 func (h *Health) StickyTTL(session string) (int64, bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

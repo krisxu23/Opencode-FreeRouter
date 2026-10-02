@@ -726,16 +726,10 @@ func TestRefreshCatalogFallsBackToOverlay(t *testing.T) {
 	}
 }
 
-func TestRebuildReadyProbeUsesSameTimeoutFormula(t *testing.T) {
-	cases := []struct{ n, want int }{
-		{0, 5000}, {100, 6000}, {5500, 60000}, {100000, 60000},
-	}
-	for _, c := range cases {
-		if got := bootTimeoutMS(c.n); got != c.want {
-			t.Fatalf("bootTimeoutMS(%d) = %d, want %d (min(60000, 5000+10n))", c.n, got, c.want)
-		}
-	}
-}
+// TestRebuildReadyProbeUsesSameTimeoutFormula 随 bootTimeoutMS 一起删了(审计 O6):
+// 那条 min(60000, 5000+10n) 公式在 Go 侧没有任何调用点,测它等于测一个不存在的接线。
+// 开机路径真正用到的两条各有自己的测试:TestFirstProbeRunsThreeSecondsAfterReady
+// (firstProbeDelay)与 TestJoinBootCapsTheWait(bootJoinTimeout,R12)。
 
 // ---- 状态快照与定时器(6 条) ----
 

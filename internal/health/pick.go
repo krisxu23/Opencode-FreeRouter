@@ -33,9 +33,10 @@ type PoolNode struct {
 
 // PickRequest asks for the next exit.
 type PickRequest struct {
-	// Model is the base model id, used only for IsRestrictedModel.
-	Model string
-	// Restricted forces B-tier-only candidates.
+	// Restricted forces B-tier-only candidates. 审计 O15 这里曾有 `Model`
+	// (文档说"used only for IsRestrictedModel"),但生产从不读它 —— 判受限的一方
+	// (engine)自己算好了再传 Restricted,health 侧再看一次 model 只会让同一个判定
+	// 有两处真相(JS 的 pickExit 也带一个从未使用的 model 参数,同源缺陷)。
 	Restricted bool
 	// Countries are the user's groups in fallback order: US, JP, HK, TW, KR,
 	// SG, EU, OTHER. These are groups, not ISO codes, which is why nodes are
@@ -56,6 +57,11 @@ type Picked struct {
 	// ExitIP is empty when the node has no fresh measurement. Callers must
 	// treat it as "unknown", not as "a private IP": it is the value the
 	// quota and stickiness accounting needs to know about.
+	//
+	// 审计 O15 说它生产零读取 —— 对,而且报告自己也把「engine 用 ExitIPOf 重新
+	// 推导两次」判为**不是缺陷**(JS 同款,第 20 条)。这里保留:它是 Pick 那一刻
+	// 解析出的 IP,而重新推导发生在尝试**之后**,那时节点可能已被下一轮探针改判;
+	// 生产要的是后者,测试要观察的是前者。删掉字段只会把这条观察换成一次更弱的断言。
 	ExitIP string
 	// Order holds at most 8 rows and is the candidate snapshot, not the
 	// attempt list; the engine turns attempts into TryRow separately.

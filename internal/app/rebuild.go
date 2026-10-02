@@ -36,10 +36,9 @@ const (
 	// AbortSignal.timeout(180_000)。单源 20s × 两轮 × 12 个出口可以远超它,
 	// 所以必须有总闸:否则一次全网抖动会把重建拖成几分钟。
 	subFetchBudget = 180 * time.Second
-	// subExitClientTimeout 是经单个出口拉一次订阅的预算。JS 版把请求打到
-	// 本机端口,连接建立是零成本,所以用 20s;零端口架构下每个出口都要新建
-	// 拨号链,故取 15s(计划 24.2 :471-489 裁定)。
-	subExitClientTimeout = 15 * time.Second
+	// subExitClientTimeout 不再声明(审计 O6):一个从未被读的预算常量比一个
+	// 没接线的旋钮更糟 —— 单源超时实际由 sub.attemptTimeout(20s)与上面的
+	// subFetchBudget 总闸决定。
 	// subRetryDelay / subRetryLimit 照抄 src/index.js:461-469 的补偿重试。
 	subRetryDelay = 20 * time.Second
 	subRetryLimit = 2
@@ -59,11 +58,6 @@ const (
 	// catalogNodeTimeoutMS / catalogDirectTimeoutMS 照抄 src/index.js:280/291。
 	catalogNodeTimeoutMS   = 20000
 	catalogDirectTimeoutMS = 12000
-
-	// bootProbe* 照抄 src/index.js:658 的 Math.min(60000, 5000 + n*10)。
-	bootProbeBaseMS    = 5000
-	bootProbePerNodeMS = 10
-	bootProbeMaxMS     = 60000
 )
 
 // catalogBox 持有当前一代模型目录。engine 的 State 回调每轮路由读一次它,
@@ -85,15 +79,11 @@ func (b *catalogBox) set(list []catalog.Model) {
 	b.mu.Unlock()
 }
 
-// bootTimeoutMS 是「起得来」的等待上限,照抄 src/index.js:658:
-// Math.min(60000, 5000 + checkList.length * 10)。节点越多,内核装载越久。
-func bootTimeoutMS(n int) int {
-	ms := bootProbeBaseMS + n*bootProbePerNodeMS
-	if ms > bootProbeMaxMS {
-		ms = bootProbeMaxMS
-	}
-	return ms
-}
+// bootTimeoutMS 不移植(审计 O6):JS 开机等第一轮探测的预算
+// Math.min(60000, 5000 + n*10)(src/index.js:658)在 Go 侧没有对应等待 ——
+// 开机路径用的是 firstProbeDelay(3s)+ 周期循环,Load 失败路径用的是
+// bootJoinTimeout(5s,R12)。留一个算好却没人用的数字,只会让人以为开机有那条
+// 上限。
 
 // Rebuild 重拉订阅、热插出站、刷新目录。它不重启任何东西:sing-box 的
 // SyncOutbounds 本身就是热插,换出口不需要重启进程,在途连接因此不断。
