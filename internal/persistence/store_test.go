@@ -6,6 +6,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -25,6 +28,96 @@ func TestWriteJSONFileIsAtomicAndLeavesNoTemp(t *testing.T) {
 	}
 	if len(ents) != 1 {
 		t.Fatalf("dir has %d entries, want 1 (temp file leaked): %+v", len(ents), ents)
+	}
+}
+
+// TestWriteJSONFileConcurrentWritersAllSucceed 钉住 B5：临时文件名必须每次
+// 调用唯一。旧实现用固定的 `file + ".tmp"`，两个并发写者会互相踩：A 先 rename
+// 走了 tmp，B 再 rename 就报 ENOENT（Windows 上还可能是共享冲突），于是
+// data/stats.json 这类大文件被截断或清空，而调用方只看到一个写错误。
+//
+// 载荷故意做大（2000 个键），好让两个写者的 marshal+write 真正重叠；否则
+// 完全串行的调度也能让旧实现碰巧通过。
+func TestWriteJSONFileConcurrentWritersAllSucceed(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "big.json")
+
+	big := make(map[string]string, 2000)
+	for i := 0; i < 2000; i++ {
+		big[strconv.Itoa(i)] = strings.Repeat("x", 64)
+	}
+
+	const writers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, writers)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			errs[w] = WriteJSONFile(file, big, true)
+		}(w)
+	}
+	wg.Wait()
+
+	for w, err := range errs {
+		if err != nil {
+			t.Fatalf("写者 %d 失败：%v（并发写共用了同一个临时名）", w, err)
+		}
+	}
+
+	// 目标文件必须是某一次完整写入的内容，不能是被截断的半截 JSON。
+	var out map[string]string
+	if err := ReadJSONFile(file, &out); err != nil {
+		t.Fatalf("读回目标文件失败（说明它被写坏了）：%v", err)
+	}
+	if len(out) != 2000 {
+		t.Fatalf("目标文件有 %d 个键，期望 2000（内容不完整）", len(out))
+	}
+
+	// 临时文件不得残留。
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(ents) != 1 {
+		t.Fatalf("目录里有 %d 个条目，期望 1（临时文件泄漏）：%+v", len(ents), ents)
+	}
+}
+
+// TestStoreFlushIsSafeWhenCalledConcurrently 是 B5 的第二面：Flush 过去只拿
+// RLock，两个并发 Flush 会同时进入 WriteJSONFile 抢同一个临时名。改成写锁后
+// 两次 Flush 串行，都必须成功。
+func TestStoreFlushIsSafeWhenCalledConcurrently(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "settings.json")
+	seed := make(map[string]any, 500)
+	for i := 0; i < 500; i++ {
+		seed[strconv.Itoa(i)] = strings.Repeat("y", 64)
+	}
+	s := NewStore("settings", file, seed)
+
+	const flushers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, flushers)
+	for i := 0; i < flushers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.Flush()
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("第 %d 个 Flush 失败：%v", i, err)
+		}
+	}
+	var out map[string]any
+	if err := ReadJSONFile(file, &out); err != nil {
+		t.Fatalf("读回失败：%v", err)
+	}
+	if len(out) != 500 {
+		t.Fatalf("落盘 %d 个键，期望 500", len(out))
 	}
 }
 

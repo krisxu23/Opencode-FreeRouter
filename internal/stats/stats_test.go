@@ -5,6 +5,8 @@ package stats
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -198,8 +200,87 @@ func TestHistoryPadsMissingDaysAscending(t *testing.T) {
 	}
 }
 
+// TestRecordCoalescesWritesWithinTheDebounceWindow 钉住 O1：Record 不再每次
+// 请求都把整块板（实测 268,949 字节）重新序列化写一遍，而是照 JS 的
+// store.js:63-72 去抖：窗口内只更新内存，到期或 Flush 时合并成一次写。
+func TestRecordCoalescesWritesWithinTheDebounceWindow(t *testing.T) {
+	restore := flushDelay
+	flushDelay = time.Hour // 窗口内不可能到期 ⇒ 落盘只可能来自显式 Flush
+	defer func() { flushDelay = restore }()
+
+	file := filepath.Join(t.TempDir(), "stats.json")
+	s := New(file)
+	for i := 0; i < 100; i++ {
+		s.Record(Record{At: time.Now().UnixMilli(), Model: "m", OK: true, Output: 1})
+	}
+
+	if _, err := os.Stat(file); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("去抖窗口内不该落盘，Stat err = %v", err)
+	}
+
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	got := readFile(t, file)
+	if got["requests"] != float64(100) {
+		t.Fatalf("落盘 requests = %v, 期望 100（Flush 必须把窗口内的全部改动一次写下去）", got["requests"])
+	}
+}
+
+// TestRecordLandsOnDiskOnceTheDebounceWindowPasses 是上一条的另一半：没人调
+// Flush 时窗口一到必须自己落盘，否则进程被强杀会丢掉整段用量。
+func TestRecordLandsOnDiskOnceTheDebounceWindowPasses(t *testing.T) {
+	restore := flushDelay
+	flushDelay = 20 * time.Millisecond
+	defer func() { flushDelay = restore }()
+
+	file := filepath.Join(t.TempDir(), "stats.json")
+	s := New(file)
+	s.Record(Record{At: time.Now().UnixMilli(), Model: "m", OK: true, Output: 1})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(file); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("去抖窗口过去了文件仍不存在：Record 没有安排异步落盘")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := readFile(t, file)["requests"]; got != float64(1) {
+		t.Fatalf("落盘 requests = %v, 期望 1", got)
+	}
+}
+
+// TestFlushCancelsThePendingDebounce 防止 Flush 之后那个定时器再写一次：
+// 关停路径调 Flush，若定时器没被取消，进程退出瞬间还会有一个后台写。
+func TestFlushCancelsThePendingDebounce(t *testing.T) {
+	restore := flushDelay
+	flushDelay = 50 * time.Millisecond
+	defer func() { flushDelay = restore }()
+
+	file := filepath.Join(t.TempDir(), "stats.json")
+	s := New(file)
+	s.Record(Record{At: time.Now().UnixMilli(), Model: "m", OK: true, Output: 1})
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// 若 Flush 没有取消定时器，50ms 后它还会再写一次；此时把一个不可能的
+	// 路径塞回去也不该再产生任何写（lastErr 保持为空）。
+	time.Sleep(150 * time.Millisecond)
+	if got := s.LastError(); got != "" {
+		t.Fatalf("Flush 之后仍有后台写发生：LastError = %q", got)
+	}
+	if got := readFile(t, file)["requests"]; got != float64(1) {
+		t.Fatalf("落盘 requests = %v, 期望 1", got)
+	}
+}
+
 // TestRecordNeverPanicsOnAReadOnlyFile 钉住「stats 绝不能影响一次回答」：
-// 落盘失败只记进 lastErr，内存计数照常。
+// 落盘失败只记进 lastErr，内存计数照常。去抖之后写发生在窗口到期或 Flush，
+// 所以这里先确认内存已记上，再用 Flush 把失败逼出来。
 func TestRecordNeverPanicsOnAReadOnlyFile(t *testing.T) {
 	dir := t.TempDir()
 	blocker := filepath.Join(dir, "not-a-dir")
@@ -213,6 +294,9 @@ func TestRecordNeverPanicsOnAReadOnlyFile(t *testing.T) {
 
 	if got := s.Snapshot().Requests; got != 1 {
 		t.Fatalf("Requests = %d, 期望 1（内存里必须记上）", got)
+	}
+	if err := s.Flush(); err == nil {
+		t.Fatal("Flush 写不进去应返回 error")
 	}
 	if s.LastError() == "" {
 		t.Fatal("落盘失败应被记进 LastError，供 /api/status 诊断")

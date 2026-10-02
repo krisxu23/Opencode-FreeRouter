@@ -278,14 +278,36 @@ func readLines(file string) []string {
 
 // writeFileText 用临时文件 + rename 原子替换文本文件(jsonl 无法走
 // persistence.WriteJSONFile 的 JSON 通道,但原子性纪律一致)。
+//
+// 临时名必须唯一(B5):固定用 file+".tmp" 时两个并发写者会抢同一个路径,
+// 先 rename 走的人把后来者的目标抽走,后者 rename 报 ENOENT 或 Windows
+// 共享冲突。os.CreateTemp 的随机后缀 + O_EXCL 从根上排除了撞名。
 func writeFileText(file, content string) error {
 	dir := filepath.Dir(file)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := file + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+	f, err := os.CreateTemp(dir, filepath.Base(file)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, file)
+	tmp := f.Name()
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, file); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }

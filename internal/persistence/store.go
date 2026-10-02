@@ -9,11 +9,40 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
 )
+
+// pathLockShards is the number of mutexes guarding atomic replacement, hashed
+// by target path. A shard array rather than a map keeps memory bounded no
+// matter how many paths a caller invents, at the cost of occasional false
+// sharing between two unrelated files — which is harmless here, since every
+// write in this program is a handful of kilobytes to a few hundred kilobytes
+// and the alternative is unbounded map growth.
+const pathLockShards = 64
+
+var pathLocks [pathLockShards]sync.Mutex
+
+// lockPath serializes writers that target the same file and returns the
+// unlock function.
+//
+// Unique temp names are not sufficient on their own (B5). Even with a private
+// temp file, two goroutines calling rename onto the same destination race:
+// on Windows the second MoveFileEx can fail with "Access is denied" while the
+// first is still swapping the destination, and on any platform the loser can
+// observe a partially visible replacement. Since the whole point of
+// WriteJSONFile is "readers never see a half-written file", the replacement
+// itself has to be exclusive per target.
+func lockPath(file string) func() {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(filepath.Clean(file)))
+	m := &pathLocks[h.Sum32()%pathLockShards]
+	m.Lock()
+	return m.Unlock
+}
 
 // WriteJSONFile writes v to file atomically: a temp file in the same directory
 // followed by a rename.
@@ -22,6 +51,17 @@ import (
 // health, stats) reads the file back immediately afterwards, and sing-box
 // config is validated on disk before anything starts; a silent failure would
 // leave the program running on the previous contents and reporting success.
+//
+// The temp name must be unique per call (B5). The JS version used
+// `${file}.${process.pid}.tmp` (src/persistence.js:82-93), which is unique
+// across processes but *not* within one — and the Go side has many more
+// concurrent writers in a single process than the JS side ever did, because
+// stats.Record writes synchronously from every request goroutine. With a fixed
+// `file + ".tmp"`, two writers race on the same temp path: one renames it away,
+// the other's rename then fails with ENOENT, or on Windows with a sharing
+// violation, and the target file is left truncated or empty. os.CreateTemp
+// appends a random suffix and opens with O_EXCL, so two calls can never pick
+// the same name.
 func WriteJSONFile(file string, v any, indent bool) error {
 	dir := filepath.Dir(file)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -37,9 +77,33 @@ func WriteJSONFile(file string, v any, indent bool) error {
 	if err != nil {
 		return fmt.Errorf("persistence: 序列化 %s: %w", file, err)
 	}
-	tmp := file + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+
+	// 同一目标路径的替换必须互斥：临时名唯一只解决了「撞同一个 tmp」，
+	// 两个 goroutine 同时 rename 到同一目标在 Windows 上仍会 "Access is
+	// denied"（B5 实测）。
+	unlock := lockPath(file)
+	defer unlock()
+
+	// 临时文件必须与目标同目录：跨卷的 rename 不是原子替换。
+	// 模式串里的 `*` 会被 CreateTemp 换成随机串。
+	f, err := os.CreateTemp(dir, filepath.Base(file)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("persistence: 建临时文件 %s: %w", file, err)
+	}
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("persistence: 写临时文件 %s: %w", tmp, err)
+	}
+	// 先 Close 再 Rename：Windows 不允许改名一个仍被打开的句柄。
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("persistence: 关临时文件 %s: %w", tmp, err)
+	}
+	if err := os.Chmod(tmp, 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("persistence: 设权限 %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, file); err != nil {
 		_ = os.Remove(tmp)
@@ -125,9 +189,14 @@ func (s *Store) Update(patch map[string]any) any {
 }
 
 // Flush writes the value to disk with 2-space indentation.
+//
+// The lock is exclusive, not shared (B5): Flush writes the value it reads, and
+// with only RLock two concurrent Flush calls could interleave with an Update
+// and serialize a half-updated map. The panel's PUT /api/settings and the
+// shutdown path can both land here, so serializing is the only correct choice.
 func (s *Store) Flush() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := WriteJSONFile(s.file, s.value, true); err != nil {
 		return fmt.Errorf("store %s: %w", s.name, err)
 	}

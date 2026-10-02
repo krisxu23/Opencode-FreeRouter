@@ -39,6 +39,13 @@ const (
 // unreachable from a unit test.
 var sampleMax = defaultSampleMax
 
+// flushDelay is how long Record waits before landing a write, coalescing every
+// turn inside the window into one pass (O1). 300ms is not invented here: the
+// JS side gives every JsonStore the same debounce (src/store.js:63-72), so a
+// burst of requests produces one file write there too. It is a var only so a
+// test can stretch or shrink the window.
+var flushDelay = 300 * time.Millisecond
+
 // Record is one finished turn, in the shape the engine can hand over without
 // knowing anything about this package.
 type Record struct {
@@ -97,6 +104,10 @@ type Stats struct {
 	file    string
 	snap    Snapshot
 	lastErr error
+	// timer 是去抖写(O1)的挂起定时器。nil 表示当前没有待写的改动。
+	// dirty 表示内存比磁盘新,到期或 Flush 时才需要真正写一次。
+	timer *time.Timer
+	dirty bool
 }
 
 // New returns an empty board writing to file.
@@ -167,17 +178,20 @@ func normalize(snap Snapshot) Snapshot {
 	return snap
 }
 
-// Record folds one finished turn into the board and lands it on disk.
+// Record folds one finished turn into the board. The write is debounced.
 //
 // It never panics and never returns an error: src/index.js:172 and :202 both
 // wrap the whole accounting in try/catch for one reason — a failed write must
 // not turn an answer that already succeeded into a 500. Failures are kept in
 // LastError instead, where /api/status can surface them.
 //
-// The in-memory update happens under the lock; the atomic write happens
-// outside it. An atomic write on Windows costs tens of milliseconds, and
-// holding the lock across it would make every request's accounting a global
-// serialization point.
+// The in-memory update happens under the lock and the write is scheduled, not
+// performed (O1). The JS version debounces every store write by 300ms
+// (src/store.js:63-72) and only calls statsStore.edit() per turn
+// (src/index.js:179-202); the Go port had dropped the debounce, so every
+// single request cloned the whole board and rewrote all 268,949 bytes of
+// data/stats.json. Coalescing restores the JS behaviour and removes the
+// window in which two request goroutines race on the same temp file (B5).
 func (s *Stats) Record(r Record) {
 	if r.At == 0 {
 		// JS: `record.at ?? Date.now()`.
@@ -218,7 +232,8 @@ func (s *Stats) Record(r Record) {
 	// fast request from three days ago hold a slot forever and drag the TTFT
 	// distribution up; keeping only a time window would let a burst grow the
 	// file without bound. Note the cutoff uses the wall clock rather than the
-	// record's own At, exactly like the JS version.
+	// record's own At, exactly like the JS version. Trimming stays inside the
+	// lock so Snapshot never observes an over-cap board.
 	if len(s.snap.Samples) > sampleMax {
 		cutoff := time.Now().UnixMilli() - sampleWindowMS
 		kept := make([]Sample, 0, len(s.snap.Samples))
@@ -233,6 +248,23 @@ func (s *Stats) Record(r Record) {
 		s.snap.Samples = kept
 	}
 
+	s.dirty = true
+	if s.file != "" && s.timer == nil {
+		s.timer = time.AfterFunc(flushDelay, s.flushPending)
+	}
+	s.mu.Unlock()
+}
+
+// flushPending is the debounce timer's callback: it lands whatever Record has
+// accumulated since the window opened.
+func (s *Stats) flushPending() {
+	s.mu.Lock()
+	s.timer = nil
+	if !s.dirty || s.file == "" {
+		s.mu.Unlock()
+		return
+	}
+	s.dirty = false
 	snap := clone(s.snap)
 	s.mu.Unlock()
 
@@ -306,9 +338,16 @@ func (s *Stats) History(days int, now int64) []HistoryRow {
 // Flush lands the current board on disk and reports the error.
 //
 // Record swallows write failures by design; this is the path the shutdown
-// sequence and the tests use when the caller does want to know.
+// sequence and the tests use when the caller does want to know. Any pending
+// debounce is cancelled first: otherwise a timer armed before shutdown would
+// fire after the process had already decided it was done writing.
 func (s *Stats) Flush() error {
 	s.mu.Lock()
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
+	s.dirty = false
 	snap := clone(s.snap)
 	s.mu.Unlock()
 
