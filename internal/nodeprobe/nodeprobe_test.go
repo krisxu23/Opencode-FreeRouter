@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -355,6 +356,44 @@ func TestIncompleteIsNotDead(t *testing.T) {
 	if r.Result.LatencyMS != -1 {
 		t.Errorf("LatencyMS = %d, want -1", r.Result.LatencyMS)
 	}
+}
+
+// TestOversizedGateBodyIsRejected 是 R3 的闸门半边:闸门/echo 都是我们不控制
+// 的第三方主机。无上限的 io.ReadAll 意味着一个坏掉的(或被接管的)闸门能把
+// 探测进程拖进 OOM —— 而探测是并发 48 路的,一份超大体被读 48 次。
+//
+// 这里直接调 gateVerdict:它就是要钉住的那个判据函数,走 ProbeNode 还要等
+// 两次 stage-1 预算,慢且绕。
+func TestOversizedGateBodyIsRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.CopyN(w, zeroReader{}, maxGateBodyBytes+1)
+	}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	err = gateVerdict(resp)
+	if err == nil {
+		t.Fatal("超大体必须判闸门失败,不能默默吃下整份响应")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("错误文案要能归因到上限: %v", err)
+	}
+}
+
+// zeroReader 产出无限个 'a'。生成器而非 strings.Repeat:测试自己先分配一份
+// 8MB 字符串的话,测的就不是被测代码的内存行为了。
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
 }
 
 // TestAbortStopsTheZombie（Go 特有）：兜底到点后，该 worker 的派生 ctx 必须在

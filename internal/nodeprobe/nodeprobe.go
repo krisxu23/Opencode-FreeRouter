@@ -99,6 +99,14 @@ const (
 	defaultAttempts  = 2
 	echoBudgetMS     = 8000
 	backstopSlackMS  = 5000
+
+	// maxGateBodyBytes / maxEchoBodyBytes 是两处响应体的上限(R3)。
+	//
+	// 探测目标是**我们不控制的**远端:一个恶意或被劫持的目标可以无限发流,
+	// 而 io.ReadAll 会把它整条读进内存。闸门要的是模型清单(实测几百 KB),
+	// echo 要的是 IP+国家(几百字节),给足余量再封顶。
+	maxGateBodyBytes = 8 << 20
+	maxEchoBodyBytes = 1 << 20
 )
 
 // ProbeOptions 是单个探测项的预算。字段只有 probeNode 实际需要的两个
@@ -276,9 +284,11 @@ func gateVerdict(resp *http.Response) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("gate HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpclient.ReadCapped(resp.Body, maxGateBodyBytes)
 	if err != nil {
-		return fmt.Errorf("gate response body unreadable")
+		// 包装而不是吞掉:调用方要能区分「闸门断流」与「闸门吐了个超大体」,
+		// 后者说明这个闸门在被滥用(R3)。
+		return fmt.Errorf("gate response body unreadable: %w", err)
 	}
 	var parsed any
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -403,7 +413,7 @@ func (p *Prober) ProbeNode(ctx context.Context, dial httpclient.Dialer, timeoutM
 	var echo exitInfo
 	if len(p.echo) > 0 {
 		echoJudge := func(resp *http.Response, _ string) (any, error) {
-			body, err := io.ReadAll(resp.Body)
+			body, err := httpclient.ReadCapped(resp.Body, maxEchoBodyBytes)
 			if err != nil {
 				return nil, fmt.Errorf("echo body unreadable: %w", err)
 			}

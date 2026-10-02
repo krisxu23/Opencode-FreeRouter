@@ -206,3 +206,80 @@ func TestTTFTFreezesOnFirstContentNotFirstChunk(t *testing.T) {
 		t.Fatalf("TTFT = %d, want ~2000 (measured from the request start)", acc.TTFTMS)
 	}
 }
+
+// TestEventDataIsBounded 是 R11 的钉子。sc.Buffer 的 8MB 是**每行**上限,
+// 而 flush 只在空行/EOF 触发 —— 对端只要一直发 `data:` 行、从不发空行,
+// 这个切片就无界增长,而内存记在网关头上。
+//
+// 用 io.Pipe 逐行喂,保证是"很多行、没有空行"的形状;上限之内的正常事件
+// 必须照常回调,所以同一个测试先钉合法面再钉越界面。
+func TestEventDataIsBounded(t *testing.T) {
+	// 先确认上限之内正常:8MB 以内的一条多行事件必须回调。
+	small := strings.Repeat("data: x\n", 3) + "\n"
+	var got []Event
+	if err := ReadSSE(strings.NewReader(small), func(ev Event) error {
+		got = append(got, ev)
+		return nil
+	}); err != nil {
+		t.Fatalf("上限之内的事件不该失败: %v", err)
+	}
+	if len(got) != 1 || got[0].Data != "x\nx\nx" {
+		t.Fatalf("events = %+v, want one three-line event", got)
+	}
+
+	// 再确认越界会失败。用生成器而不是构造一份 8MB 字符串:测试自己先分配
+	// 的话,测的就不是被测代码的内存了。
+	pr, pw := io.Pipe()
+	go func() {
+		defer func() { _ = pw.Close() }()
+		line := []byte("data: " + strings.Repeat("a", 64*1024) + "\n")
+		for sent := 0; sent <= maxEventBytes; sent += len(line) {
+			if _, err := pw.Write(line); err != nil {
+				return // 读侧已返回,pipe 关闭
+			}
+		}
+	}()
+	err := ReadSSE(pr, func(Event) error { return nil })
+	if !errors.Is(err, ErrEventTooLarge) {
+		t.Fatalf("err = %v, want ErrEventTooLarge", err)
+	}
+}
+
+// TestEventCapDoesNotRejectAnEventExactlyAtTheLimit 是 R11 的差一字节钉子。
+// 多行事件在 Join 时会插入换行,只有非首行才该计入;否则一个正好等于上限的
+// 事件会被多算字节而误拒。
+//
+// 事件由 8 行拼成(首行少 7 字节),拼出的 data 长度恰好等于 maxEventBytes:
+// 8×1MB − 7 + 7 个换行 = 8MB。单行做不到这一点 —— bufio.Scanner 的每行上限
+// 也是 8MB,而 "data: " 前缀会让单行先撞上 Scanner 的 ErrTooLong。
+func TestEventCapDoesNotRejectAnEventExactlyAtTheLimit(t *testing.T) {
+	const lineSize = 1 << 20
+	firstSize := lineSize - 7
+	parts := make([]io.Reader, 0, 8)
+	parts = append(parts, strings.NewReader("data: "), io.LimitReader(byteFiller{}, int64(firstSize)), strings.NewReader("\n"))
+	for i := 0; i < 7; i++ {
+		parts = append(parts, strings.NewReader("data: "), io.LimitReader(byteFiller{}, lineSize), strings.NewReader("\n"))
+	}
+	parts = append(parts, strings.NewReader("\n"))
+
+	var got int
+	if err := ReadSSE(io.MultiReader(parts...), func(ev Event) error {
+		got = len(ev.Data)
+		return nil
+	}); err != nil {
+		t.Fatalf("恰好等于上限的事件必须通过: %v", err)
+	}
+	if got != maxEventBytes {
+		t.Fatalf("data = %d 字节, want %d", got, maxEventBytes)
+	}
+}
+
+// byteFiller 产出无限个 'a'。
+type byteFiller struct{}
+
+func (byteFiller) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}

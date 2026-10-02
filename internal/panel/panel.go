@@ -28,10 +28,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"freerouter/internal/logger"
 	"freerouter/internal/tracelog"
@@ -43,6 +45,29 @@ import (
 // the one inside `window.__BOOT__`, producing `window.{...} = __BOOT__` and a
 // SyntaxError on the first frame.
 const bootMarker = "/*__BOOT_JSON__*/null"
+
+// R1:面板同样要收紧头阶段与空闲超时(Go 的 http.Server 零值等于无限)。
+//
+// 不设 WriteTimeout:POST /api/probe 会阻塞一整轮探测(几百个节点、几十秒),
+// 整请求死线会把一个正在干活的按钮变成 500。ReadHeaderTimeout 堵 slowloris
+// 的「连上不发头」,IdleTimeout 堵 keep-alive 上挂死的连接。
+const (
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 60 * time.Second
+)
+
+// panelLoopbackHosts 是面板认的 Host 主机名白名单(R2)。
+//
+// 面板绑在 127.0.0.1 上不等于「只有本机能访问」:DNS-rebinding 让一个恶意
+// 页面把 http://evil.example 解析到 127.0.0.1,浏览器照发请求,Host 是
+// evil.example —— 于是恶意页面能读 GET /api/status(status.go 里回显转发
+// 密钥)、能 PUT /api/settings、能 POST /api/probe。绑定地址挡不住这一层,
+// 只有校验 Host 能。
+var panelLoopbackHosts = map[string]bool{
+	"127.0.0.1": true,
+	"localhost": true,
+	"::1":       true,
+}
 
 // maxBodyBytes mirrors the 1<<20 ceiling in src/panel.js's readJson.
 const maxBodyBytes = 1 << 20
@@ -154,7 +179,11 @@ func New(deps PanelDeps) *Server {
 			s.bootErr = fmt.Errorf("panel: web/index.html 里 %s 出现 %d 次，必须恰好 1 次", bootMarker, n)
 		}
 	}
-	s.srv = &http.Server{Handler: http.HandlerFunc(s.route)}
+	s.srv = &http.Server{
+		Handler:           http.HandlerFunc(s.route),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 	return s
 }
 
@@ -217,7 +246,82 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": msg})
 		}
 	}()
+	if !s.localRequest(w, r) {
+		return
+	}
 	s.dispatch(w, r)
+}
+
+// localRequest 是 R2 的 DNS-rebinding 闸门:请求必须真的发给本机控制台。
+//
+// 它**不是鉴权** —— 面板仍然没有密钥、仍然把每个内部错误答成 500。这一层
+// 判的是「这个请求是不是浏览器里那个恶意页面代发的」:rebinding 攻击下
+// Host/Origin 会是攻击者的域名而不是 127.0.0.1,所以按主机名白名单拒绝即可。
+// 因此 403 在这里是诚实的(它说的是「这不是发给控制台的请求」),而
+// TestNoStateCanDistinguishAuthorizedFromNot 要防的「用状态码推断内部状态」
+// 依旧成立:那个 403 与面板内部状态无关,且在任何 Host 合法的请求上都不会出现。
+//
+// 只认主机名、不比对端口:面板端口可配置,而攻击者伪造 Host 时同样可以写上
+// 正确端口;真正拦住 rebinding 的是「主机名必须是回环名」这一条。
+func (s *Server) localRequest(w http.ResponseWriter, r *http.Request) bool {
+	if !panelLoopbackHosts[hostOnly(r.Host)] {
+		s.logf("panel: 拒绝非本机 Host 的请求: %q", r.Host)
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "panel: host is not the local console"})
+		return false
+	}
+	// 浏览器对跨源的非简单请求才会带上 Origin;同源 PUT 也会带(值同源)。
+	// 因此「有 Origin 就必须是回环」,没有 Origin 说明不是浏览器发的 ——
+	// curl/托盘/测试都走这条路,不能拒。
+	if isWriteMethod(r.Method) {
+		if origin := r.Header.Get("Origin"); origin != "" && !loopbackURLHost(origin) {
+			s.logf("panel: 拒绝非本机 Origin 的写请求: %q", origin)
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "panel: origin is not the local console"})
+			return false
+		}
+		if ref := r.Header.Get("Referer"); ref != "" && !loopbackURLHost(ref) {
+			s.logf("panel: 拒绝非本机 Referer 的写请求: %q", ref)
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "panel: referer is not the local console"})
+			return false
+		}
+	}
+	return true
+}
+
+// hostOnly 去掉 Host 里的端口,IPv6 的方括号也一并去干净,并折叠大小写
+// (主机名大小写不敏感,"LOCALHOST" 与 "localhost" 是同一台机器):
+// "127.0.0.1:3458" -> "127.0.0.1"、"[::1]:3458" -> "::1"。
+func hostOnly(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return strings.ToLower(strings.Trim(h, "[]"))
+	}
+	return strings.ToLower(strings.Trim(host, "[]"))
+}
+
+// isWriteMethod 列出会改状态的方法。GET/HEAD/OPTIONS 不查 Origin:
+// 它们本就是只读的,而浏览器同源的普通导航请求不带 Origin。
+func isWriteMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// loopbackURLHost 判一个 Origin/Referer 值的主机是不是回环。
+// Origin 只有 scheme://host[:port] 三段,Referer 是完整 URL;同一个解析
+// 都能吃下。解析失败一律按「不是回环」处理。
+func loopbackURLHost(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return false
+	}
+	return panelLoopbackHosts[strings.ToLower(u.Hostname())]
 }
 
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {

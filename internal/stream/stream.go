@@ -12,10 +12,26 @@ package stream
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"time"
 )
+
+// maxEventBytes caps one event's accumulated data (R11).
+//
+// sc.Buffer's 8MB is a **per-line** cap. SSE lets an event carry any number of
+// `data:` lines, and flush() only runs on a blank line or EOF — so an upstream
+// that streams `data:` lines forever without ever emitting a blank line grows
+// this slice without bound, and the gateway is the one holding the memory.
+// The cap matches the per-line cap: an event that needs more than 8MB of data
+// is not a chat frame.
+const maxEventBytes = 8 << 20
+
+// ErrEventTooLarge is returned when one event's data exceeds maxEventBytes.
+// Truncating instead would hand the caller a half-parsed JSON frame, which is
+// worse than failing the turn.
+var ErrEventTooLarge = errors.New("stream: SSE event data exceeds the cap")
 
 // Event is one SSE event. Data keeps the raw text, including the newlines of a
 // multi-line data block.
@@ -32,6 +48,9 @@ func ReadSSE(r io.Reader, fn func(Event) error) error {
 	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	var cur Event
 	var data []string
+	// size 是 data 里已累积的字节数(含 Join 会插入的换行)。data 切片会被
+	// flush 复用(len 归零但容量还在),所以字节数必须单独记,不能靠 len(data)。
+	size := 0
 	flush := func() error {
 		if len(data) == 0 {
 			cur = Event{}
@@ -39,6 +58,7 @@ func ReadSSE(r io.Reader, fn func(Event) error) error {
 		}
 		cur.Data = strings.Join(data, "\n")
 		data = data[:0]
+		size = 0
 		err := fn(cur)
 		cur = Event{}
 		return err
@@ -63,6 +83,15 @@ func ReadSSE(r io.Reader, fn func(Event) error) error {
 		case "event":
 			cur.Event = value
 		case "data":
+			// 每行之间 strings.Join 会插一个换行,只有非首行才计入,否则
+			// 单行事件会被多算一个字节、在正好等于上限时被误拒。
+			if len(data) > 0 {
+				size++
+			}
+			size += len(value)
+			if size > maxEventBytes {
+				return ErrEventTooLarge
+			}
 			data = append(data, value)
 		}
 	}

@@ -98,6 +98,20 @@ func startPanel(t *testing.T, deps PanelDeps) string {
 
 func do(t *testing.T, method, url, body string) (int, http.Header, string) {
 	t.Helper()
+	return doWithHeaders(t, method, url, body, nil)
+}
+
+// doWithHeaders 是 do 的带自定义请求头版本。R2 的测试必须能伪造 Host/Origin,
+// 所以请求头要能从外面塞进来;不塞时行为与 do 完全一致。
+func doWithHeaders(t *testing.T, method, url, body string, hdr map[string]string) (int, http.Header, string) {
+	t.Helper()
+	return doAs(t, method, url, body, "", hdr)
+}
+
+// doAs 允许连 Host 一起伪造。Go 的 Host 不是普通请求头:http.Header.Set("Host",…)
+// 会被忽略,必须写 req.Host 字段 —— 这正是 DNS-rebinding 请求的形状。
+func doAs(t *testing.T, method, url, body, host string, hdr map[string]string) (int, http.Header, string) {
+	t.Helper()
 	var rdr *strings.Reader
 	if body != "" {
 		rdr = strings.NewReader(body)
@@ -107,6 +121,12 @@ func do(t *testing.T, method, url, body string) (int, http.Header, string) {
 	req, err := http.NewRequest(method, url, rdr)
 	if err != nil {
 		t.Fatalf("new request %s %s: %v", method, url, err)
+	}
+	if host != "" {
+		req.Host = host
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
 	}
 	resp, err := testClient.Do(req)
 	if err != nil {
@@ -588,5 +608,99 @@ func TestShellKeepsTrailingNewline(t *testing.T) {
 	}
 	if !strings.HasSuffix(string(raw), "</html>\n") {
 		t.Fatalf("shell 必须以 </html>\n 收尾, got %q", string(raw[len(raw)-12:]))
+	}
+}
+
+// TestPanelTimeoutsAreBounded 是 R1 的面板半边。与 forward 不同,面板没有 SSE,
+// 但 POST /api/probe 会阻塞一整轮探测,所以 WriteTimeout 同样必须留 0。
+func TestPanelTimeoutsAreBounded(t *testing.T) {
+	dir := writeAssets(t, goodShell, "console.log('app')\n")
+	s := New(baseDeps(dir))
+	if s.srv.ReadHeaderTimeout != readHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %v, want %v", s.srv.ReadHeaderTimeout, readHeaderTimeout)
+	}
+	if s.srv.IdleTimeout != idleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", s.srv.IdleTimeout, idleTimeout)
+	}
+	if s.srv.ReadHeaderTimeout <= 0 || s.srv.IdleTimeout <= 0 {
+		t.Fatal("两个超时都必须为正:零值就是无限")
+	}
+	if s.srv.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %v,必须为 0 —— /api/probe 会阻塞几十秒",
+			s.srv.WriteTimeout)
+	}
+}
+
+// TestForeignHostIsRejected 是 R2 的核心钉子:DNS-rebinding 下浏览器会把
+// http://evil.example 解析到 127.0.0.1 并发请求,Host 是攻击者的域名。
+// 绑定地址挡不住这一层,只有校验 Host 能 —— 而 /api/status 里回显着转发密钥。
+func TestForeignHostIsRejected(t *testing.T) {
+	dir := writeAssets(t, goodShell, "console.log('app')\n")
+	deps := baseDeps(dir)
+	deps.GetSettings = func() any {
+		return map[string]any{"forwardKey": "super-secret-key"}
+	}
+	base := startPanel(t, deps)
+
+	for _, host := range []string{"evil.example", "evil.example:3458", "127.0.0.1.evil.example", "attacker.test"} {
+		status, _, body := doAs(t, http.MethodGet, base+"/api/status", "", host, nil)
+		if status != http.StatusForbidden {
+			t.Errorf("Host=%q GET /api/status = %d %s, want 403", host, status, body)
+		}
+		if strings.Contains(body, "super-secret-key") {
+			t.Fatalf("Host=%q 的响应泄露了 forwardKey", host)
+		}
+	}
+	// 写方法同样要挡:一个恶意页面能 PUT /api/settings 就能把网关锁死。
+	for _, host := range []string{"evil.example", "attacker.test:80"} {
+		status, _, _ := doAs(t, http.MethodPut, base+"/api/settings", `{"probeEnabled":false}`, host, nil)
+		if status != http.StatusForbidden {
+			t.Errorf("Host=%q PUT /api/settings = %d, want 403", host, status)
+		}
+	}
+	// 回环名必须照常放行 —— 这一层拦的是外部主机名,不是请求头本身。
+	for _, host := range []string{"127.0.0.1", "127.0.0.1:3458", "localhost", "localhost:3458"} {
+		status, _, body := doAs(t, http.MethodGet, base+"/api/settings", "", host, nil)
+		if status != http.StatusOK {
+			t.Errorf("Host=%q GET /api/settings = %d %s, want 200", host, status, body)
+		}
+	}
+}
+
+// TestForeignOriginIsRejectedOnWrites:Origin 只在浏览器发跨源/写请求时出现,
+// 所以「有 Origin 就必须是回环」不会误伤 curl/托盘/测试(它们根本不发 Origin)。
+func TestForeignOriginIsRejectedOnWrites(t *testing.T) {
+	dir := writeAssets(t, goodShell, "console.log('app')\n")
+	base := startPanel(t, baseDeps(dir))
+
+	for _, origin := range []string{"http://evil.example", "https://evil.example:443", "http://127.0.0.1.evil.example"} {
+		status, _, _ := doWithHeaders(t, http.MethodPut, base+"/api/settings",
+			`{"probeEnabled":false}`, map[string]string{"Origin": origin})
+		if status != http.StatusForbidden {
+			t.Errorf("Origin=%q PUT = %d, want 403", origin, status)
+		}
+		status, _, _ = doWithHeaders(t, http.MethodPost, base+"/api/probe", "",
+			map[string]string{"Origin": origin})
+		if status != http.StatusForbidden {
+			t.Errorf("Origin=%q POST /api/probe = %d, want 403", origin, status)
+		}
+	}
+	// 伪造 Referer 同样要挡:某些浏览器在非简单请求上只给 Referer。
+	status, _, _ := doWithHeaders(t, http.MethodPut, base+"/api/settings",
+		`{"probeEnabled":false}`, map[string]string{"Referer": "http://evil.example/x.html"})
+	if status != http.StatusForbidden {
+		t.Errorf("恶意 Referer PUT = %d, want 403", status)
+	}
+	// 同源 Origin 必须放行,否则面板自己就点不动了。
+	status, _, body := doWithHeaders(t, http.MethodPut, base+"/api/settings",
+		`{"probeEnabled":false}`, map[string]string{"Origin": base})
+	if status != http.StatusOK {
+		t.Errorf("同源 Origin PUT = %d %s, want 200", status, body)
+	}
+	// 只读请求不查 Origin:浏览器同源导航不发 Origin,拦它没有意义。
+	status, _, _ = doWithHeaders(t, http.MethodGet, base+"/api/settings", "",
+		map[string]string{"Origin": "http://evil.example"})
+	if status != http.StatusOK {
+		t.Errorf("GET 带恶意 Origin = %d, want 200(只读请求不设 Origin 闸门)", status)
 	}
 }

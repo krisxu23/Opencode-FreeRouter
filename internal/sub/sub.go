@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/http"
 	"regexp"
@@ -83,6 +82,10 @@ const (
 	subUserAgent = "clash.meta/1.18.1"
 	acceptHeader = "application/json, text/yaml, text/plain, */*"
 )
+
+// maxSubBodyBytes caps one subscription response (R3). 实测 data/subs_cache.json
+// 是 432KB 量级,所以 32MB 对真实源宽松得离谱,但对一个无限发流的源是硬墙。
+const maxSubBodyBytes = 32 << 20
 
 // Fetch 拉取全部订阅源并合并（不再"首个成功即用"），按配置指纹去重。
 //
@@ -228,7 +231,7 @@ func fetchOne(ctx context.Context, c *http.Client, url string, extra map[string]
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := httpclient.ReadCapped(resp.Body, maxSubBodyBytes)
 	if err != nil {
 		return nil, err
 	}

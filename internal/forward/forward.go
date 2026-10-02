@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	frerrors "freerouter/internal/errors"
 	"freerouter/internal/check"
@@ -98,10 +99,28 @@ type Server struct {
 	http *http.Server
 }
 
+// serverReadHeaderTimeout / serverIdleTimeout 是两个服务器共用的收紧值(R1)。
+//
+// 只收紧这两项,不碰 ReadTimeout/WriteTimeout:转发端口要吐 SSE,一个正常
+// 回复可以吐几十秒,整请求死线会把它腰斩(那正是 httpclient.NewStreamClient
+// 存在的理由)。剩下的两个洞正好是 slowloris 的形状 —— 连上来不发头、或者
+// 发完一个请求就挂着不关 —— 这两项各堵一个。
+//
+// 与 JS 同源(forward.js:100 同样没设),但 JS 那边是 Node 默认值,Go 这边是
+// 零值即无限;修起来零成本,所以修。
+const (
+	serverReadHeaderTimeout = 10 * time.Second
+	serverIdleTimeout       = 60 * time.Second
+)
+
 // New 组装一个转发服务,此时还没有监听任何端口。
 func New(cfg Config) *Server {
 	s := &Server{cfg: cfg}
-	s.http = &http.Server{Handler: http.HandlerFunc(s.handle)}
+	s.http = &http.Server{
+		Handler:           http.HandlerFunc(s.handle),
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
 	return s
 }
 

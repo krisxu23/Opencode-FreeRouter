@@ -3,6 +3,7 @@ package sub
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -155,6 +156,40 @@ func TestSaveCacheIsHumanReadable(t *testing.T) {
 // (difftest)从包外喂进来的必须是与 fetchOne 同一条生产链——含
 // dropUnroutable——而不是各格式解析器的裸输出。用一条 Clash YAML 带
 // 127.0.0.1 假节点验证过滤确实在链上(src/sub.js parseSubscriptionBody 同款)。
+// TestOversizedSubscriptionBodyIsRejected 是 R3 的钉子:订阅源由用户填,它
+// 可以是任何一个被攻陷或坏掉的服务器。没有上限的 io.ReadAll 会把整个响应体
+// 拉进内存 —— 一个恶意源就能把网关 OOM 掉。
+//
+// 断言的是"报错"而不是"截断":半份订阅文本会被解析成"格式不受支持",
+// 把故障指向错误的方向。
+func TestOversizedSubscriptionBodyIsRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/plain")
+		// 上限 +1 字节:恰好等于上限是合法的,多一字节不是。
+		_, _ = io.CopyN(w, zeroReader{}, maxSubBodyBytes+1)
+	}))
+	defer srv.Close()
+
+	_, err := Fetch(context.Background(), []string{srv.URL}, nil)
+	if err == nil {
+		t.Fatal("超过上限的订阅体必须失败,不能默默吃下整份响应")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("错误文案要能归因到上限: %v", err)
+	}
+}
+
+// zeroReader 产出无限个 'a'。用生成器而不是 strings.Repeat,避免测试自己先
+// 分配一份 32MB 的字符串 —— 那样测的就不是被测代码的内存了。
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'a'
+	}
+	return len(p), nil
+}
+
 func TestParseSubscriptionBodyExportedMatchesPipeline(t *testing.T) {
 	yamlText := `proxies:
   - name: real

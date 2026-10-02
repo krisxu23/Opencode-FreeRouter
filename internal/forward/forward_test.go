@@ -872,6 +872,8 @@ func TestResponsesEndpointErrorIs502(t *testing.T) {
 	}
 }
 
+// TestNotWiredCompleteIs500NotPanic:Config 只给了 ForwardKey 时,handler 必须
+// 答 500 而不是 nil 解引用崩掉整个进程。这是"没接线"与"接线了但坏了"的分界。
 func TestNotWiredCompleteIs500NotPanic(t *testing.T) {
 	srv := New(Config{ForwardKey: func() string { return testKey }})
 	ts := httptest.NewServer(srv.Handler())
@@ -884,5 +886,28 @@ func TestNotWiredCompleteIs500NotPanic(t *testing.T) {
 	}
 	if !strings.Contains(body, "Complete is not wired") {
 		t.Fatalf("未接线的 Complete 必须给出可归因的错误: %s", body)
+	}
+}
+
+// TestServerTimeoutsAreBounded 是 R1 的钉子:Go 的 http.Server 零值等于无限,
+// 一个连上不发头的 slowloris 连接会一直占着 goroutine 和 fd。
+//
+// 同时钉住 ReadTimeout/WriteTimeout **必须保持 0**:转发端口吐 SSE,一个正常
+// 回复可以吐几十秒,整请求死线会把它腰斩 —— 那不是疏忽,是刻意的(空闲截止
+// 由 httpclient.NewStreamClient 在响应体上实现)。谁把这两项设上,这个测试红。
+func TestServerTimeoutsAreBounded(t *testing.T) {
+	srv := New(Config{})
+	if srv.http.ReadHeaderTimeout != serverReadHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %v, want %v", srv.http.ReadHeaderTimeout, serverReadHeaderTimeout)
+	}
+	if srv.http.IdleTimeout != serverIdleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", srv.http.IdleTimeout, serverIdleTimeout)
+	}
+	if srv.http.ReadHeaderTimeout <= 0 || srv.http.IdleTimeout <= 0 {
+		t.Fatal("两个超时都必须为正:零值就是无限,slowloris 能一直占着连接")
+	}
+	if srv.http.ReadTimeout != 0 || srv.http.WriteTimeout != 0 {
+		t.Fatalf("ReadTimeout=%v WriteTimeout=%v,必须为 0 —— SSE 回复会被整请求死线腰斩",
+			srv.http.ReadTimeout, srv.http.WriteTimeout)
 	}
 }
