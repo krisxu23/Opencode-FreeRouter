@@ -29,3 +29,5 @@
 组装点，与 `panel` 同级；`app` 启动它并注入 engine 回调。
 
 **`app` 是唯一组装点。** 它是唯一允许「什么都 import」的包。`sbx`/`registry`/`nodeprobe`/`health`/`engine`/`panel` 之间通过 `app` 传递依赖，而不是互相 import。`panel` 靠 `PanelDeps` 依赖注入拿到所有能力（与 JS 版 `startPanel({status, getSettings, applySettings, actions, logs, routeRecent})` 同构），因此 `panel` 自己不 import 任何 L2/L3/L4。
+
+**根目录的 `web` 包不归层，因为它没有逻辑。** 它只有一条 `//go:embed index.html app.js`，把面板静态资产编进二进制（`//go:embed` 到不了父目录，所以资产放在仓库根的 `web/`、由这个包转一手）。`panel` 读它 = 读自己的资源，不是读上一层的业务包；`PanelDeps.AssetDir` 是测试用的覆盖口，生产里 `app` 不设。

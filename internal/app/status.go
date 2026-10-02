@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	"freerouter/internal/health"
@@ -390,24 +389,4 @@ func (p *Parts) LimitsView() panel.LimitsView {
 	p.limitsMu.Lock()
 	defer p.limitsMu.Unlock()
 	return panel.LimitsView{Rows: p.limitsRows, Stale: p.limitsStale}
-}
-
-// resolveWebDir 找 web/ 静态资产目录。exe 与 web/ 同在 Go 树根
-// (buildGo 的产物路径决定),从 exe 目录找;找不到退回工作目录 —— 测试从
-// 仓库任意目录跑时仍能命中。
-func resolveWebDir(root string) string {
-	candidates := []string{}
-	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "web"))
-	}
-	candidates = append(candidates,
-		filepath.Join(root, "web"),
-		"web",
-	)
-	for _, c := range candidates {
-		if st, err := os.Stat(filepath.Join(c, "index.html")); err == nil && !st.IsDir() {
-			return c
-		}
-	}
-	return ""
 }

@@ -16,7 +16,7 @@
 ## 上手
 
 1. 到 [Releases](https://github.com/krisxu23/Opencode-FreeRouter/releases) 下载
-   `FreeRouter-v<版本>-windows-x64.zip`，解压到任意空目录（`web/` 要和 exe 同级，面板才打得开）；
+   `FreeRouter-v<版本>-windows-x64.zip`，解压即可 —— 面板的前端已编进 exe，同级不需要任何目录；
    想自己构建就 `npm run build:exe` → 仓库根出现 `FreeRouter.exe`
 2. 双击它 → 托盘出现图标（没有控制台窗口）→ 右键「打开面板」。exe 未签名，
    Windows 可能弹 SmartScreen，选「仍要运行」；运行期不需要 Node

@@ -515,7 +515,6 @@ func Load(root string) (*Parts, error) {
 		Logs:        logger.Recent,
 		RouteRecent: tracelog.Recent,
 		Version:     Version,
-		AssetDir:    resolveWebDir(root),
 		Log:         func(msg string) { logger.Info(fmt.Sprintf("panel: %s", msg)) },
 		Limits:      parts.LimitsView,
 	})
@@ -531,7 +530,7 @@ func Load(root string) (*Parts, error) {
 
 	logger.Info(fmt.Sprintf("[app] 注册表 %d 个出口（本进程 0 个本地端口）", reg.Len()))
 	logger.Info(fmt.Sprintf("[app] 转发端口 %d 已监听", portOf(fwdLn)))
-	logger.Info(fmt.Sprintf("[app] 面板端口 %d 已监听（控制台 %s）", portOf(panelLn), resolveWebDir(root)))
+	logger.Info(fmt.Sprintf("[app] 面板端口 %d 已监听（控制台资产已内置于 exe）", portOf(panelLn)))
 	return parts, nil
 }
 

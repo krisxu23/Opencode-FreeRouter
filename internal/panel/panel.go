@@ -29,6 +29,7 @@ import (
 
 	"freerouter/internal/logger"
 	"freerouter/internal/tracelog"
+	"freerouter/web"
 )
 
 // bootMarker is the exact placeholder web/index.html must carry. The name is
@@ -72,10 +73,11 @@ type PanelDeps struct {
 	Logs          func(int) []logger.Line
 	RouteRecent   func(int) []tracelog.Route
 	Version       string
-	// AssetDir holds index.html and app.js. It is a directory rather than two
-	// file paths because the pair always travels together; naming each one
-	// separately would only allow the inconsistent half-states that the JS
-	// version kept hitting.
+	// AssetDir is an optional override: when it is set, index.html and app.js
+	// are read from that directory instead of the copy compiled into the binary.
+	// Production leaves it empty (the exe is self-contained); the tests stage
+	// their own shell to exercise the malformed and missing cases, which embed
+	// can never produce.
 	AssetDir string
 	Log      func(string)
 	// Limits reports the overlay summary that /api/limits returns. It is read
@@ -137,21 +139,26 @@ type Server struct {
 // fails at startup instead of at first paint.
 func New(deps PanelDeps) *Server {
 	s := &Server{deps: deps}
-	if deps.AssetDir == "" {
+	raw, err := s.readAsset("index.html")
+	if err != nil {
 		s.shellMissing = true
 	} else {
-		raw, err := os.ReadFile(filepath.Join(deps.AssetDir, "index.html"))
-		if err != nil {
-			s.shellMissing = true
-		} else {
-			s.shell = string(raw)
-			if n := strings.Count(s.shell, bootMarker); n != 1 {
-				s.bootErr = fmt.Errorf("panel: web/index.html 里 %s 出现 %d 次，必须恰好 1 次", bootMarker, n)
-			}
+		s.shell = string(raw)
+		if n := strings.Count(s.shell, bootMarker); n != 1 {
+			s.bootErr = fmt.Errorf("panel: web/index.html 里 %s 出现 %d 次，必须恰好 1 次", bootMarker, n)
 		}
 	}
 	s.srv = &http.Server{Handler: http.HandlerFunc(s.route)}
 	return s
+}
+
+// readAsset 取面板的静态文件：设了 AssetDir 就从磁盘读（测试要造畸形壳和缺文件的
+// 情形），没设就用编进 exe 的那份。生产路径不设，所以单文件就能跑。
+func (s *Server) readAsset(name string) ([]byte, error) {
+	if s.deps.AssetDir != "" {
+		return os.ReadFile(filepath.Join(s.deps.AssetDir, name))
+	}
+	return web.FS.ReadFile(name)
 }
 
 // Serve blocks on the listener. It reports the construction error first so a
@@ -320,10 +327,10 @@ func (s *Server) serveShell(w http.ResponseWriter) {
 	_, _ = io.WriteString(w, page)
 }
 
-// serveClientJS ships the bundle verbatim. It is read per request, exactly as
-// the JS version did, so a rebuilt bundle is picked up without a restart.
+// serveClientJS ships the bundle verbatim. The bytes come from the binary, or
+// from the override directory when one is set.
 func (s *Server) serveClientJS(w http.ResponseWriter) {
-	raw, err := os.ReadFile(filepath.Join(s.deps.AssetDir, "app.js"))
+	raw, err := s.readAsset("app.js")
 	if err != nil {
 		s.logf("panel: cannot read client bundle: %v", err)
 		writeText(w, http.StatusInternalServerError, "client bundle missing")

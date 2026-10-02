@@ -19,7 +19,8 @@ name: release
 #     依赖清单来自 `go list -deps`，同样离线。
 #   - 换行由 .gitattributes 锁成 LF：Windows runner 默认 core.autocrlf=true，
 #     会把 web/index.html 检出成 CRLF，而 internal/panel 的字节尾巴断言钉的就是
-#     `</html>\n`（2026-10-02 首跑即因此红在 Go tests）。
+#     `</html>\n`（2026-10-02 首跑即因此红在 Go tests）。面板资产现在还是 go:embed
+#     编进二进制的，所以检出错了就是分发出去的字节也错。
 #   - `paths-ignore: ['**.md']` 去掉了：它对 push 事件连带作用于 tag，README 单独
 #     改一行的那次发布就会静不触发。发布比省几分钟 CI 值钱。
 on:
@@ -123,16 +124,15 @@ jobs:
           $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
           if ("v$v" -ne $env:TAG) { throw "tag=$env:TAG 而 package.json=$v，两者必须一致" }
 
-      # zip 里带 web/ 不是冗余：面板是从文件系统读 web/index.html 与 web/app.js 的
-      # （resolveWebDir 的第一个候选就是 <exe 目录>/web），单发 exe 就只有转发能用、
-      # 打开面板是空白。
+      # 面板的 index.html/app.js 已经编进 exe（web.FS），zip 里不再带 web/。
+      # 剩下三份是文书不是资源：读它们的人是下载者，不是程序，嵌进二进制就等于没告知。
       - name: Package zip
         shell: pwsh
         env:
           TAG: ${{ github.ref_name }}
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path FreeRouter.exe, web, LICENSE, NOTICE, README.md -DestinationPath "dist/FreeRouter-$env:TAG-windows-x64.zip"
+          Compress-Archive -Path FreeRouter.exe, LICENSE, NOTICE, README.md -DestinationPath "dist/FreeRouter-$env:TAG-windows-x64.zip"
 
       # 必须是 bash 而不是 pwsh：脚本靠 GNU tar 的 --sort=name/--mtime=@0/--owner=0
       # 保证源码包可复跑，而 pwsh 里 `tar` 解析到 C:\Windows\System32\tar.exe（bsdtar，

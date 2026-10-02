@@ -18,6 +18,7 @@ import (
 
 	"freerouter/internal/logger"
 	"freerouter/internal/tracelog"
+	"freerouter/web"
 )
 
 // goodShell 是最小可用外壳：必须含 /*__BOOT_JSON__*/null 恰好一次、含
@@ -540,13 +541,6 @@ func TestNoStateCanDistinguishAuthorizedFromNot(t *testing.T) {
 	}
 }
 
-// depsAssetDirForTest 指向仓库真实的 web/ 目录。测试的工作目录是 internal/panel，
-// 所以相对路径两级回到 Go 树根 —— 与 app.resolveWebDir 在生产里解析出的同一目录。
-func depsAssetDirForTest(t *testing.T) string {
-	t.Helper()
-	return filepath.Join("..", "..", "web")
-}
-
 func firstLineWith(text, needle string) string {
 	for _, line := range strings.Split(text, "\n") {
 		if strings.Contains(line, needle) {
@@ -559,11 +553,12 @@ func firstLineWith(text, needle string) string {
 // TestShellKeepsTrailingNewline 钉住壳的字节尾巴:JS 版的 SHELL 模板串以
 // </html>\n 结尾(src/panel.js),逐字搬运的 web/index.html 必须同样带收尾
 // 换行 —— 差分 B10 抓到的唯一一处壳字节差,少这一字节,/ 的响应体与 JS 版
-// 就不是逐字节相同。
+// 就不是逐字节相同。读的是**编进二进制的那份**（web.FS），不是磁盘上的同名
+// 文件：CRLF 一旦在检出时被改出来，红的是真正会被分发的那串字节。
 func TestShellKeepsTrailingNewline(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join(depsAssetDirForTest(t), "index.html"))
+	raw, err := web.FS.ReadFile("index.html")
 	if err != nil {
-		t.Skipf("web/index.html 不可读: %v", err)
+		t.Fatalf("内置 index.html 读不出来: %v", err)
 	}
 	if !strings.HasSuffix(string(raw), "</html>\n") {
 		t.Fatalf("shell 必须以 </html>\n 收尾, got %q", string(raw[len(raw)-12:]))
