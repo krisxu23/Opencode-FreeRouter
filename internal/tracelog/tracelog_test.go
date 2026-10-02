@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,4 +101,83 @@ func TestRecordNeverPanicsOnGarbage(t *testing.T) {
 	// Route is a plain struct, so there is nothing unserialisable here; the
 	// point of this test is that Record has no error return to forget to check.
 	Record(Route{Kind: "route", At: 1})
+}
+
+// TestWriteOffRevivesOnANewDay 是 B6 的回归测试。JS 的配额账是
+// dayBytes: Map<day, bytes>,所以跨天天然不受影响;Go 用单变量 + 一个
+// writeOff 标志,而跨天分支只重置 dayBytes,从不复活 writeOff ⇒
+// 某一天触顶(或被杀软占用一次日文件)之后,data/route/<day>.jsonl
+// 在整个进程余下生命周期都不再增长,面板正常、历史为空、任何地方都不报错。
+//
+// 这里把 dayBytes 顶到上限触发 writeOff,再喂一条「明天」的记录:
+// 新的一天必须重新开始写盘。
+func TestWriteOffRevivesOnANewDay(t *testing.T) {
+	dir := t.TempDir()
+	Init(dir)
+
+	today := time.Now().UTC()
+	Record(Route{Result: "今天第一条", At: today.UnixMilli()})
+	if _, err := os.Stat(filepath.Join(dir, today.Format("2006-01-02")+".jsonl")); err != nil {
+		t.Fatalf("today's file missing: %v", err)
+	}
+
+	// 模拟当天配额耗尽。JS 在 size >= MAX 时就停写,所以直接顶到上限。
+	mu.Lock()
+	dayBytes = maxBytesPerDay
+	mu.Unlock()
+	Record(Route{Result: "触顶", At: today.UnixMilli()})
+	mu.RLock()
+	off := writeOff
+	mu.RUnlock()
+	if !off {
+		t.Fatal("配额耗尽后 writeOff 应为真")
+	}
+
+	// 跨天:明天必须重新落盘,而不是沿用昨天的停写状态。
+	tomorrow := today.AddDate(0, 0, 1)
+	Record(Route{Result: "明天", At: tomorrow.UnixMilli()})
+	b, err := os.ReadFile(filepath.Join(dir, tomorrow.Format("2006-01-02")+".jsonl"))
+	if err != nil {
+		t.Fatalf("B6:跨天后没有恢复写盘: %v", err)
+	}
+	if !strings.Contains(string(b), "明天") {
+		t.Fatalf("明天的文件里没有新记录: %s", b)
+	}
+}
+
+// TestWriteOffRevivesWhenTheFileBecomesWritableAgain 覆盖另一条永久停写的
+// 入口:日文件被占用(杀软/编辑器)导致 OpenFile 或 Write 失败。JS 同样置
+// writeDisabled,但它的配额按天独立,所以第二天照样能写;Go 的 writeOff
+// 是进程级标志,必须跨天复活,否则一次瞬时 I/O 错误就终结整个进程的追踪。
+func TestWriteOffRevivesWhenTheFileBecomesWritableAgain(t *testing.T) {
+	dir := t.TempDir()
+	Init(dir)
+
+	// 用一个目录冒充当天的 jsonl 文件:OpenFile 必然失败。
+	today := time.Now().UTC()
+	target := filepath.Join(dir, today.Format("2006-01-02")+".jsonl")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	Record(Route{Result: "写不进去", At: today.UnixMilli()})
+	mu.RLock()
+	off := writeOff
+	mu.RUnlock()
+	if !off {
+		t.Fatal("OpenFile 失败后 writeOff 应为真")
+	}
+
+	// 障碍排除(文件被释放)+ 新的一天:两个条件合起来必须恢复。
+	if err := os.Remove(target); err != nil {
+		t.Fatalf("unblock: %v", err)
+	}
+	tomorrow := today.AddDate(0, 0, 1)
+	Record(Route{Result: "恢复", At: tomorrow.UnixMilli()})
+	b, err := os.ReadFile(filepath.Join(dir, tomorrow.Format("2006-01-02")+".jsonl"))
+	if err != nil {
+		t.Fatalf("B6:障碍排除 + 跨天后没有恢复写盘: %v", err)
+	}
+	if !strings.Contains(string(b), "恢复") {
+		t.Fatalf("明天的文件里没有新记录: %s", b)
+	}
 }

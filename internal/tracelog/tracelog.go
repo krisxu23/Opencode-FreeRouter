@@ -120,6 +120,24 @@ func Record(r Route) {
 	if len(ring) > ringMax {
 		ring = ring[len(ring)-ringMax:]
 	}
+	// B6：跨天的复位必须发生在 writeOff 的早退**之前**。writeOff 从前只有
+	// Init 会复位，于是一天触顶（或日文件被杀软/编辑器占用一次）之后，
+	// data/route/<day>.jsonl 在整个进程余下的生命周期里都不再增长：面板照常、
+	// 历史为空、任何地方都不报错。而 JS 的配额账是 dayBytes: Map<day, bytes>，
+	// 跨天天然不受影响——「一天触顶 = 永久停写」是 Go 独有回归。
+	//
+	// 现在 writeOff 与 dayBytes 一样是**按天**的状态：新的一天重新给一次机会。
+	// 最坏情况是每天失败一次后再次停写，既不会静默永久停摆，也不会退化成
+	// 每条记录一次的错误风暴。
+	day := time.UnixMilli(r.At).UTC().Format("2006-01-02")
+	if dir != "" && day != lastPruneDay {
+		pruneLocked(day)
+		lastPruneDay = day
+		// 每日字节配额按天重置。不重置的话，昨天攒下的计数会把今天
+		// 提前顶到 32MB 上限，整个新的一天都静默停写。
+		dayBytes = 0
+		writeOff = false
+	}
 	if dir == "" || writeOff {
 		return
 	}
@@ -128,14 +146,6 @@ func Record(r Route) {
 		return
 	}
 	b = append(b, '\n')
-	day := time.UnixMilli(r.At).UTC().Format("2006-01-02")
-	if day != lastPruneDay {
-		pruneLocked(day)
-		lastPruneDay = day
-		// 每日字节配额按天重置。不重置的话，昨天攒下的计数会把今天
-		// 提前顶到 32MB 上限，整个新的一天都静默停写。
-		dayBytes = 0
-	}
 	path := filepath.Join(dir, day+".jsonl")
 	if dayBytes+int64(len(b)) > maxBytesPerDay {
 		// Stop writing for the rest of the day rather than truncating: the
