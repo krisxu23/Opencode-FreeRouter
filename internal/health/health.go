@@ -321,12 +321,18 @@ func (h *Health) TtftSnapshot() []TtftView {
 // Forget 删掉一个离开池子的节点(探测失败淘汰后调用)。(src/health.js:227-234)
 // TTFT 观测跟着节点走:节点名可能明天被另一个订阅条目复用(去重按配置指纹,
 // 换了服务器/凭据就是另一条线路),把旧出口的速度记在新出口头上会让排序错一个
-// 量级。
+// 量级。冷却同理(R17):JS 靠单线程让两张表天然同步,Go 必须在这里一起删。
 func (h *Health) Forget(nodeKey string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.forgetLocked(nodeKey)
+}
+
+// forgetLocked 是三张按节点建键的表的统一回收点:判决行、TTFT 观测、冷却。
+func (h *Health) forgetLocked(nodeKey string) {
 	delete(h.nodes, nodeKey)
 	delete(h.ttft, nodeKey)
+	delete(h.cool, nodeKey)
 }
 
 // ClearQuotaMark 测试钩子:忘掉一个节点的配额记号,不动行的其余部分。
@@ -682,8 +688,13 @@ func (h *Health) TierCounts() TierCount {
 // PruneStale 删掉离开池子的节点的行。(src/health.js:485-497)
 // 池子每轮 rebuild churn 1700-1900 个 tag —— 早期版本这里还会顺带清空 region
 // 矩阵,判决在复用之前就被删光,region-gated 路由静默退化成「任意节点」,每一
-// 轮都撞 403 RegionError。tier 现在长在节点行上,删行就是全部工作;活着的判决
-// 不受影响(回归:TestForgetAndPruneStaleKeepLiveVerdicts)。
+// 轮都撞 403 RegionError。tier 现在长在节点行上,活着的判决不受影响
+// (回归:TestForgetAndPruneStaleKeepLiveVerdicts)。
+//
+// 三张按节点建键的表要一起删(R17):JS 单线程里 pruneStale 只删判决行也没事,
+// 因为它的 ttft/cooling 同样只在 pruneStale 里被跳过 —— Go 这边每轮 churn 都是
+// 真实并发,只删一张表等于让另外两张按历史 tag 单调增长。EnforceCap 挤出去的
+// tag 不走 Forget,所以这里的「不在 active 就删」也正是那条路径的回收点。
 func (h *Health) PruneStale(activeKeys []string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -694,6 +705,16 @@ func (h *Health) PruneStale(activeKeys []string) {
 	for key := range h.nodes {
 		if !on[key] {
 			delete(h.nodes, key)
+		}
+	}
+	for key := range h.ttft {
+		if !on[key] {
+			delete(h.ttft, key)
+		}
+	}
+	for key := range h.cool {
+		if !on[key] {
+			delete(h.cool, key)
 		}
 	}
 }
@@ -912,6 +933,51 @@ func (h *Health) NoteStickyUsage(session string, usage StickyUsage) {
 	hit.TTLMS = h.stickyTTLOfLocked(hit, hit.CacheAt)
 }
 
+// stickyCap 是粘性表的上限(R20)。键来自客户端可控的 user/conversation,而行只在
+// 同会话再次被读到时才作废 —— 没有上限,一个每请求换会话名的客户端就能让这张表
+// 以及每次 Pick 在独占锁下对它的全表扫描无界增长。1024 远大于真实并发会话数
+// (这是个跑在个人机器上的网关),同时把扫描成本钉在一个常数上。
+const stickyCap = 1024
+
+// evictStickyLocked 按最久未用(at 最旧)挤掉 n 行(R20 的上限)。挤掉一个会话
+// 的代价只是它下一次请求重新选路 —— 丢一次缓存亲和,换表长与扫描成本的常数上界。
+// 挤完顺手把该会话的连败计数一起删掉:那是同一把键的另一张表。
+//
+// 只在**越过上限**时才付这次 O(n log n),所以平时零成本。
+func (h *Health) evictStickyLocked(n int, keep string) {
+	if n <= 0 {
+		return
+	}
+	type row struct {
+		session string
+		at      int64
+	}
+	all := make([]row, 0, len(h.sticky))
+	for session, hit := range h.sticky {
+		if session == keep {
+			continue // 本轮刚钉下的这一行不参与自己引发的淘汰
+		}
+		all = append(all, row{session, hit.At})
+	}
+	slices.SortFunc(all, func(a, b row) int {
+		if a.at != b.at {
+			if a.at < b.at {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.session, b.session) // 同毫秒:按会话字典序,可复现
+	})
+	for _, x := range all {
+		if n <= 0 {
+			break
+		}
+		delete(h.sticky, x.session)
+		delete(h.stickyFail, x.session)
+		n--
+	}
+}
+
 // NoteSticky 把会话钉到一个出口。(src/health.js:641-685)
 // 锚点是出口 IP,不是节点:提示词缓存按出口 IP 计账(随机轮换实测 0% 命中,
 // 固定出口 99.8%),而池子里 96 个 IP 后面挂着 191 个节点 —— 「同一个 IP 换一个
@@ -946,6 +1012,11 @@ func (h *Health) NoteSticky(session, nodeKey string, withinTurn bool) {
 		ExitIP:  h.exitIpOfLocked(nodeKey, now),
 		At:      now,
 		TTLMS:   stickyTTLBase,
+	}
+	// R20 的硬上界:过期行的就地回收只在「扫到」时发生,而新增行的速率由客户端控
+	// (会话名是它给的)。超上限就按最久未用挤掉,把表长钉成常数。
+	if over := len(h.sticky) - stickyCap; over > 0 {
+		h.evictStickyLocked(over, session)
 	}
 }
 

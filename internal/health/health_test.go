@@ -655,3 +655,87 @@ func TestConcurrentPickAndNotesDoNotRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestPruneStaleReclaimsTtftAndCoolingRows 钉住 R17:池子每轮 churn 掉上千个 tag,
+// 而 PruneStale 过去只删判决行 —— ttft 与 cool 两张按节点建键的表随历史 tag
+// 单调增长,单行很小但没有上界。EnforceCap 淘汰的 tag 更是连 Forget 都不走,
+// 所以残留是稳定的而不是暂时的。
+func TestPruneStaleReclaimsTtftAndCoolingRows(t *testing.T) {
+	h := NewHealth("")
+	h.MarkProbe("gone", aliveRes(10, "1.1.1.1", "US"))
+	h.MarkProbe("stay", aliveRes(20, "2.2.2.2", "US"))
+	h.NoteTtft("gone", 50)
+	h.NoteTtft("stay", 60)
+	h.NoteCooldown("gone", 0)
+
+	h.PruneStale([]string{"stay"})
+
+	h.mu.RLock()
+	ttftN, coolN := len(h.ttft), len(h.cool)
+	_, stayKept := h.ttft["stay"]
+	_, goneKept := h.ttft["gone"]
+	h.mu.RUnlock()
+	if goneKept {
+		t.Fatal("离开池子的节点的 ttft 行还在:旧出口的速度会被记到复用同一个名字的线路上")
+	}
+	if ttftN != 1 || !stayKept {
+		t.Fatalf("ttft 表 = %d 行, want 只剩 stay 一行", ttftN)
+	}
+	if coolN != 0 {
+		t.Fatalf("cool 表剩 %d 行, want 0:冷却行同理", coolN)
+	}
+}
+
+// TestStickyTableIsBoundedUnderSessionKeyChurn 钉住 R20 的上半:sticky 的键来自
+// 客户端可控的 user/conversation,行只在同会话再次被读到时才作废。没有上限的话,
+// 一个每请求换会话名的客户端就能让这张表(以及每次 Pick 在独占锁下的全表扫描)
+// 无界增长。
+func TestStickyTableIsBoundedUnderSessionKeyChurn(t *testing.T) {
+	h := NewHealth("")
+	h.MarkProbe("n1", aliveRes(10, "1.1.1.1", "US"))
+	for i := 0; i < stickyCap*3+17; i++ {
+		h.NoteSticky(fmt.Sprintf("flood-%d", i), "n1", false)
+	}
+	h.mu.RLock()
+	n := len(h.sticky)
+	h.mu.RUnlock()
+	if n > stickyCap {
+		t.Fatalf("sticky 表 %d 行, want ≤ %d(超上限按最久未用淘汰)", n, stickyCap)
+	}
+}
+
+// TestPickSweepsExpiredStickyRows 是下半:过期行必须在 Pick 的那次全表扫描里
+// 顺手删掉 —— 既然每次 Pick 都付了这个遍历,不回收就等于让独占锁里的扫描
+// 成本永久等于历史会话数。
+func TestPickSweepsExpiredStickyRows(t *testing.T) {
+	h := NewHealth("")
+	for i := 0; i < 4; i++ {
+		tag := fmt.Sprintf("n%d", i)
+		h.MarkProbe(tag, aliveRes(int64(10+i), fmt.Sprintf("10.0.0.%d", i+1), "US"))
+	}
+	h.NoteSticky("old", "n1", false)
+	h.NoteSticky("live", "n2", false)
+	h.NoteStickyFailure("old")
+	h.mu.Lock()
+	h.sticky["old"].At = 1
+	h.sticky["old"].TTLMS = 1 // 远过期
+	h.mu.Unlock()
+
+	if p := h.Pick(PickRequest{Pool: []PoolNode{{Tag: "n3", Country: "US"}}}); p == nil {
+		t.Fatal("Pick = nil")
+	}
+	h.mu.RLock()
+	_, oldGone := h.sticky["old"]
+	_, liveKept := h.sticky["live"]
+	failKept := h.stickyFail["old"]
+	h.mu.RUnlock()
+	if oldGone {
+		t.Fatal("过期 sticky 行还在:扫描不顺手删,表就只长不消")
+	}
+	if !liveKept {
+		t.Fatal("未过期的行被误删了")
+	}
+	if failKept != 0 {
+		t.Fatalf("会话连败计数 = %d, want 0:行删了计数也要跟着删,否则同样的键还漏着", failKept)
+	}
+}

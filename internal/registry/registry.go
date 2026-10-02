@@ -93,6 +93,10 @@ type Registry struct {
 	file       string
 	entries    map[string]*entry
 	tombstones map[string]*tombstone
+	// writeFile 是落盘接缝,生产路径就是 persistence.WriteJSONFile。它存在的唯一
+	// 理由是把 R15 的纪律(锁内只取快照、写盘在锁外)变成可断言的事实:测试把写盘
+	// 卡住,再去看池子读取能不能照常返回。没有这个接缝就只能拿计时采样赌磁盘。
+	writeFile func(file string, v any, indent bool) error
 }
 
 // NewRegistry 返回空池,**不读盘**;显式 Load()(与 JS initRegistry 在进程
@@ -102,6 +106,7 @@ func NewRegistry(file string) *Registry {
 		file:       file,
 		entries:    map[string]*entry{},
 		tombstones: map[string]*tombstone{},
+		writeFile:  persistence.WriteJSONFile,
 	}
 }
 
@@ -439,10 +444,18 @@ func (r *Registry) Len() int {
 // Go 版把落盘做成显式 Flush,由 app 在每轮 rebuild/probe 之后调用(任务 20
 // 接线)。契约是「改完就 Flush」—— 调用方忘掉它会丢掉自上次 Flush 以来的
 // 全部增删改,这个窗口的性质与 JS 注释里那个 8 分 20 秒的窗口相同。
+//
+// 锁的边界(R15):锁内只生成快照,序列化与原子写都在锁外 —— 实测
+// node-registry.json 有 1.1MB,每请求的候选池读取走 All()(同一把锁的 RLock),
+// 持锁跨过写盘就等于每轮 rebuild/probe 给所有在途请求加几十毫秒的排队。
+// health.Persist 从一开始就是这个写法,这里是同一条纪律。代价是落盘的那份
+// 快照可能在写出去之前又被后面的改动超越 —— 与 JS 单线程里「先改完再写」的
+// 语义等价,下一次 Flush 会把它补上。
 func (r *Registry) Flush() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := persistence.WriteJSONFile(r.file, r.snapshotLocked(), true); err != nil {
+	snap := r.snapshotLocked()
+	r.mu.Unlock()
+	if err := r.writeFile(r.file, snap, true); err != nil {
 		return fmt.Errorf("registry: %w", err)
 	}
 	return nil

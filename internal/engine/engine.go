@@ -620,6 +620,12 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 	if v, ok := in.openAi["max_tokens"].(float64); ok && v > 0 {
 		areq.MaxTokens = int(v)
 	}
+	// R19:客户端的停止序列要上线。adapter 写 payload["stop"] 的分支一直在,但全仓
+	// 没有生产赋值点(JS 的 engine.js 同样不生产 options.stop),于是「调用方指定
+	// stop」这件事在两条线上都是静默无效的。
+	if stops := stopSequences(in.openAi["stop"]); len(stops) > 0 {
+		areq.Stop = stops
+	}
 
 	res, err := adapter.NewAdapter(deps).Complete(ctx, areq, func(d adapter.Delta) error {
 		return emit(chunkOfDelta(d))
@@ -695,6 +701,29 @@ func finishReasonOf(token string) FinishReason {
 		return FinishMaxTokens
 	default:
 		return FinishStop
+	}
+}
+
+// stopSequences 把请求体里的 `stop` 归一成字符串切片(R19)。OpenAI 允许裸字符串
+// 与字符串数组两种写法;非字符串项与空串逐项丢掉 —— 停止序列少一个是行为差异,
+// 为一个畸形项把整轮弄坏更不是。全空当「没给」,交给 adapter 的 len>0 判据省略。
+func stopSequences(v any) []string {
+	switch t := v.(type) {
+	case string:
+		if t == "" {
+			return nil
+		}
+		return []string{t}
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
 	}
 }
 

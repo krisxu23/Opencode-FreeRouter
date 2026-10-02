@@ -274,10 +274,21 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 		probedTags[it.Tag] = true
 	}
 	results := p.Prober.ProbeAll(ctx, items, p.probeWorkers(len(items)))
+	// unknownTags 是 backstop 兜底点火的节点(本轮没量出来)。nodeprobe 的契约
+	// (nodeprobe.go:440-452)与 health.MarkProbe 都写着「拿到 unknown 应当跳过它
+	// 这一轮」:它既不是通关也不是判决。跳过在两个地方都要兑现 —— 记连败会
+	// 三轮后够到淘汰门槛(探测源越抖,池子越缩),而 RetainOnly 看 probedTags,
+	// 留在这里同样会被判死。
+	unknownTags := make(map[string]bool, len(items))
 	for _, r := range results {
 		p.Health.MarkProbe(r.Tag, r.Result)
-		if r.Result.State == nodeprobe.StateAlive {
+		switch r.Result.State {
+		case nodeprobe.StateAlive:
 			aliveTags[r.Tag] = true
+		case nodeprobe.StateDead:
+		default:
+			unknownTags[r.Tag] = true
+			delete(probedTags, r.Tag) // 与拨不出去的节点同一待遇:没证据不等于有罪
 		}
 	}
 
@@ -306,11 +317,12 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 			summary.Scanned))
 	}
 
-	// 计败:本轮真的测过、又没通关的节点各记一次。缓存跳过的不在此列 ——
+	// 计败:本轮真的测出结论、又没通关的节点各记一次。缓存跳过的不在此列 ——
 	// 缓存的语义是「同一个观测只算一次」,否则 MAX_FAILS=3 会被缓存加速一倍。
+	// unknown 也不在此列(R16):兜底超时是「本轮没量出来」,不是「量到了不通」。
 	now := p.now()
 	for _, it := range items {
-		if aliveTags[it.Tag] {
+		if aliveTags[it.Tag] || unknownTags[it.Tag] {
 			continue
 		}
 		p.Registry.NoteFail(it.Tag, now)

@@ -335,12 +335,17 @@ func orderRowOf(r *ranked, stickyNode string) tracelog.OrderRow {
 func (h *Health) busyExitIpsLocked(ownSticky string) map[string]int {
 	out := map[string]int{}
 	now := time.Now().UnixMilli()
-	for _, hit := range h.sticky {
-		// 调用方自己钉着的那个 tag 永不给自己降级(src/health.js:896)
-		if ownSticky != "" && hit.NodeKey == ownSticky {
+	for session, hit := range h.sticky {
+		if now-hit.At > ttlOf(hit) {
+			// R20:过期行就地删掉。这张表按客户端可控的会话标识建键,而行过去只在
+			// 「同一个会话又被读到」时才作废 —— 于是每次 Pick 都要在独占锁下扫一遍
+			// 历史会话数,而表长只增不消。这次遍历本来就已经付了,顺手回收是免费的。
+			delete(h.sticky, session)
+			delete(h.stickyFail, session) // 同一把键的另一张表,一起放手
 			continue
 		}
-		if now-hit.At > ttlOf(hit) {
+		// 调用方自己钉着的那个 tag 永不给自己降级(src/health.js:896)
+		if ownSticky != "" && hit.NodeKey == ownSticky {
 			continue
 		}
 		if !h.nodeUsableLocked(hit.NodeKey) {

@@ -16,6 +16,52 @@ func ob(tag string) parse.Outbound {
 	return parse.Outbound{Tag: tag, Type: "vless", Server: tag, ServerPort: 443}
 }
 
+// TestFlushWritesTheFileOutsideTheLock 钉住 R15:锁内只生成快照,序列化与原子写
+// 都在锁外。实测 node-registry.json 有 1.1MB,而每请求的候选池读取走的是同一把
+// 锁的 RLock —— 持锁跨写盘等于每轮 rebuild/probe 给所有在途请求加几十毫秒排队。
+// 判据不能靠计时(慢盘是环境属性),所以用落盘接缝把写盘卡在「已经开始」的那一刻:
+// 旧实现在这里是真的死锁,而不是「读得慢」。
+func TestFlushWritesTheFileOutsideTheLock(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "node-registry.json")
+	r := NewRegistry(file)
+	r.Merge([]parse.Outbound{ob("a"), ob("b")})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	orig := r.writeFile
+	r.writeFile = func(path string, v any, indent bool) error {
+		close(entered)
+		<-release
+		return orig(path, v, indent)
+	}
+
+	flushed := make(chan error, 1)
+	go func() { flushed <- r.Flush() }()
+	<-entered
+
+	all := make(chan int, 1)
+	go func() { all <- len(r.All()) }()
+	select {
+	case n := <-all:
+		if n != 2 {
+			t.Fatalf("写盘窗口里的池子读取 = %d, want 2", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("R15:Flush 在写盘期间仍持着独占锁,候选池读取被卡死")
+	}
+	close(release)
+	if err := <-flushed; err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	again := NewRegistry(file)
+	if err := again.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if again.Len() != 2 {
+		t.Fatalf("len = %d, want 2(写盘挪到锁外之后落盘内容不能少)", again.Len())
+	}
+}
+
 func newReg(t *testing.T) *Registry {
 	t.Helper()
 	return NewRegistry(filepath.Join(t.TempDir(), "node-registry.json"))

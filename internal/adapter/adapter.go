@@ -158,7 +158,7 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, s *sink) (Result, error
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := readAllCapped(resp.Body, maxBodyBytes)
+		raw, rerr := readAllCapped(resp.Body, maxBodyBytes)
 		// A 400 naming a reasoning item the server no longer knows is not a
 		// client error: drop the server-issued references and replay once.
 		// Replaying unconditionally would double every genuine 400, and a
@@ -169,12 +169,33 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, s *sink) (Result, error
 					errors.RetryAfter(resp.Header.Get("Retry-After")))
 			}
 		}
-		return s.result(), errors.Classify(resp.StatusCode, raw, errors.RetryAfter(resp.Header.Get("Retry-After")))
+		return s.result(), classifyErrorBody(resp.StatusCode, raw, rerr,
+			errors.RetryAfter(resp.Header.Get("Retry-After")))
 	}
 	if err := a.readReply(resp, t, s); err != nil {
 		return s.result(), idleOrPassthrough(err)
 	}
 	return s.result(), nil
+}
+
+// classifyErrorBody 分类一个非 2xx 响应(R18)。
+//
+// 读错误不能丢:errors.Classify 里 **403 的 FreeTier 判据依赖 body 文案**
+// (errors.go 的 freeRe),文案没读全就按「读到的是空文案」分类,会掉进
+// `status == 401 || status == 403` 那条不可重试的凭证判决 —— 于是本应换出口的
+// 403 变成对客户端的立即失败(engine 的 B 分支直接 return)。
+//
+// 所以:先拿已经读到的前缀分类(429/Region 这类可重试判决不依赖尾部,照抄);
+// 只有当前缀不足以支撑一个**可重试**判决时,才把「没读完」本身当成故障 ——
+// TRANSPORT 在引擎的 retryOn 与 cooldownOn 里,换出口并冷却这个出口是对的应对。
+func classifyErrorBody(status int, raw []byte, readErr error, retryAfter int64) error {
+	f := errors.Classify(status, raw, retryAfter)
+	if readErr == nil || f.Retryable {
+		return f
+	}
+	return errors.Failure{Code: check.CodeTransport, Status: status,
+		Message:   "our-free-model: upstream error body unreadable: " + readErr.Error(),
+		Retryable: true}
 }
 
 // idleOrPassthrough 把 httpclient 的空闲截止翻译成 TIMEOUT。
@@ -211,8 +232,9 @@ func (a *Adapter) replay(ctx context.Context, t *turn, s *sink, status int, raw 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		replayRaw, _ := readAllCapped(resp.Body, maxBodyBytes)
-		return s.result(), errors.Classify(resp.StatusCode, replayRaw, errors.RetryAfter(resp.Header.Get("Retry-After")))
+		replayRaw, replayRErr := readAllCapped(resp.Body, maxBodyBytes)
+		return s.result(), classifyErrorBody(resp.StatusCode, replayRaw, replayRErr,
+			errors.RetryAfter(resp.Header.Get("Retry-After")))
 	}
 	if err := a.readReply(resp, retry, s); err != nil {
 		return s.result(), err
@@ -355,8 +377,24 @@ func (a *Adapter) readReply(resp *http.Response, t *turn, s *sink) error {
 	if headSSERe.Match(head) || (!headJSONRe.Match(head) && strings.Contains(resp.Header.Get("Content-Type"), "event-stream")) {
 		return a.readSSE(body, t, s)
 	}
-	raw, _ := readAllCapped(body, maxBodyBytes)
+	raw, readErr := readAllCapped(body, maxBodyBytes)
+	if readErr != nil {
+		return bodyReadFailure(readErr)
+	}
 	return a.readJSON(raw, resp.StatusCode, errors.RetryAfter(resp.Header.Get("Retry-After")), t, s)
+}
+
+// bodyReadFailure 把一次 2xx 响应体读故障翻译成引擎认识的码(R18 的第三个点)。
+//
+// 空闲截止仍按 B1 的语义交给 idleOrPassthrough(它认这个哨兵);其余都是
+// TRANSPORT —— 整包没读全不等于「上游回了奇怪的东西」,而 readJSON 的守卫会把
+// 截断的 JSON 报成 SERVER,那条既不说这条连接不可信,也不给冷却表任何线索。
+func bodyReadFailure(err error) error {
+	if stderrors.Is(err, httpclient.ErrIdleTimeout) {
+		return err
+	}
+	return errors.Failure{Code: check.CodeTransport,
+		Message: "our-free-model: upstream body unreadable: " + err.Error(), Retryable: true}
 }
 
 // readSSE 逐事件喂 feed;[DONE] 与非 JSON 帧在 feed 的入口被跳过。

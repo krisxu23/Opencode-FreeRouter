@@ -46,12 +46,13 @@ func (f fakeEngine) Stats(context.Context) (any, error) {
 // fakeProber 是 Prober 接口的测试实现:探测不真的出网,缓存/事故/淘汰的
 // 分支逻辑由此离线可断言。
 type fakeProber struct {
-	mu         sync.Mutex
-	directErr  error
-	directCnt  int
-	allCnt     int
-	block      chan struct{} // 非 nil:ProbeAll 阻塞直到通道关闭
-	failedTags map[string]bool
+	mu          sync.Mutex
+	directErr   error
+	directCnt   int
+	allCnt      int
+	block       chan struct{} // 非 nil:ProbeAll 阻塞直到通道关闭
+	failedTags  map[string]bool
+	unknownTags map[string]bool // backstop 兜底:本轮没量出来的节点(state=unknown)
 }
 
 func (f *fakeProber) ProbeDirect(ctx context.Context, timeoutMS int) error {
@@ -66,12 +67,16 @@ func (f *fakeProber) ProbeAll(ctx context.Context, items []nodeprobe.Item, worke
 	f.allCnt++
 	block := f.block
 	failed := f.failedTags
+	unknown := f.unknownTags
 	f.mu.Unlock()
 	results := make([]nodeprobe.Result, 0, len(items))
 	for _, it := range items {
 		r := aliveResult("198.51.100." + fmt.Sprint(len(results)%200+1))
 		if failed[it.Tag] {
 			r = deadResult()
+		}
+		if unknown[it.Tag] {
+			r = unknownResult()
 		}
 		results = append(results, nodeprobe.Result{Tag: it.Tag, Result: r})
 	}
@@ -173,6 +178,13 @@ func aliveResult(ip string) nodeprobe.ProbeResult {
 
 func deadResult() nodeprobe.ProbeResult {
 	return nodeprobe.ProbeResult{State: nodeprobe.StateDead, LatencyMS: -1}
+}
+
+// unknownResult 是 worker 兜底点火的形状:本轮**没量出来**。nodeprobe 的契约
+// (nodeprobe.go:440-452、health.go 的 MarkProbe)都要求调用方跳过它这一轮 ——
+// 它既不是 alive 也不是判决。
+func unknownResult() nodeprobe.ProbeResult {
+	return nodeprobe.ProbeResult{State: nodeprobe.StateUnknown, LatencyMS: -1, Incomplete: true}
 }
 
 // ---- 探测轮次(12 条) ----
@@ -437,6 +449,31 @@ func TestTierBucketReleasesOnlyItsOwnSection(t *testing.T) {
 	case <-bEntered:
 	case <-time.After(2 * time.Second):
 		t.Fatal("前一节 panic 后,同 key 的后来者没有接上(链被整表删除踩掉了)")
+	}
+}
+
+// TestProbeRoundSkipsTheFailCountOnUnknownVerdicts 钉住 R16:backstop 兜底给出的
+// unknown 是「本轮没量出来」,不是判决 —— nodeprobe(nodeprobe.go:440-452)与
+// health.MarkProbe 都要求调用方跳过它这一轮。过去只有 MarkProbe 那半兑现了:
+// 计败与淘汰判决照样把 unknown 当失败,探测源越抖,池子被缩得越狠。
+func TestProbeRoundSkipsTheFailCountOnUnknownVerdicts(t *testing.T) {
+	p := newProbeParts(t, 4)
+	fp := p.Prober.(*fakeProber)
+	fp.unknownTags = map[string]bool{"n1": true}
+	fp.failedTags = map[string]bool{"n2": true, "n3": true} // 对照组:真判决必须照常计败
+	for round := 0; round <= registry.MaxFails; round++ {
+		if _, err := p.ProbeNow(context.Background(), true); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
+	if got := p.Registry.FailCount("n1"); got != 0 {
+		t.Fatalf("unknown 节点的连败 = %d, want 0(它这一轮被跳过了)", got)
+	}
+	if !p.Registry.Has("n1") {
+		t.Fatal("没量出来的节点被淘汰了:「没证据」被当成「有罪」")
+	}
+	if p.Registry.Has("n2") || p.Registry.Has("n3") {
+		t.Fatalf("对照组失效:dead 节点连败到门槛就该淘汰(池子 %d 个)", p.Registry.Len())
 	}
 }
 

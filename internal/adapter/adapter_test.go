@@ -1079,6 +1079,83 @@ func TestNonStreamingReplyMarksSawText(t *testing.T) {
 	}
 }
 
+// TestUnreadableErrorBodyIsRetriedAsTransport 钉住 R18:非 2xx 的 body 读失败时,
+// 旧代码把错误连同「文案没读到」这件事一起丢了。403 的 FreeTier 判据依赖 body
+// 文本 —— 文本没了就退化成不可重试的凭证错误,本应换出口的 403 变成对客户端的
+// 立即失败。读不断才是判决,读断了只是这条连接不可信。
+//
+// 夹具用「声明的 Content-Length 比写出的字节多」制造真读错误(客户端 unexpected
+// EOF),而不是手工喂前缀 —— 要钉的就是传输层这一步。
+func TestUnreadableErrorBodyIsRetriedAsTransport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "4000")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"type":"FreeTierError","message":"free tier limit reached for`)
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newAdapter(srv.URL, srv.Client(), "big-pickle")
+	_, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collect(&strings.Builder{}))
+	if err == nil {
+		t.Fatal("want a failure from the truncated error body")
+	}
+	failure, ok := err.(errors.Failure)
+	if !ok {
+		t.Fatalf("err = %#v, want errors.Failure", err)
+	}
+	if failure.Code != check.CodeTransport {
+		t.Fatalf("code = %q, want %q:文案没读全就不该下凭证判决", failure.Code, check.CodeTransport)
+	}
+	if !failure.Retryable {
+		t.Fatal("读断的错误必须可重试(换出口是对的应对)")
+	}
+}
+
+// TestReadable403FreeTierBodyStillClassifiesAsQuota 是上一条的对照组:读得到的
+// 文本必须照旧分类,不能因为 R18 的改动把所有 403 都推成 transport。
+func TestReadable403FreeTierBodyStillClassifiesAsQuota(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 403, "application/json", `{"error":{"type":"FreeTierError","message":"free tier limit reached"}}`
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+	_, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collect(&strings.Builder{}))
+	if code := errors.CodeOf(err); code != check.CodeQuota {
+		t.Fatalf("code = %q, want %q", code, check.CodeQuota)
+	}
+}
+
+// TestUnreadableSuccessBodyIsRetriedAsTransport 钉住 R18 的第三个点:2xx 的
+// JSON 分支也吞了读错误 —— 截断的整包会退化成「unexpected non-SSE response」的
+// SERVER 判决,而不是一次该换出口的传输故障。
+func TestUnreadableSuccessBodyIsRetriedAsTransport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "4000")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"par`)
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newAdapter(srv.URL, srv.Client(), "big-pickle")
+	_, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   false,
+	}, collect(&strings.Builder{}))
+	if code := errors.CodeOf(err); code != check.CodeTransport {
+		t.Fatalf("code = %q, want %q(读断的 2xx 不是「上游回了奇怪的东西」)", code, check.CodeTransport)
+	}
+	if failure, ok := err.(errors.Failure); !ok || !failure.Retryable {
+		t.Fatalf("err = %#v, want Retryable", err)
+	}
+}
+
 func TestDecoyToolsAreInjectedOnEveryWire(t *testing.T) {
 	for _, model := range []string{"big-pickle", "muse-spark-1.3-contributor-free", "union-alpha"} {
 		f := newFakeUpstream(t, func(n int) (int, string, string) {

@@ -99,6 +99,16 @@ func readAll(r *http.Request) []byte {
 	return raw
 }
 
+// decodeJSON 把伪造上游收到的请求体解回 map,断言线上字段用。
+func decodeJSON(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("上游收到的请求体不是 JSON: %v (%s)", err, raw)
+	}
+	return m
+}
+
 // sseChat 是 big-pickle(chat 线)的一段成功 SSE:一个文本增量 + [DONE]。
 func sseChat(text string) string {
 	delta := `{"choices":[{"delta":{"content":"` + text + `"}}]}`
@@ -881,6 +891,73 @@ func TestSummaryHasNoDoubleSpaceWhenNothingRotated(t *testing.T) {
 	}
 	if !strings.Contains(msg, ": 共") {
 		t.Fatalf("汇总行应保留 ': 共' 段: %q", msg)
+	}
+}
+
+// TestClientStopSequencesReachTheUpstream 钉住 R19:客户端的 `stop` 过去在全仓
+// 没有生产赋值点 —— adapter 写 payload["stop"] 的分支恒为死代码,调用方指定的
+// 停止序列对上游生成毫无影响。OpenAI 的两种写法(字符串与字符串数组)都要认。
+func TestClientStopSequencesReachTheUpstream(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChat("ok")
+	})
+	req := simpleReq("big-pickle", "u1")
+	req.OpenAI["stop"] = []any{"\n\nEND", "###"}
+	if _, err := f.eng.Complete(context.Background(), req, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	sent := decodeJSON(t, f.up.requests()[0].body)
+	stop, _ := sent["stop"].([]any)
+	if len(stop) != 2 || stop[0] != "\n\nEND" || stop[1] != "###" {
+		t.Fatalf("线上 stop = %v, want [\"\\n\\nEND\" ###]", sent["stop"])
+	}
+}
+
+// TestBareStringStopBecomesOneSequence 是 OpenAI 的另一半:stop 可以是裸字符串。
+func TestBareStringStopBecomesOneSequence(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChat("ok")
+	})
+	req := simpleReq("big-pickle", "u1")
+	req.OpenAI["stop"] = "###"
+	if _, err := f.eng.Complete(context.Background(), req, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	sent := decodeJSON(t, f.up.requests()[0].body)
+	stop, _ := sent["stop"].([]any)
+	if len(stop) != 1 || stop[0] != "###" {
+		t.Fatalf("线上 stop = %v, want [###]", sent["stop"])
+	}
+}
+
+// TestGarbageStopIsDroppedInsteadOfFailingTheTurn:上游字段是外部数据 —— 非字符串
+// 项与空串丢掉,整字段都不是字符串时干脆不写,而不是把轮次弄坏。
+func TestGarbageStopIsDroppedInsteadOfFailingTheTurn(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChat("ok")
+	})
+	req := simpleReq("big-pickle", "u1")
+	req.OpenAI["stop"] = []any{nil, "", 7, "END"}
+	if _, err := f.eng.Complete(context.Background(), req, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	sent := decodeJSON(t, f.up.requests()[0].body)
+	stop, _ := sent["stop"].([]any)
+	if len(stop) != 1 || stop[0] != "END" {
+		t.Fatalf("线上 stop = %v, want [END]", sent["stop"])
+	}
+
+	f2 := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChat("ok")
+	})
+	req2 := simpleReq("big-pickle", "u2")
+	req2.OpenAI["stop"] = 7
+	if _, err := f2.eng.Complete(context.Background(), req2, nil); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	sent2 := decodeJSON(t, f2.up.requests()[0].body)
+	if _, has := sent2["stop"]; has {
+		t.Fatalf("整个 stop 字段都不是字符串时不该上线: %v", sent2["stop"])
 	}
 }
 

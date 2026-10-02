@@ -511,7 +511,7 @@ func TestDeclaredToolNamesSplitsDecoysFromRealCalls(t *testing.T) {
 // (ToolName / Renamed),这里用一个同形状的替身把契约钉住。
 type testWireTool struct{ name string }
 
-func (t testWireTool) ToolName() string       { return t.name }
+func (t testWireTool) ToolName() string        { return t.name }
 func (t testWireTool) Renamed(name string) any { t.name = name; return t }
 
 // TestApplyFingerprintAcceptsStructTools 钉住 B13 的 Go 独有回归:adapter 交来
