@@ -186,8 +186,15 @@ func settingsMap(s Settings) map[string]any {
 }
 
 func settingsFromStore(store *persistence.Store) (Settings, error) {
+	m, _ := store.Get().(map[string]any)
+	return settingsFromMap(m)
+}
+
+// settingsFromMap 把一份设置 map 解成 Settings。B10 的候选校验用它:先确认
+// 「补丁 merge 进当前快照」的结果能解出来,再决定要不要落盘。
+func settingsFromMap(m map[string]any) (Settings, error) {
 	var out Settings
-	raw, err := json.Marshal(store.Get())
+	raw, err := json.Marshal(m)
 	if err != nil {
 		return out, fmt.Errorf("app: 设置无法序列化: %w", err)
 	}
@@ -523,11 +530,13 @@ func Load(root string) (*Parts, error) {
 	console := panel.New(panel.PanelDeps{
 		Status:      parts.Status,
 		GetSettings: func() any { return parts.SettingsView() },
-		ApplySettings: func(patch map[string]any) any {
+		ApplySettings: func(patch map[string]any) (any, error) {
+			// B10:错误必须透传到面板(→ 400),不能吞成一行 warn ——
+			// 吞掉之后前端照样 toast「已保存并应用」,而改动从未生效。
 			if _, err := parts.ApplySettings(patch); err != nil {
-				logger.Warn(fmt.Sprintf("panel: 应用设置失败: %v", err))
+				return nil, err
 			}
-			return parts.SettingsView()
+			return parts.SettingsView(), nil
 		},
 		Actions: panel.PanelActions{
 			ProbeNow: func(ctx context.Context, force bool) error {

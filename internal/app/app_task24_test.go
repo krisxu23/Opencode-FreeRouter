@@ -920,3 +920,51 @@ func TestApplySettingsKeepsNullAndGuardsKey(t *testing.T) {
 		t.Fatalf("probeIntervalMin = %d, want 15", p.Settings.ProbeIntervalMin)
 	}
 }
+
+// TestApplySettingsRejectsAMalformedPatchWithoutTouchingDisk:B10。面板不认证
+// (panel.go 的头注释自认),任何本机进程都能 PUT 一个畸形补丁。旧实现先把
+// clean 写进 store 再校验,一条 {"probeWorkers":"abc"} 就能把 settings.json
+// 写成不可解析 —— 下次启动 Load 失败,网关拒绝启动,只能手改文件。修法:先逐键
+// 类型校验,非法立即返回,绝不碰盘。
+func TestApplySettingsRejectsAMalformedPatchWithoutTouchingDisk(t *testing.T) {
+	p := newProbeParts(t, 1)
+	settingsFile := filepath.Join(p.Root, "settings.json")
+	p.settingsStore = persistence.NewStore("settings", settingsFile, settingsMap(defaultSettings()))
+	if err := p.settingsStore.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := p.settingsStore.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	before, err := os.ReadFile(settingsFile)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	beforeWorkers := p.Settings.ProbeWorkers
+
+	for _, patch := range []map[string]any{
+		{"probeWorkers": "abc"},        // 报告 B10 的复现输入
+		{"subUrls": []any{float64(1)}}, // 数组里混进非字符串
+		{"probeEnabled": "yes"},        // 布尔位收到字符串
+		{"countries": "US"},            // 数组位收到字符串
+		{"probeIntervalMin": nil},      // 数字位收到 null
+	} {
+		if _, err := p.ApplySettings(patch); err == nil {
+			t.Fatalf("ApplySettings(%v) 接受了畸形补丁", patch)
+		}
+		after, err := os.ReadFile(settingsFile)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if string(after) != string(before) {
+			t.Fatalf("ApplySettings(%v) 动了磁盘:\n before %s\n after  %s", patch, before, after)
+		}
+		if p.Settings.ProbeWorkers != beforeWorkers {
+			t.Fatalf("probeWorkers 被畸形补丁改成了 %d", p.Settings.ProbeWorkers)
+		}
+	}
+	// 盘上文件必须仍能启动 —— 这才是 B10 的核心后果。
+	if _, err := settingsFromStore(p.settingsStore); err != nil {
+		t.Fatalf("settingsFromStore 在畸形补丁后失败: %v", err)
+	}
+}

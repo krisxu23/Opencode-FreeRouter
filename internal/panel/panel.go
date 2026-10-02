@@ -11,6 +11,12 @@
 // every handler failure is a 500 — never a 403 — because the panel listens on
 // 127.0.0.1 only and does not authenticate, so a status code must never let a
 // caller infer anything about internal state.
+//
+// One deliberate exception: PUT /api/settings answers 400 when the patch fails
+// validation. That is the caller's own malformed input, not a server fault, and
+// the client must see it (web/app.js:941-943 only reacts to `!r.ok`) — before
+// this, a bad patch was silently accepted, reported as saved, and left an
+// unparseable settings.json behind that stopped the gateway from starting.
 package panel
 
 import (
@@ -68,7 +74,7 @@ type LimitsView struct {
 type PanelDeps struct {
 	Status        func() any
 	GetSettings   func() any
-	ApplySettings func(map[string]any) any
+	ApplySettings func(map[string]any) (any, error)
 	Actions       PanelActions
 	Logs          func(int) []logger.Line
 	RouteRecent   func(int) []tracelog.Route
@@ -236,7 +242,14 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 		}
 		var out any
 		if s.deps.ApplySettings != nil {
-			out = s.deps.ApplySettings(patch)
+			out, err = s.deps.ApplySettings(patch)
+			if err != nil {
+				// 400,不是 500:畸形补丁是调用方自己的输入问题,与内部状态
+				// 无关。纯文本是因为 web/app.js:941-943 把非 2xx 的 body
+				// 原样塞进 toast —— JSON 会显示成一坨。
+				writeText(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		writeJSON(w, http.StatusOK, out)
 

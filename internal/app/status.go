@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -379,45 +380,143 @@ func (p *Parts) SettingsView() map[string]any {
 // merge 下删键会让旧值活过整个往返,字段永远清不掉(src/index.js:1047-1054)。
 // 端口字段的改动要重启后生效(转发端口已绑定,运行中重绑会断在途连接);
 // 其余字段下一轮探测/重建立即可见。
+//
+// B10:校验必须发生在落盘之前。面板不认证(panel.go 头注释自认),本机任何进程
+// 都能 PUT 一个畸形补丁;旧实现先 Update+Flush 再 settingsFromStore,于是
+// {"probeWorkers":"abc"} 会把 settings.json 写成不可解析 —— 下次启动 Load 失败,
+// 网关拒绝启动,只能手改文件。现在的顺序是「构造候选 → 逐键类型校验 → 候选能解
+// 成 Settings → 才 Update+Flush」,任一步失败都直接返回,一个字节都不写盘。
 func (p *Parts) ApplySettings(patch map[string]any) (Settings, error) {
 	if len(patch) == 0 {
 		return *p.Settings, nil
 	}
-	clean := map[string]any{}
-	for _, key := range []string{
-		"subUrls", "countries", "probeEnabled", "probeWorkers", "probeIntervalMin",
-		"effortLevel", "defaultMaxTokens", "forwardPort", "panelPort",
-	} {
-		if v, ok := patch[key]; ok {
-			clean[key] = v
-		}
+	clean, err := validateSettingsPatch(patch)
+	if err != nil {
+		return *p.Settings, err
 	}
-	if v, ok := clean["subUrls"].([]any); ok {
-		clean["subUrls"] = trimAll(anyToStrings(v))
+	// 候选校验:补丁 merge 进当前快照,先确认结果能被解成 Settings。类型
+	// 断言挡不住的组合(例如超大整数)在这里落网。
+	before, _ := p.settingsStore.Get().(map[string]any)
+	candidate := make(map[string]any, len(before)+len(clean))
+	for k, v := range before {
+		candidate[k] = v
 	}
-	if v, ok := clean["countries"].([]any); ok {
-		clean["countries"] = trimAll(anyToStrings(v))
+	for k, v := range clean {
+		candidate[k] = v
+	}
+	next, err := settingsFromMap(candidate)
+	if err != nil {
+		return *p.Settings, err
 	}
 	p.settingsStore.Update(clean)
 	if err := p.settingsStore.Flush(); err != nil {
+		// 落盘失败要把内存里的补丁撤回,否则内存与磁盘各说各话。
+		p.settingsStore.Update(before)
 		return *p.Settings, fmt.Errorf("app: 写设置: %w", err)
-	}
-	next, err := settingsFromStore(p.settingsStore)
-	if err != nil {
-		return *p.Settings, err
 	}
 	*p.Settings = next
 	return next, nil
 }
 
-func anyToStrings(v []any) []string {
-	out := make([]string, 0, len(v))
-	for _, e := range v {
-		if s, ok := e.(string); ok {
-			out = append(out, s)
+// validateSettingsPatch 对白名单键做逐键类型校验并归一化。任何非法类型都是
+// 错误,绝不静默跳过 —— 静默跳过正是 B10 的前半段(非法原值留在 clean 里被写进
+// store)。返回的 map 只含通过校验的键,值已归一化成 Settings 字段的 Go 类型。
+func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
+	clean := map[string]any{}
+	for _, key := range []string{
+		"subUrls", "countries", "probeEnabled", "probeWorkers", "probeIntervalMin",
+		"effortLevel", "defaultMaxTokens", "forwardPort", "panelPort",
+	} {
+		v, ok := patch[key]
+		if !ok {
+			continue
+		}
+		switch key {
+		case "subUrls", "countries":
+			list, ok := v.([]any)
+			if !ok {
+				return nil, fmt.Errorf("app: 设置 %s 必须是字符串数组", key)
+			}
+			out := make([]string, 0, len(list))
+			for _, e := range list {
+				s, ok := e.(string)
+				if !ok {
+					return nil, fmt.Errorf("app: 设置 %s 的元素必须是字符串", key)
+				}
+				out = append(out, s)
+			}
+			clean[key] = trimAll(out)
+		case "probeEnabled":
+			b, ok := v.(bool)
+			if !ok {
+				return nil, fmt.Errorf("app: 设置 probeEnabled 必须是布尔值")
+			}
+			clean[key] = b
+		case "effortLevel":
+			s, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("app: 设置 effortLevel 必须是字符串")
+			}
+			clean[key] = s
+		case "defaultMaxTokens":
+			// null 是「不额外设限」;非正数照 src/index.js:1047-1054 归一成
+			// null,而不是把 0 或负数留在盘上。
+			if v == nil {
+				clean[key] = nil
+				continue
+			}
+			n, ok := settingsInt(v)
+			if !ok {
+				return nil, fmt.Errorf("app: 设置 defaultMaxTokens 必须是数字或 null")
+			}
+			if n <= 0 {
+				clean[key] = nil
+			} else {
+				clean[key] = n
+			}
+		case "probeWorkers", "probeIntervalMin", "forwardPort", "panelPort":
+			n, ok := settingsInt(v)
+			if !ok {
+				return nil, fmt.Errorf("app: 设置 %s 必须是整数", key)
+			}
+			if n < 0 {
+				return nil, fmt.Errorf("app: 设置 %s 不能是负数", key)
+			}
+			if key == "forwardPort" || key == "panelPort" {
+				if n > 65535 {
+					return nil, fmt.Errorf("app: 设置 %s 超出端口范围", key)
+				}
+			}
+			clean[key] = n
 		}
 	}
-	return out
+	return clean, nil
+}
+
+// settingsInt 把 JSON 数字转成 int。只接受可无损转换的整数:48.5 会被
+// json.Unmarshal 拒绝进 Settings 的 int 字段,正是 B10 的崩溃路径之一,必须在
+// 这里就拦下。
+func settingsInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) {
+			return 0, false
+		}
+		if n < -(1 << 53) || n > 1<<53 {
+			return 0, false
+		}
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(i), true
+	default:
+		return 0, false
+	}
 }
 
 // LimitsView 是 /api/limits 的摘要面板读回的那一半(刷新在 refreshLimitsOverlay)。

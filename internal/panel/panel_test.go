@@ -129,7 +129,7 @@ func baseDeps(dir string) PanelDeps {
 		GetSettings: func() any {
 			return map[string]any{}
 		},
-		ApplySettings: func(map[string]any) any { return map[string]any{} },
+		ApplySettings: func(map[string]any) (any, error) { return map[string]any{}, nil },
 		Logs:          func(int) []logger.Line { return nil },
 		RouteRecent:   func(int) []tracelog.Route { return nil },
 	}
@@ -445,10 +445,10 @@ func TestPutSettingsPassesEmptyObjectForEmptyBody(t *testing.T) {
 	var got map[string]any
 	called := 0
 	deps := baseDeps(dir)
-	deps.ApplySettings = func(patch map[string]any) any {
+	deps.ApplySettings = func(patch map[string]any) (any, error) {
 		called++
 		got = patch
-		return map[string]any{"ok": true}
+		return map[string]any{"ok": true}, nil
 	}
 	base := startPanel(t, deps)
 
@@ -478,9 +478,9 @@ func TestPutSettingsRejectsOversizedBody(t *testing.T) {
 	dir := writeAssets(t, goodShell, "console.log('app')\n")
 	called := 0
 	deps := baseDeps(dir)
-	deps.ApplySettings = func(map[string]any) any {
+	deps.ApplySettings = func(map[string]any) (any, error) {
 		called++
-		return map[string]any{}
+		return map[string]any{}, nil
 	}
 	base := startPanel(t, deps)
 
@@ -491,6 +491,32 @@ func TestPutSettingsRejectsOversizedBody(t *testing.T) {
 	}
 	if called != 0 {
 		t.Errorf("超限 body 仍然调了 ApplySettings %d 次", called)
+	}
+}
+
+// TestPutSettingsReportsAValidationFailure:B10 的另一半。ApplySettings 现在能
+// 报错,面板必须把错误变成非 2xx —— 否则前端 web/app.js:941-943 的 `if (!r.ok)`
+// 看不到任何异常,照样 toast「已保存并应用」,而设置从未生效。
+//
+// 用 400 而不是 500:畸形补丁是客户端自己的输入问题,不是服务端故障。body 是
+// 纯文本,因为前端把非 2xx 的 body 文本原样塞进 toast。
+func TestPutSettingsReportsAValidationFailure(t *testing.T) {
+	dir := writeAssets(t, goodShell, "console.log('app')\n")
+	deps := baseDeps(dir)
+	deps.ApplySettings = func(map[string]any) (any, error) {
+		return nil, errors.New("probeWorkers 必须是数字")
+	}
+	base := startPanel(t, deps)
+
+	status, hdr, body := do(t, http.MethodPut, base+"/api/settings", `{"probeWorkers":"abc"}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("PUT 畸形补丁 = %d %s, want 400", status, body)
+	}
+	if !strings.Contains(body, "probeWorkers") {
+		t.Fatalf("body = %q, 应带上校验失败的原因", body)
+	}
+	if ct := hdr.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain（前端直接读文本进 toast）", ct)
 	}
 }
 
