@@ -1,0 +1,7 @@
+# 检出后的字节必须等于 blob 的字节。
+#
+# Windows runner 与本机 git 全局都是 core.autocrlf=true，checkout 会把 LF 换成 CRLF，
+# 于是 CI 的 Go tests 里 TestShellKeepsTrailingNewline 必红 —— 它钉的是 web/index.html
+# 的字节尾巴 `</html>\n`（差分 B10 抓到的唯一一处壳字节差），不是风格。identity 键、
+# 差分固件、逐字节比对的验收记录同理经不起一次换行改写。
+* text=auto eol=lf
