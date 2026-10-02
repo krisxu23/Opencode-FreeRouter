@@ -126,16 +126,24 @@ jobs:
       # zip 里带 web/ 不是冗余：面板是从文件系统读 web/index.html 与 web/app.js 的
       # （resolveWebDir 的第一个候选就是 <exe 目录>/web），单发 exe 就只有转发能用、
       # 打开面板是空白。
-      - name: Package zip + GPL source tarball
+      - name: Package zip
         shell: pwsh
         env:
           TAG: ${{ github.ref_name }}
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path FreeRouter.exe, web, LICENSE, NOTICE, README.md -DestinationPath "dist/FreeRouter-$env:TAG-windows-x64.zip"
+
+      # 必须是 bash 而不是 pwsh：脚本靠 GNU tar 的 --sort=name/--mtime=@0/--owner=0
+      # 保证源码包可复跑，而 pwsh 里 `tar` 解析到 C:\Windows\System32\tar.exe（bsdtar，
+      # 实测 3.8.9 直接「Option --sort=name is not supported」）。Git Bash 的 /usr/bin
+      # 在 PATH 前面，那里的 tar 是本机验证过的 GNU tar 1.35。
+      - name: GPL source tarball
+        shell: bash
+        run: |
           node scripts/make-source-tarball.mjs
-          Copy-Item release/*-source.tar.gz dist/
-          Get-ChildItem dist | Format-Table Name, Length
+          cp release/*-source.tar.gz dist/
+          ls -la dist
 
       - name: Publish
         shell: pwsh
