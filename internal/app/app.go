@@ -287,48 +287,9 @@ func Load(root string) (*Parts, error) {
 
 	// 4. the opening subscription pull, off the critical path. Degradation
 	// rule 1: a total failure keeps the outbounds from step 3 and still opens
-	// the listener.
+	// the listener. The pull itself is launched at step 6.5 — right after
+	// `parts` exists — because it has to record its outcome into lastCheck.
 	firstFetch := make(chan struct{})
-	go func() {
-		defer close(firstFetch)
-		subURLs := settings.SubURLs
-		if len(subURLs) == 0 {
-			logger.Info(fmt.Sprintf("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（%d 个）；注册表为空则以纯直连兜底模式启动", reg.Len()))
-			return
-		}
-		exits := make([]sub.Exit, 0, reg.Len())
-		for _, o := range reg.All() {
-			d, derr := host.Dialer(o.Tag)
-			if derr != nil {
-				continue
-			}
-			exits = append(exits, sub.Exit{Name: o.Tag, Dial: d})
-		}
-		res, ferr := sub.Fetch(ctx, subURLs, exits)
-		if ferr != nil {
-			logger.Warn(fmt.Sprintf("[app] 订阅失败，沿用 %d 个已知出口: %v", reg.Len(), ferr))
-			return
-		}
-		picked := parse.FilterByGroups(res.Outbounds, settings.Countries)
-		clean := make([]parse.Outbound, 0, len(picked))
-		for _, o := range picked {
-			if ok, keep := parse.SanitizeOutbound(o); keep {
-				clean = append(clean, ok)
-			}
-		}
-		merged := reg.Merge(clean)
-		evicted := reg.EnforceCap(registry.PoolCap)
-		if err := reg.Flush(); err != nil {
-			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
-		}
-		syncAdded, syncRemoved, serr := host.SyncOutbounds(reg.All())
-		if serr != nil {
-			logger.Warn(fmt.Sprintf("[app] 热插出站失败: %v", serr))
-			return
-		}
-		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，淘汰 %d），池内现有 %d 个（热插 %d，撤下 %d）",
-			len(clean), merged, evicted, reg.Len(), syncAdded, syncRemoved))
-	}()
 
 	// 5. health
 	h := health.NewHealth(filepath.Join(dataDir, "node-health.json"))
@@ -449,6 +410,62 @@ func Load(root string) (*Parts, error) {
 	if len(bootOverlay) > 0 {
 		catBox.set(parts.applyOverlay(catBox.get()))
 	}
+
+	// 6.5 开场订阅拉取。仍然是后台跑(监听端口不该等网络),但必须等 parts 建好
+	// 再启动:它要把结果记进 lastCheck/lastRebuild。此前这一步在 parts 之前启动,
+	// 于是冷启动路径上没有任何人调用 setRebuildResult —— lastRebuildAt 恒为 0、
+	// lastCheck.ok 恒为 null,前端 checkBadge/checkAlert 对 ok==null 直接返回空串,
+	// 面板顶部的「上次检查」在每次开机后都是永久空白,看起来就像网关什么都没做。
+	go func() {
+		defer close(firstFetch)
+		subURLs := settings.SubURLs
+		if len(subURLs) == 0 {
+			logger.Info(fmt.Sprintf("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（%d 个）；注册表为空则以纯直连兜底模式启动", reg.Len()))
+			parts.setRebuildResult(0, 0, 0, nil)
+			return
+		}
+		exits := make([]sub.Exit, 0, reg.Len())
+		for _, o := range reg.All() {
+			d, derr := host.Dialer(o.Tag)
+			if derr != nil {
+				continue
+			}
+			exits = append(exits, sub.Exit{Name: o.Tag, Dial: d})
+		}
+		res, ferr := sub.Fetch(ctx, subURLs, exits)
+		if ferr != nil {
+			logger.Warn(fmt.Sprintf("[app] 订阅失败，沿用 %d 个已知出口: %v", reg.Len(), ferr))
+			parts.setRebuildResult(0, 0, 0, ferr)
+			return
+		}
+		picked := parse.FilterByGroups(res.Outbounds, settings.Countries)
+		clean := make([]parse.Outbound, 0, len(picked))
+		for _, o := range picked {
+			if ok, keep := parse.SanitizeOutbound(o); keep {
+				clean = append(clean, ok)
+			}
+		}
+		// 订阅里被 sing-box 拒收的节点数(非法 uuid / 不认的 cipher / 未知传输)。
+		// 前端拿它显示「剔除 N 个坏节点」,不传过去那条告警就永远不出现。
+		dropped := len(picked) - len(clean)
+		merged := reg.Merge(clean)
+		evicted := reg.EnforceCap(registry.PoolCap)
+		if err := reg.Flush(); err != nil {
+			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
+		}
+		syncAdded, syncRemoved, serr := host.SyncOutbounds(reg.All())
+		if dropped > 0 {
+			logger.Warn(fmt.Sprintf("[app] 订阅里有 %d 个节点 sing-box 无法使用（非法 uuid / 不认的 cipher / 未知传输），未入池", dropped))
+		}
+		if serr != nil {
+			logger.Warn(fmt.Sprintf("[app] 热插出站失败: %v", serr))
+			parts.setRebuildResult(syncAdded, syncRemoved, dropped, serr)
+			return
+		}
+		parts.setRebuildResult(syncAdded, syncRemoved, dropped, nil)
+		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，淘汰 %d），池内现有 %d 个（热插 %d，撤下 %d）",
+			len(clean), merged, evicted, reg.Len(), syncAdded, syncRemoved))
+	}()
 
 	// 7. the forward listener, last: the port may only open once it can serve.
 	srv := forward.New(forward.Config{

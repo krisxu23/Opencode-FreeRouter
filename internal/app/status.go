@@ -131,7 +131,9 @@ func (p *Parts) StartTimers(ctx context.Context) {
 // 用 wait 而不是 afterFunc:后者在 timersWG 上记一笔、只有回调真跑完才 Done,于是
 // 一个被 ctx 取消掉的定时器会把 Wait 挂到超时为止。
 func (p *Parts) warmUp(ctx context.Context) {
-	p.refreshCatalog(ctx)
+	// 首探的定时器先挂上,再刷目录。原先 refreshCatalog 同步跑在定时器之前,而它
+	// 最坏要等 3 个节点出口各 20s 再加直连 12s(约 72s),期间 StartTimers 里紧跟
+	// 其后的 probeLoop 也被一并挡住 —— 面板因此在开机后一分多钟里什么都不显示。
 	p.timersWG.Add(1)
 	go func() {
 		defer p.timersWG.Done()
@@ -143,6 +145,11 @@ func (p *Parts) warmUp(ctx context.Context) {
 		// 与 Rebuild 的首探同口径:force=false,新鲜结果不重测。已有轮在跑就放弃
 		// —— 首探是尽力而为,排队只会让它变成紧接着的第二轮全量实测。
 		_, _ = p.ProbeNow(ctx, false)
+	}()
+	p.timersWG.Add(1)
+	go func() {
+		defer p.timersWG.Done()
+		p.refreshCatalog(ctx)
 	}()
 }
 
@@ -209,24 +216,26 @@ func (p *Parts) limitsLoop(ctx context.Context) {
 // 正文写「绝不回显 key」并称 JS 也没回显 —— 那半句与 JS 源码相反,按 JS 裁决
 // (修正案阶段 4 条目)。
 func (p *Parts) Status() any {
-	lastRebuildAt, lastOK, lastErr, dropped := func() (int64, bool, string, int) {
+	// 一次加锁读全部重建状态:lastRebuild.added/removed 原先在锁外裸读,和
+	// setRebuildResult 的写构成数据竞争(-race 下会报)。
+	lastRebuildAt, lastOK, lastErr, dropped, lastAdded, lastRemoved, mode := func() (int64, bool, string, int, int, int, string) {
 		p.rebuildStateMu.Lock()
 		defer p.rebuildStateMu.Unlock()
-		return p.lastRebuildAt, p.lastRebuildOK, p.lastRebuildErr, p.lastDropped
+		mode := ""
+		// 纯直连兜底:跑过重建但池子空着,且本轮没有热插任何出站。
+		if p.lastRebuildAt != 0 && p.Registry.Len() == 0 && p.lastAdded == 0 && p.lastRemoved == 0 {
+			mode = "direct"
+		}
+		return p.lastRebuildAt, p.lastRebuildOK, p.lastRebuildErr, p.lastDropped, p.lastAdded, p.lastRemoved, mode
 	}()
 
 	// lastCheck 的形状对齐 src/index.js:1070:ok 为 null 表示「还没跑过重建」,
-	// 前端 checkBadge 对 ok==null 返回空串(不显示任何徽标)。
+	// 前端 checkBadge 对 ok==null 返回空串(不显示任何徽标)。冷启动路径现在会
+	// 记这一次(app.go 步骤 6.5),所以开机几秒后这里就有值了。
 	var okValue any
 	if lastRebuildAt != 0 {
 		okValue = lastOK
 	}
-	mode := ""
-	p.rebuildStateMu.Lock()
-	if lastRebuildAt != 0 && p.Registry.Len() == 0 && (p.lastAdded == 0 && p.lastRemoved == 0) {
-		mode = "direct" // 纯直连兜底:注册表空且本轮没有热插任何出站
-	}
-	p.rebuildStateMu.Unlock()
 
 	singbox := map[string]any{
 		"running": true, // 零端口架构:sing-box 与本进程同生死,进程在即 running
@@ -234,6 +243,7 @@ func (p *Parts) Status() any {
 		"lastCheck": map[string]any{
 			"ok":        okValue,
 			"dropped":   dropped,
+			"nodes":     p.Registry.Len(), // 前端 checkAlert 的「N 个节点正常启用」读它
 			"probation": p.probationCount(),
 			"at":        lastRebuildAt,
 			"mode":      mode,
@@ -241,8 +251,8 @@ func (p *Parts) Status() any {
 		},
 		"lastRebuild": map[string]any{
 			"ok":      lastOK,
-			"added":   p.lastAdded,
-			"removed": p.lastRemoved,
+			"added":   lastAdded,
+			"removed": lastRemoved,
 			"at":      lastRebuildAt,
 		},
 	}

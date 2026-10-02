@@ -154,7 +154,7 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	// 出站集合没变就不刷新目录:目录刷新会打一次上游,而「什么都没变」
 	// 是稳态下最常见的情况(每 6 小时一次重建)。
 	added, removed, syncErr := p.Host.SyncOutbounds(p.Registry.All())
-	p.setRebuildResult(added, removed, syncErr)
+	p.setRebuildResult(added, removed, dropped, syncErr)
 	if syncErr != nil {
 		logger.Warn(fmt.Sprintf("[app] 热插出站部分失败: %v", syncErr))
 	}
@@ -257,12 +257,15 @@ func (p *Parts) noteSubFailure(ctx context.Context) {
 	})
 }
 
-// setRebuildResult 记录最近一次热插的结果,面板的「上次重建」就显示它。
-func (p *Parts) setRebuildResult(added, removed int, err error) {
+// setRebuildResult 记录最近一次热插的结果,面板的「上次重建」与「上次检查」都显示
+// 它。dropped 是订阅里被 sing-box 拒收的节点数 —— 前端 checkBadge 的「剔除 N 个
+// 坏节点」和 checkAlert 的整句都读它,不记就等于那条告警永远不出现。
+func (p *Parts) setRebuildResult(added, removed, dropped int, err error) {
 	p.rebuildStateMu.Lock()
 	defer p.rebuildStateMu.Unlock()
 	p.lastAdded = added
 	p.lastRemoved = removed
+	p.lastDropped = dropped
 	p.lastRebuildAt = p.nowMS()
 	p.lastRebuildOK = err == nil
 	if err != nil {
