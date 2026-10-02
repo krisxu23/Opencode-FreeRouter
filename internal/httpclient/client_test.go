@@ -3,6 +3,8 @@ package httpclient
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -52,5 +54,91 @@ func TestClientRejectsRedirectsToAnotherHost(t *testing.T) {
 	resp, err := c.Get(other.URL)
 	if err == nil {
 		_ = resp.Body.Close()
+	}
+}
+
+// TestStreamClientAllowsAResponseLongerThanTheIdleWindow 钉住流式客户端与
+// NewClient 的关键差别：死线是**空闲**截止，不是整请求截止。JS 权威在
+// http.js:185（timeoutMs=300000）与 :235（每收到一块就 deadline = now +
+// timeoutMs 续期）。整请求死线会让一个正常吐 40 秒的回复在第 20 秒被腰斩。
+func TestStreamClientAllowsAResponseLongerThanTheIdleWindow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher := w.(http.Flusher)
+		for i := 0; i < 6; i++ {
+			_, _ = io.WriteString(w, "data: chunk\n\n")
+			flusher.Flush()
+			time.Sleep(40 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+	// 空闲窗口 120ms，而整条响应要 ~240ms：整请求死线必然失败，空闲死线必须成功。
+	c := NewStreamClient(nil, 120*time.Millisecond)
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("stream client rejected a response that kept sending: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(raw) == 0 {
+		t.Fatal("read no body")
+	}
+}
+
+// TestStreamClientAbortsAnIdleStream 钉住另一半：真正停发时必须在空闲窗口后
+// 报错，且错误要能被认出来 —— 引擎把它当 TIMEOUT（可重试、可冷却），而不是
+// 掉进 classifyAttemptError 的 SERVER 兜底。
+func TestStreamClientAbortsAnIdleStream(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		<-release // 只停发，不关流：JS 注释 http.js:180-184 描述的那种源
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := NewStreamClient(nil, 120*time.Millisecond)
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	started := time.Now()
+	_, err = io.ReadAll(resp.Body)
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("expected the idle deadline to abort the read, got nil")
+	}
+	if !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("want ErrIdleTimeout, got %v", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("idle deadline fired far too late: %s", elapsed)
+	}
+}
+
+// TestStreamClientStillWorksForAWholeBodyRead 保证空闲读不会被包装器自己打断：
+// 一次快速完成的整包读取必须原样返回。
+func TestStreamClientStillWorksForAWholeBodyRead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hello")
+	}))
+	defer srv.Close()
+	c := NewStreamClient(nil, 5*time.Second)
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(raw) != "hello" {
+		t.Fatalf("body = %q", raw)
 	}
 }

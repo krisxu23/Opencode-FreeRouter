@@ -44,6 +44,12 @@ import (
 	"freerouter/internal/upstream"
 )
 
+// streamIdleTimeout 是流式回合的空闲截止（B1）。JS 权威
+// archive/node/src/http.js:103/:185 默认 300000ms，且 :235 每收到一块就续期。
+// 它不是整请求死线：一次正常的回复可以吐 40 秒以上，整请求死线会在中途把它
+// 腰斩，而客户端看到的是一个被截断的回复加一个 502。
+const streamIdleTimeout = 300 * time.Second
+
 // Settings is the slice of data/settings.json this phase reads.
 //
 // The JSON names are kept identical to the JS version's so a legacy settings
@@ -366,7 +372,11 @@ func Load(root string) (*Parts, error) {
 			// One connection pool per exit: sharing http.DefaultTransport's
 			// idle connections would let one exit's socket be reused for
 			// another exit's request.
-			return httpclient.NewClient(d, 20*time.Second), nil
+			//
+			// 流式回合用的是空闲死线而不是整请求死线（B1）：一次正常的回复
+			// 可以吐 40 秒以上，20s 的整请求死线会在第 20 秒把它腰斩。JS 权威
+			// 是 300s 空闲（archive/node/src/http.js:103/:185，每块续期）。
+			return httpclient.NewStreamClient(d, streamIdleTimeout), nil
 		},
 		AdapterDeps: adapter.Deps{
 			Base: upstream.UpstreamBase,
