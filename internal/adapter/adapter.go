@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"io"
 	"math"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"freerouter/internal/check"
 	"freerouter/internal/effort"
 	"freerouter/internal/errors"
+	"freerouter/internal/httpclient"
 	"freerouter/internal/messages"
 	"freerouter/internal/stream"
 	"freerouter/internal/upstream"
@@ -131,6 +133,12 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, onChunk func(string) er
 	}
 	resp, err := a.deps.Client.Do(httpReq)
 	if err != nil {
+		// 空闲截止先于 ctx 检查：NewStreamClient 的头阶段超时就是靠取消
+		// 自己的 context 实现的，先看 ctx.Err() 会把它误判成「客户端中止」
+		// （CodeAborted 不可重试、不冷却），而它其实是一个该换出口的 TIMEOUT。
+		if stderrors.Is(err, httpclient.ErrIdleTimeout) {
+			return *acc, errors.Failure{Code: check.CodeTimeout, Message: err.Error(), Retryable: true}
+		}
 		// JS 对中止与传输失败分开记码(http.js:110-111):客户端取消不是
 		// 「换个出口」能治的传输抖动,引擎对 CodeAborted 也不冷却。
 		if ctx.Err() != nil {
@@ -155,9 +163,24 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, onChunk func(string) er
 		return *acc, errors.Classify(resp.StatusCode, raw, errors.RetryAfter(resp.Header.Get("Retry-After")))
 	}
 	if err := a.readReply(resp, t, onChunk, acc, firstContent); err != nil {
-		return *acc, err
+		return *acc, idleOrPassthrough(err)
 	}
 	return *acc, nil
+}
+
+// idleOrPassthrough 把 httpclient 的空闲截止翻译成 TIMEOUT。
+//
+// 引擎的 retryOn 与 cooldownOn 都含 CodeTimeout：一个卡死的出口该被冷却并换掉。
+// 不翻译的话它会掉进 classifyAttemptError 的 SERVER 兜底 —— 那等于把「这个出口
+// 不回话了」记成「供应商故障」，同一个出口会被反复选中（B1 的另一半）。
+func idleOrPassthrough(err error) error {
+	if err == nil {
+		return nil
+	}
+	if stderrors.Is(err, httpclient.ErrIdleTimeout) {
+		return errors.Failure{Code: check.CodeTimeout, Message: err.Error(), Retryable: true}
+	}
+	return err
 }
 
 // replay 把剥过字段的 body 重发**一次**(js http.js:128-136)。重放又被拒时按

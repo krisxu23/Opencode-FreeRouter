@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -95,9 +96,13 @@ func (t *idleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 一返回就 defer cancel 会把刚拿到的 body 立刻取消掉（实测症状是
 	// "context canceled"）。所以正常路径把它交给 idleReader，由 Close 释放。
 	ctx, cancel := context.WithCancel(req.Context())
+	var headerExpired atomic.Bool
 	var headerTimer *time.Timer
 	if t.idle > 0 {
-		headerTimer = time.AfterFunc(t.idle, cancel)
+		headerTimer = time.AfterFunc(t.idle, func() {
+			headerExpired.Store(true)
+			cancel()
+		})
 	}
 	resp, err := t.base.RoundTrip(req.WithContext(ctx))
 	if headerTimer != nil {
@@ -105,6 +110,12 @@ func (t *idleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	if err != nil {
 		cancel()
+		// 头阶段的超时在底层看起来是 context canceled（我们自己取消的），
+		// 对调用方要的是同一个空闲超时语义 —— 否则它会被归成「客户端中止」
+		// 而不是可重试的 TIMEOUT。
+		if headerExpired.Load() {
+			return nil, ErrIdleTimeout
+		}
 		return resp, err
 	}
 	if resp.Body != nil {

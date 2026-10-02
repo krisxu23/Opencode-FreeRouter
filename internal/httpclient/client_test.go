@@ -121,6 +121,41 @@ func TestStreamClientAbortsAnIdleStream(t *testing.T) {
 	}
 }
 
+// TestStreamClientAbortsAStreamThatNeverSendsHeaders 覆盖响应头阶段的空闲
+// 截止。引擎默认没有墙钟上限，一个接受连接却永不发头的上游（或者连 TCP 都
+// 没建起来的那种）会让请求挂到天荒；NewStreamClient 必须自己把这一段收掉。
+func TestStreamClientAbortsAStreamThatNeverSendsHeaders(t *testing.T) {
+	release := make(chan struct{})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-release // 收下连接，一个字都不写
+	}()
+	defer close(release)
+
+	c := NewStreamClient(nil, 120*time.Millisecond)
+	started := time.Now()
+	_, err = c.Get("http://" + ln.Addr().String())
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("expected the header deadline to abort the request, got nil")
+	}
+	if !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("want ErrIdleTimeout, got %v", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("header deadline fired far too late: %s", elapsed)
+	}
+}
+
 // TestStreamClientStillWorksForAWholeBodyRead 保证空闲读不会被包装器自己打断：
 // 一次快速完成的整包读取必须原样返回。
 func TestStreamClientStillWorksForAWholeBodyRead(t *testing.T) {

@@ -17,6 +17,7 @@ import (
 	"freerouter/internal/check"
 	"freerouter/internal/effort"
 	"freerouter/internal/errors"
+	"freerouter/internal/httpclient"
 	"freerouter/internal/messages"
 	"freerouter/internal/stream"
 	"freerouter/internal/upstream"
@@ -559,6 +560,41 @@ func TestInputTokensAreUncachedAcrossEveryWire(t *testing.T) {
 				t.Fatalf("usage = %+v, want in=%d (uncached input, js stream.js:122)", usage, tc.want)
 			}
 		})
+	}
+}
+
+// TestIdleUpstreamIsClassifiedAsTimeout 钉住 B1 的另一半：空闲截止必须被认成
+// TIMEOUT，而不是掉进 classifyAttemptError 的 SERVER 兜底。
+//
+// 引擎的 retryOn 与 cooldownOn 都含 CodeTimeout —— 一个停发不关流的出口该被
+// 冷却并换掉。归成 SERVER 的话引擎会把「这个出口不回话了」记成「供应商故障」，
+// 下一次还会挑同一个出口，客户端则收到 502 而看不到真正的病因。
+func TestIdleUpstreamIsClassifiedAsTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		w.(http.Flusher).Flush()
+		<-release // 只停发，不关流
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	// 空闲窗口 120ms，上游停发：adapter 必须报 TIMEOUT。
+	a := newAdapter(srv.URL, httpclient.NewStreamClient(nil, 120*time.Millisecond), "big-pickle")
+	_, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collect(&strings.Builder{}))
+	if err == nil {
+		t.Fatal("want a failure from the idle upstream")
+	}
+	if code := errors.CodeOf(err); code != check.CodeTimeout {
+		t.Fatalf("code = %q, want %q (idle deadline must be a retryable TIMEOUT)", code, check.CodeTimeout)
+	}
+	if failure, ok := err.(errors.Failure); !ok || !failure.Retryable {
+		t.Fatalf("failure = %#v, want Retryable", err)
 	}
 }
 
