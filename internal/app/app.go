@@ -112,6 +112,22 @@ type Parts struct {
 	shutdownOnce  sync.Once
 	shutdownErr   error
 
+	// ---- 生命周期(B9) ----
+	//
+	// lifeCtx 是所有后台定时器与重跑回调的根 context。从前 afterFunc 的回调里
+	// 写死 context.Background(),于是 Shutdown 取消 ctx 之后这些定时器照样触发、
+	// 以全新 context 重入 Rebuild/ProbeNow,继续写注册表、健康表和日志;而
+	// Shutdown 也从不 join timersWG,回调可以在关停流程跑完后仍在运行。
+	//
+	// lifeCtx 由 Load 建立(它的 cancel 就是 p.cancel);StartTimers 把调用方的
+	// ctx(生产里是 main 的信号 ctx)桥接进来。
+	lifeCtx context.Context
+
+	// timersMu 保护 timers。afterFunc 登记,回调与 Shutdown 摘除 ——
+	// 回调跑完必须自己摘掉,否则长时间运行会无限攒定时器指针。
+	timersMu sync.Mutex
+	timers   []*time.Timer
+
 	// ---- 探测轮次状态(probe.go) ----
 	probing         atomic.Bool
 	probeRerunMu    sync.Mutex
@@ -445,6 +461,9 @@ func Load(root string) (*Parts, error) {
 		limitsRows:      len(bootOverlay),
 		settingsStore:   store,
 		cancel:          cancel,
+		// B9:生命周期根 context。它的 cancel 就是 p.cancel,所以
+		// Shutdown 取消它 = 所有后台定时器与重跑回调同时失去根。
+		lifeCtx: ctx,
 	}
 
 	if len(bootOverlay) > 0 {
@@ -573,9 +592,11 @@ func Load(root string) (*Parts, error) {
 				return err
 			},
 			// Refresh/RefreshLimits 的签名没有 ctx:重建自带 180s 总预算,
-			// 限额刷新自带单次超时,都不需要外层取消。
-			Refresh:       func() error { return parts.Rebuild(context.Background()) },
-			RefreshLimits: func() error { return parts.refreshLimitsOverlay(context.Background()) },
+			// 限额刷新自带单次超时,都不需要外层取消。但根必须是 lifeCtx
+			// 而不是 context.Background()(B9):面板上的手动刷新一旦发生在
+			// 关停之后,不能再以全新 context 重入重建、继续写注册表。
+			Refresh:       func() error { return parts.Rebuild(parts.ctx()) },
+			RefreshLimits: func() error { return parts.refreshLimitsOverlay(parts.ctx()) },
 		},
 		Logs:        logger.Recent,
 		RouteRecent: tracelog.Recent,
@@ -601,14 +622,35 @@ func Load(root string) (*Parts, error) {
 
 // Shutdown stops the listener, flushes every store and closes the sing-box
 // host. Safe to call twice, and safe on the zero Parts after a failed Load.
+//
+// B9:它同时要**收回后台定时器**。从前这里丢掉传入的 ctx,也从不 join
+// timersWG,于是关停之后排着的 afterFunc 仍会触发,并且用写死的
+// context.Background() 重入 Rebuild/ProbeNow —— 托盘「退出」之后还在写
+// node-registry.json、node-health.json 与网关日志。现在顺序是:取消 lifeCtx
+// (所有回调的根)→ 停掉待触发定时器 → join 定时器与循环 → 才关监听/落盘/
+// 关 host。join 用调用方的 ctx 兜底,免得一个卡在慢网络里的在途轮次把退出
+// 永久挂住。
 func (p *Parts) Shutdown(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
-	_ = ctx
 	p.shutdownOnce.Do(func() {
 		if p.cancel != nil {
 			p.cancel()
+		}
+		p.stopPendingTimers()
+		if ctx != nil {
+			done := make(chan struct{})
+			go func() {
+				p.timersWG.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+		} else {
+			p.timersWG.Wait()
 		}
 		if p.Forward != nil {
 			_ = p.Forward.Close()

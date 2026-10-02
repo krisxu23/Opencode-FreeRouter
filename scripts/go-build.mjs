@@ -21,13 +21,42 @@
  */
 
 import { execFile } from 'node:child_process'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 export const TAGS = 'with_quic,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0'
-export const LDFLAGS = '-checklinkname=0 -s -w -buildid= -X runtime.godebugDefault=multipathtcp=0,tlssha1=1'
+
+/**
+ * The product version shown in the console, read from package.json.
+ *
+ * It used to be a `const Version = "0.4.5"` in internal/app/status.go that
+ * nobody bumped when package.json moved on to 1.0.2, so the console title
+ * lied. The version now lives in exactly one place and reaches the binary
+ * through the linker: `-X freerouter/internal/app.Version=...`. That is also
+ * why app.Version is a `var` — `-X` only writes variables.
+ *
+ * Falling back to a dev marker rather than throwing keeps a bare `go build`
+ * working on a checkout whose package.json is missing; the console then shows
+ * "v0.0.0-dev", which is honest.
+ */
+export function readProductVersion() {
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
+    if (typeof pkg.version === 'string' && pkg.version.length > 0) return pkg.version
+  } catch {
+    /* missing or malformed package.json: fall through to the dev marker */
+  }
+  return '0.0.0-dev'
+}
+
+export const VERSION = readProductVersion()
+
+export const LDFLAGS =
+  '-checklinkname=0 -s -w -buildid= ' +
+  '-X runtime.godebugDefault=multipathtcp=0,tlssha1=1 ' +
+  `-X freerouter/internal/app.Version=${VERSION}`
 
 /** Offline env. Every go invocation in this project goes through here. */
 export function goEnv(extra = {}) {

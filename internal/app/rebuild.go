@@ -9,6 +9,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -126,8 +127,8 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	settings := p.settingsSnapshot()
 	before := p.Registry.Len()
 
-	picked, fetchFailed, dropped := p.fetchSubscriptions(ctx, settings)
-	if fetchFailed {
+	picked, fetchErr, dropped := p.fetchSubscriptions(ctx, settings)
+	if fetchErr != nil {
 		p.noteSubFailure(ctx)
 	} else {
 		p.subFetchRetries = 0
@@ -154,7 +155,11 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	// 出站集合没变就不刷新目录:目录刷新会打一次上游,而「什么都没变」
 	// 是稳态下最常见的情况(每 6 小时一次重建)。
 	added, removed, syncErr := p.Host.SyncOutbounds(p.Registry.All())
-	p.setRebuildResult(added, removed, dropped, syncErr)
+	// B11:两路失败都要冒泡 —— 订阅拉不到、出站热插失败。注册表本身已经
+	// 按「沿用历史节点」降级处理过,调用方拿到的是「这轮重建有没有全须全尾
+	// 地成功」,面板据此给 toast,托盘据此给提示。
+	rebuildErr := errors.Join(fetchErr, syncErr)
+	p.setRebuildResult(added, removed, dropped, rebuildErr)
 	if syncErr != nil {
 		logger.Warn(fmt.Sprintf("[app] 热插出站部分失败: %v", syncErr))
 	}
@@ -180,14 +185,19 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 			return
 		}
 	})
-	return nil
+	return rebuildErr
 }
 
-// fetchSubscriptions 拉取并筛选订阅。返回值:picked 是整形后的出站、fetchFailed
-// 表示「一个源都没拉到」(要用缓存/历史节点)、dropped 是被 sing-box 拒收的节点数。
-func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]parse.Outbound, bool, int) {
+// fetchSubscriptions 拉取并筛选订阅。返回值:picked 是整形后的出站、fetchErr
+// 表示「一个源都没拉到」(要用缓存/历史节点;非 nil 才算失败)、dropped 是被
+// sing-box 拒收的节点数。
+//
+// B11:从前这里回的是 bool,而 Rebuild 无论订阅成不成、出站热插有没有报错都
+// `return nil`。于是面板「刷新」永远 toast 成功、托盘 Reload 永远静默 ——
+// 哪怕订阅全军覆没。现在把失败原样交出去,由 Rebuild 聚合后上报。
+func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]parse.Outbound, error, int) {
 	if len(settings.SubURLs) == 0 {
-		return nil, false, 0
+		return nil, nil, 0
 	}
 	exits := p.subExits()
 	budget, cancel := context.WithTimeout(ctx, subFetchBudget)
@@ -195,7 +205,7 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 	res, err := sub.Fetch(budget, settings.SubURLs, exits)
 	if err != nil {
 		logger.Warn(fmt.Sprintf("[app] 订阅失败，沿用 %d 个已知出口: %v", p.Registry.Len(), err))
-		return nil, true, 0
+		return nil, err, 0
 	}
 	picked := parse.FilterByGroups(res.Outbounds, settings.Countries)
 	clean := make([]parse.Outbound, 0, len(picked))
@@ -208,7 +218,7 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 		}
 		clean = append(clean, sanitized)
 	}
-	return clean, false, dropped
+	return clean, nil, dropped
 }
 
 // subExits 是拉订阅时可以借用的出口。只取健康表判活的节点,且最多

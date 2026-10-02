@@ -535,8 +535,10 @@ func TestRebuildKeepsOldOutboundsWhenAllSubsFail(t *testing.T) {
 	swallowTimers(p)
 	url := subAndCatalogServer(t, "boom", "boom", http.StatusInternalServerError)
 	p.Settings.SubURLs = []string{url}
-	if err := p.Rebuild(context.Background()); err != nil {
-		t.Fatalf("rebuild: %v", err)
+	// B11:订阅全挂必须上报失败,而不是永远 nil。降级(不清池子)与上报是
+	// 两件事:池子照旧,但调用方要知道这一轮没成功。
+	if err := p.Rebuild(context.Background()); err == nil {
+		t.Fatal("订阅全挂时 Rebuild 必须返回错误")
 	}
 	if p.Registry.Len() != 3 {
 		t.Fatalf("registry len = %d, want 3 (订阅全挂不清池子)", p.Registry.Len())
@@ -556,8 +558,10 @@ func TestRebuildRetriesTwiceThenGivesUp(t *testing.T) {
 		got <- captured{d, fn}
 		return nil
 	}
-	if err := p.Rebuild(context.Background()); err != nil {
-		t.Fatalf("rebuild: %v", err)
+	// B11:补偿重试的每一轮都是失败的一轮,所以每轮都返回错误 —— 但重试
+	// 排程本身不受影响,这里只断言排了两次就不再排。
+	if err := p.Rebuild(context.Background()); err == nil {
+		t.Fatal("订阅全挂时 Rebuild 必须返回错误")
 	}
 	// 首探/目录重试的 afterFunc 混在同一个通道里,只对 subRetryDelay 的
 	// 捕获计数并触发;两次补偿重试之后不再安排。

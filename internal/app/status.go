@@ -23,14 +23,29 @@ import (
 	"freerouter/internal/upstream"
 )
 
-// Version 是控制台显示的产品版本。来源与 package.json 的 version 字段一致
-// (阶段 5 任务 29 改为 1.0.0 后同步这里)。
-const Version = "0.4.5"
+// Version 是控制台显示的产品版本。它由构建脚本从 package.json 的 version
+// 字段注入(-X freerouter/internal/app.Version=…,见 scripts/go-build.mjs),
+// 所以面板标题永远跟着 package.json 走,不会再像 B12 那样停在手写的 0.4.5。
+//
+// 必须是 var 而不是 const:-X 只作用于变量。裸 `go build`/`go test`(不经过
+// 构建脚本)拿到的是下面的开发默认值。
+var Version = "0.0.0-dev"
 
 // ---- 时钟与定时器接缝 ----
 //
 // 测试不能真的等 5 分钟或 6 小时:now/afterFunc/wait 走 Parts 上的可替换字段,
 // 生产路径零开销(time.Now / time.AfterFunc / time.After)。
+
+// ctx 是后台任务的根 context(B9)。定时器回调里绝不能再写
+// context.Background():关停之后那样会以全新 context 重入,继续写盘、打日志。
+// 零值 Parts(Load 失败后)没有 lifeCtx,回落到 Background 只为让调用方不必
+// 到处判空 —— 那种 Parts 上不会有定时器被排出来。
+func (p *Parts) ctx() context.Context {
+	if p.lifeCtx != nil {
+		return p.lifeCtx
+	}
+	return context.Background()
+}
 
 func (p *Parts) now() time.Time {
 	if p.clockFn != nil {
@@ -41,16 +56,67 @@ func (p *Parts) now() time.Time {
 
 func (p *Parts) nowMS() int64 { return p.now().UnixMilli() }
 
+// afterFunc 排一个延时回调,并把定时器登记进 p.timers 以便关停时统一停掉。
+// 回调在 fn() 之前先把自己摘出登记表:否则进程跑上几天,这个切片会跟着
+// 每轮探测/重建无限增长。
 func (p *Parts) afterFunc(d time.Duration, fn func()) *time.Timer {
 	p.timersWG.Add(1)
+	var self *time.Timer
 	wrapped := func() {
 		defer p.timersWG.Done()
+		p.forgetTimer(self)
 		fn()
 	}
 	if p.afterFuncFn != nil {
-		return p.afterFuncFn(d, wrapped)
+		self = p.afterFuncFn(d, wrapped)
+	} else {
+		self = time.AfterFunc(d, wrapped)
 	}
-	return time.AfterFunc(d, wrapped)
+	p.rememberTimer(self)
+	return self
+}
+
+// rememberTimer/forgetTimer 维护 p.timers。测试接缝 afterFuncFn 允许返回 nil
+// (swallowTimers 就是这么做的),nil 不登记 —— 它本来就不会触发,也没有
+// Stop 可以调。
+func (p *Parts) rememberTimer(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	p.timersMu.Lock()
+	p.timers = append(p.timers, t)
+	p.timersMu.Unlock()
+}
+
+func (p *Parts) forgetTimer(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	p.timersMu.Lock()
+	for i, cur := range p.timers {
+		if cur == t {
+			p.timers = append(p.timers[:i], p.timers[i+1:]...)
+			break
+		}
+	}
+	p.timersMu.Unlock()
+}
+
+// stopPendingTimers 停掉所有还没触发的定时器,并替它们把 timersWG 的计数还上。
+//
+// 关键点:Stop 返回 true 表示回调不会再跑,于是 wrapped 里的 Done 永远不会执行。
+// 计数是 Add 在排定时器时加的,所以必须由这里补 Done,否则随后的 timersWG.Wait
+// 会一直挂到 ctx 超时为止(B9 的另一半)。
+func (p *Parts) stopPendingTimers() {
+	p.timersMu.Lock()
+	pending := p.timers
+	p.timers = nil
+	p.timersMu.Unlock()
+	for _, t := range pending {
+		if t.Stop() {
+			p.timersWG.Done()
+		}
+	}
 }
 
 // wait 返回一个在 d 后闭合的通道。probeTicker 间隔每轮重读
@@ -89,37 +155,53 @@ func (p *Parts) probeInterval() time.Duration {
 // StartTimers 起三个周期任务:探测、订阅重建、限额覆盖层刷新
 // (间隔照抄 src/index.js:1102-1104)。它们都阻塞在 firstFetch 上再进第一轮:
 // 宁可晚几秒,也不要对着空池子空转。
+//
+// 传入的 ctx 是调用方的生命周期信号(生产里是 main 的 signal.NotifyContext)。
+// Load 已经建好了 lifeCtx,这里只把它桥接起来:调用方 ctx 一旦取消,p.cancel
+// 就取消 lifeCtx,三个循环与所有重跑定时器一起退出。测试/嵌入场景直接造 Parts
+// (没有经过 Load)时 lifeCtx 为空,这里就地建一个,行为一致。
 func (p *Parts) StartTimers(ctx context.Context) {
+	if p.lifeCtx == nil {
+		life, cancel := context.WithCancel(ctx)
+		p.lifeCtx = life
+		p.cancel = cancel
+	} else if p.cancel != nil {
+		// Stop 函数随 AfterFunc 一起留着 —— 丢掉它会让 ctx 一直持有这个回调,
+		// 直到 ctx 自己被回收为止。
+		_ = context.AfterFunc(ctx, p.cancel)
+	}
+	life := p.lifeCtx
+
 	if p.firstFetch != nil {
 		p.timersWG.Add(1)
 		go func() {
 			defer p.timersWG.Done()
 			select {
-			case <-ctx.Done():
+			case <-life.Done():
 				return
 			case <-p.firstFetch:
 			}
-			p.warmUp(ctx)
-			p.probeLoop(ctx)
+			p.warmUp(life)
+			p.probeLoop(life)
 		}()
 
 		p.timersWG.Add(1)
 		go func() {
 			defer p.timersWG.Done()
 			select {
-			case <-ctx.Done():
+			case <-life.Done():
 				return
 			case <-p.firstFetch:
 			}
-			p.rebuildLoop(ctx)
+			p.rebuildLoop(life)
 		}()
 	} else {
 		p.timersWG.Add(2)
-		go func() { defer p.timersWG.Done(); p.probeLoop(ctx) }()
-		go func() { defer p.timersWG.Done(); p.rebuildLoop(ctx) }()
+		go func() { defer p.timersWG.Done(); p.probeLoop(life) }()
+		go func() { defer p.timersWG.Done(); p.rebuildLoop(life) }()
 	}
 	p.timersWG.Add(1)
-	go func() { defer p.timersWG.Done(); p.limitsLoop(ctx) }()
+	go func() { defer p.timersWG.Done(); p.limitsLoop(life) }()
 }
 
 // warmUp 是开场订阅落定与周期循环之间的那段:刷新模型目录,并在 firstProbeDelay

@@ -148,7 +148,14 @@ func (p *Parts) finishProbeRound() {
 		return
 	}
 	p.afterFunc(time.Second, func() {
-		if _, err := p.ProbeNow(context.Background(), rerunForce); err != nil {
+		// B9:重跑必须挂在 lifeCtx 上。从前这里写死 context.Background(),
+		// 是四个复活点里唯一连 ctx.Err() 都不查的:关停之后这一秒的定时器
+		// 照样触发,以全新 context 跑完一整轮探测。
+		ctx := p.ctx()
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := p.ProbeNow(ctx, rerunForce); err != nil {
 			logger.Warn(fmt.Sprintf("[app] 探测重跑失败: %v", err))
 		}
 	})
