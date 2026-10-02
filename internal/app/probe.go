@@ -160,7 +160,7 @@ func (p *Parts) finishProbeRound() {
 // 是 <=,于是每隔一轮就整轮跳过,刷新频率被静默腰斩。下限两分钟是因为
 // probeIntervalMin=5 时半周期只剩 2.5 分钟。
 func (p *Parts) cacheWindowMS() int64 {
-	cycleMin := p.Settings.ProbeIntervalMin
+	cycleMin := p.settingsSnapshot().ProbeIntervalMin
 	if cycleMin < 5 {
 		cycleMin = 5 // src/index.js:818 的 Math.max(5, probeIntervalMin)
 	}
@@ -180,7 +180,8 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 	started := p.nowMS()
 	summary := ProbeSummary{At: started, SourceAddr: "direct"}
 
-	if p.Settings == nil || !p.Settings.ProbeEnabled {
+	cur := p.settingsSnapshot()
+	if !cur.ProbeEnabled {
 		// 面板关掉探测就整轮不跑,连日志都不打:这不是失败,是用户的选择。
 		return summary, nil
 	}
@@ -366,7 +367,7 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 
 // probeWorkers 复刻 src/index.js:893 的 workers 公式。
 func (p *Parts) probeWorkers(n int) int {
-	workers := p.Settings.ProbeWorkers
+	workers := p.settingsSnapshot().ProbeWorkers
 	if q := (n + 3) / 4; q > workers {
 		workers = q
 	}

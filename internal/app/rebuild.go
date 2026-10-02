@@ -123,7 +123,7 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 		}
 	}()
 
-	settings := *p.Settings
+	settings := p.settingsSnapshot()
 	before := p.Registry.Len()
 
 	picked, fetchFailed, dropped := p.fetchSubscriptions(ctx, settings)
@@ -481,8 +481,13 @@ func (p *Parts) refreshLimitsOverlay(ctx context.Context) error {
 	now := p.now()
 	p.overlayMu.Lock()
 	byID := p.overlayByID
-	fetchedAt := p.limitsFetchedAt
 	p.overlayMu.Unlock()
+	// B8:fetchedAt 与 limitsRows/limitsStale 是同一份状态,必须同一把锁 ——
+	// 从前这里在 overlayMu 下读、在 limitsMu 下写,两把锁各自「正确」合起来
+	// 不构成互斥,面板与 OverlayStale 判定会读到撕裂的 fetchedAt。
+	p.limitsMu.Lock()
+	fetchedAt := p.limitsFetchedAt
+	p.limitsMu.Unlock()
 
 	var fetchErr string
 	if limits.OverlayStale(fetchedAt, now) {
@@ -581,10 +586,10 @@ func (p *Parts) catalogCacheFile() string {
 // 端口从已解析的 Settings 取,不重读 settings.json —— 重读会与
 // ApplySettings 的写入产生竞态,且用户可能刚在面板上改过端口。
 func (p *Parts) PanelURL() string {
-	if p == nil || p.Settings == nil {
+	if p == nil || !p.hasSettings() {
 		return ""
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d/", p.Settings.PanelPort)
+	return fmt.Sprintf("http://127.0.0.1:%d/", p.settingsSnapshot().PanelPort)
 }
 
 // Reload 是托盘「重启网关」的动作:重读 settings.json(用户可能在面板上
@@ -603,7 +608,7 @@ func (p *Parts) Reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	*p.Settings = next
+	p.setSettings(next)
 	// 顺序固定:先设置,再重建出站,最后刷新目录。反过来会让目录与新出站
 	// 代际错配一轮 —— 目录决定哪些模型可用,而出站决定它们经谁出去。
 	if err := p.Rebuild(ctx); err != nil {

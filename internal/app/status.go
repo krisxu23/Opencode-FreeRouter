@@ -79,7 +79,7 @@ func (p *Parts) base() string {
 // src/index.js:1102 —— 更密的探测只会烧配额、把出口 IP 打成 429,不会让
 // 池子更健康。
 func (p *Parts) probeInterval() time.Duration {
-	minutes := p.Settings.ProbeIntervalMin
+	minutes := p.settingsSnapshot().ProbeIntervalMin
 	if minutes < 5 {
 		minutes = 5
 	}
@@ -310,9 +310,13 @@ func (p *Parts) Status() any {
 		nodes = append(nodes, row)
 	}
 
+	// B7:端口与密钥必须来自同一份快照,不能两次裸读 —— 两次读之间隔着一次
+	// 面板 PUT 就会回出「旧端口配新 key」这种从未存在过的组合。
+	cur := p.settingsSnapshot()
+
 	return map[string]any{
 		"singbox":      singbox,
-		"forward":      map[string]any{"running": true, "port": p.Settings.ForwardPort, "key": p.Settings.ForwardKey},
+		"forward":      map[string]any{"running": true, "port": cur.ForwardPort, "key": cur.ForwardKey},
 		"models":       ids,
 		"modelCaps":    caps,
 		"limits":       limits,
@@ -354,12 +358,47 @@ const usageHistoryDays = 7
 
 // ---- 设置视图与写入 ----
 
+// settingsSnapshot 返回当前设置的**副本**。所有读点都必须走这里,不能直接
+// 解引用 p.Settings(B7):面板 PUT 与托盘 Reload 会整结构覆写它,裸读会看到
+// 撕裂值 —— 半个 int、旧端口配新 key、字符串头半更新。副本是值语义,
+// 调用方拿到后随便读多久都不会再变。
+func (p *Parts) settingsSnapshot() Settings {
+	p.settingsMu.RLock()
+	defer p.settingsMu.RUnlock()
+	if p.Settings == nil {
+		// 零值 Parts:Load 失败后的 Shutdown 与测试里的空结构体都会走到。
+		return Settings{}
+	}
+	return *p.Settings
+}
+
+// hasSettings 报告设置是否已装配。Load 失败后的 Parts 与零值 Parts 上是 false,
+// 调用方靠它区分「没装配」与「装配了但都是零值」。
+func (p *Parts) hasSettings() bool {
+	p.settingsMu.RLock()
+	defer p.settingsMu.RUnlock()
+	return p.Settings != nil
+}
+
+// setSettings 是设置整结构覆写的唯一入口(ApplySettings 与 Reload)。
+// Settings 为 nil 时分配一块,否则原地覆盖 —— 保留指针身份,夹具里
+// `p.Settings.X = …` 的直接赋值仍然有效。
+func (p *Parts) setSettings(next Settings) {
+	p.settingsMu.Lock()
+	defer p.settingsMu.Unlock()
+	if p.Settings == nil {
+		p.Settings = &next
+		return
+	}
+	*p.Settings = next
+}
+
 // SettingsView 是 /api/settings 的响应:settings 的面板子集(照抄
 // src/panel.js:171-184 的键清单,但删掉 portBase/portSpan/catchAllPort)。
 // forwardKey 绝不进这个视图 —— 设置页没有显示它的需求,测试请求走的是
 // Status() 的 forward.key。
 func (p *Parts) SettingsView() map[string]any {
-	s := *p.Settings
+	s := p.settingsSnapshot()
 	return map[string]any{
 		"subUrls":          s.SubURLs,
 		"countries":        s.Countries,
@@ -388,11 +427,11 @@ func (p *Parts) SettingsView() map[string]any {
 // 成 Settings → 才 Update+Flush」,任一步失败都直接返回,一个字节都不写盘。
 func (p *Parts) ApplySettings(patch map[string]any) (Settings, error) {
 	if len(patch) == 0 {
-		return *p.Settings, nil
+		return p.settingsSnapshot(), nil
 	}
 	clean, err := validateSettingsPatch(patch)
 	if err != nil {
-		return *p.Settings, err
+		return p.settingsSnapshot(), err
 	}
 	// 候选校验:补丁 merge 进当前快照,先确认结果能被解成 Settings。类型
 	// 断言挡不住的组合(例如超大整数)在这里落网。
@@ -406,15 +445,15 @@ func (p *Parts) ApplySettings(patch map[string]any) (Settings, error) {
 	}
 	next, err := settingsFromMap(candidate)
 	if err != nil {
-		return *p.Settings, err
+		return p.settingsSnapshot(), err
 	}
 	p.settingsStore.Update(clean)
 	if err := p.settingsStore.Flush(); err != nil {
 		// 落盘失败要把内存里的补丁撤回,否则内存与磁盘各说各话。
 		p.settingsStore.Update(before)
-		return *p.Settings, fmt.Errorf("app: 写设置: %w", err)
+		return p.settingsSnapshot(), fmt.Errorf("app: 写设置: %w", err)
 	}
-	*p.Settings = next
+	p.setSettings(next)
 	return next, nil
 }
 

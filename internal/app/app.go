@@ -76,11 +76,20 @@ type Settings struct {
 // Load returns non-nil only after the forward port can already serve a
 // request, so no caller ever has to ask "is it up yet".
 type Parts struct {
-	Root     string
-	Settings *Settings
-	Host     *sbx.Host
-	Registry *registry.Registry
-	Health   *health.Health
+	Root string
+	// Settings 是当前生效的设置。它只允许经 settingsMu 访问 —— 面板 PUT
+	// (ApplySettings)与托盘 Reload 写它,而 5 秒一次的 /api/status 轮询、
+	// 探测轮、Rebuild 都在读它(B7:无锁读写整结构会让读者看到撕裂值,
+	// 例如半个 probeIntervalMin、旧端口配新 key)。
+	//
+	// 保持指针字段而不是 atomic.Pointer[Settings],是因为测试夹具直接写
+	// p.Settings.X(约 25 处);读侧一律走 settingsSnapshot(),写侧一律走
+	// setSettings()。
+	Settings   *Settings
+	settingsMu sync.RWMutex
+	Host       *sbx.Host
+	Registry   *registry.Registry
+	Health     *health.Health
 	// Prober 是探测轮次的实现接口(probe.go 定义):生产装 *nodeprobe.Prober,
 	// 测试装假实现 —— 真实探测要打外网,而缓存/事故/淘汰逻辑必须能离线断言。
 	Prober  Prober
@@ -339,6 +348,10 @@ func Load(root string) (*Parts, error) {
 		catList = catalog.Build(cachedIDs)
 	}
 	catBox := &catalogBox{list: catList}
+	// parts 先声明后装配:下面几个闭包要读活设置(B7),而 parts 的字段又依赖
+	// 它们构造出来的 eng/statStore。闭包只可能在 Load 返回之后被调用,
+	// 那时 parts 一定已赋值。
+	var parts *Parts
 	eng := engine.NewEngine(engine.Deps{
 		State: func() engine.State {
 			return engine.State{Catalog: catBox.get(), Health: h}
@@ -352,16 +365,18 @@ func Load(root string) (*Parts, error) {
 			return pool
 		},
 		Settings: func() engine.Settings {
-			// 这两个字段必须读活值:面板上保存的 effortLevel / defaultMaxTokens
-			// 会写进同一份 settings,热路径每请求取一次(B2/B3)。过去 EffortLevel
-			// 写死常量、MaxTokens 根本没接线,保存了也不生效。
-			maxTokens, _ := jsonNumberOrNil(settings.DefaultMaxTokens)
+			// 必须读活值:面板上保存的 effortLevel / defaultMaxTokens 会写进
+			// 同一份 settings,热路径每请求取一次(B2/B3)。过去 EffortLevel
+			// 写死常量、MaxTokens 根本没接线,保存了也不生效;而这里原先读的是
+			// Load 的局部副本,面板保存后同样读不到(B7 顺手一起修)。
+			live := parts.settingsSnapshot()
+			maxTokens, _ := jsonNumberOrNil(live.DefaultMaxTokens)
 			return engine.Settings{
-				Countries:        settings.Countries,
-				EffortLevel:      settings.EffortLevel,
+				Countries:        live.Countries,
+				EffortLevel:      live.EffortLevel,
 				DefaultMaxTokens: maxTokens,
-				MaxAttempts:      settings.MaxAttempts,
-				MaxWallClockMS:   settings.MaxWallClockMS,
+				MaxAttempts:      live.MaxAttempts,
+				MaxWallClockMS:   live.MaxWallClockMS,
 			}
 		},
 		// RecordUsage:base id 由引擎给到(stream.Usage 是 harness 形状,
@@ -410,25 +425,28 @@ func Load(root string) (*Parts, error) {
 	if bootOverlay == nil {
 		bootOverlay = map[string]limits.OverlayRow{}
 	}
-	parts := &Parts{
-		Root:          root,
-		Settings:      &settings,
-		Host:          host,
-		Registry:      reg,
-		Health:        h,
-		Prober:        nodeprobe.NewProber(logf),
-		Engine:        eng,
-		StatsStore:    statStore,
-		firstFetch:    firstFetch,
-		tierGate:      gate.New(tierGapMS),
-		catalog:       catBox,
-		overlayByID:   bootOverlay,
-		settingsStore: store,
-		cancel:        cancel,
+	parts = &Parts{
+		Root:        root,
+		Settings:    &settings,
+		Host:        host,
+		Registry:    reg,
+		Health:      h,
+		Prober:      nodeprobe.NewProber(logf),
+		Engine:      eng,
+		StatsStore:  statStore,
+		firstFetch:  firstFetch,
+		tierGate:    gate.New(tierGapMS),
+		catalog:     catBox,
+		overlayByID: bootOverlay,
+		// B8:这两个字段与 limitsMu 保护,必须在结构体字面量里装配好 ——
+		// 从前是字面量之后的两行无锁写,而 refreshLimitsOverlay 已经在
+		// limitsMu 下读写它们。
+		limitsFetchedAt: bootFetchedAt,
+		limitsRows:      len(bootOverlay),
+		settingsStore:   store,
+		cancel:          cancel,
 	}
 
-	parts.limitsFetchedAt = bootFetchedAt
-	parts.limitsRows = len(bootOverlay)
 	if len(bootOverlay) > 0 {
 		catBox.set(parts.applyOverlay(catBox.get()))
 	}
@@ -440,7 +458,11 @@ func Load(root string) (*Parts, error) {
 	// 面板顶部的「上次检查」在每次开机后都是永久空白,看起来就像网关什么都没做。
 	go func() {
 		defer close(firstFetch)
-		subURLs := settings.SubURLs
+		// 订阅地址与放行国家取**活值**:面板上保存的设置要能影响这一轮,而不是
+		// 开机那一瞬间的副本(B7)。监听端口不在此列 —— 端口已经绑定,改端口
+		// 必须重启,那是设计而不是遗漏。
+		cur := parts.settingsSnapshot()
+		subURLs := cur.SubURLs
 		if len(subURLs) == 0 {
 			logger.Info(fmt.Sprintf("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（%d 个）；注册表为空则以纯直连兜底模式启动", reg.Len()))
 			parts.setRebuildResult(0, 0, 0, nil)
@@ -460,7 +482,7 @@ func Load(root string) (*Parts, error) {
 			parts.setRebuildResult(0, 0, 0, ferr)
 			return
 		}
-		picked := parse.FilterByGroups(res.Outbounds, settings.Countries)
+		picked := parse.FilterByGroups(res.Outbounds, cur.Countries)
 		clean := make([]parse.Outbound, 0, len(picked))
 		for _, o := range picked {
 			if ok, keep := parse.SanitizeOutbound(o); keep {
@@ -491,8 +513,10 @@ func Load(root string) (*Parts, error) {
 
 	// 7. the forward listener, last: the port may only open once it can serve.
 	srv := forward.New(forward.Config{
-		Enabled:    func() bool { return settings.Enabled },
-		ForwardKey: func() string { return settings.ForwardKey },
+		// B7:两个闭包每请求取一次活快照。它们原先捕获的是 Load 的局部副本,
+		// 面板/托盘改完之后仍按开机时的旧值鉴权。
+		Enabled:    func() bool { return parts.settingsSnapshot().Enabled },
+		ForwardKey: func() string { return parts.settingsSnapshot().ForwardKey },
 		Complete: func(cctx context.Context, req engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
 			// Degradation rule 2. The engine answers an empty pool with a 503
 			// -flavoured failure, but forward maps every error from Complete
