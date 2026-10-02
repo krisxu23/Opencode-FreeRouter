@@ -130,6 +130,76 @@ func sseCutAfter(text, errMsg string) string {
 const quotaBody = `{"error":{"type":"FreeUsageLimitError","message":"usage limit"}}`
 const regionBody = `{"error":{"type":"RegionError","message":"Model is not available in your country"}}`
 
+// sseChatToolFrames 拼若干 chat 帧:每个参数是 delta.tool_calls 里的一条 call。
+// 用 json.Marshal 而不是字符串拼接,免得 arguments 里的引号要手工转义。
+func sseChatToolFrames(calls ...map[string]any) string {
+	var sb strings.Builder
+	for _, call := range calls {
+		frame, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+			"delta": map[string]any{"tool_calls": []any{call}}}}})
+		sb.WriteString("data: " + string(frame) + "\n\n")
+	}
+	sb.WriteString("data: [DONE]\n\n")
+	return sb.String()
+}
+
+// sseChatReasoning 是 chat 线的一段推理增量 + 正文增量。
+func sseChatReasoning(think, text string) string {
+	first, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+		"delta": map[string]any{"reasoning": think}}}})
+	second, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+		"delta": map[string]any{"content": text}}}})
+	return "data: " + string(first) + "\n\ndata: " + string(second) + "\n\ndata: [DONE]\n\n"
+}
+
+// sseChatUsageOnly 是一段没有任何块的「正常 stop」+ usage 尾包:退化完成。
+func sseChatUsageOnly() string {
+	stop, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+		"delta": map[string]any{}, "finish_reason": "stop"}}})
+	usage, _ := json.Marshal(map[string]any{"choices": []any{},
+		"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 0}})
+	return "data: " + string(stop) + "\n\ndata: " + string(usage) + "\n\ndata: [DONE]\n\n"
+}
+
+// sseChatTextFinish 是一段带收尾 token 的 chat 流:正文 + finish_reason。
+func sseChatTextFinish(text, finish string) string {
+	delta, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+		"delta": map[string]any{"content": text}}}})
+	last, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+		"delta": map[string]any{}, "finish_reason": finish}}})
+	return "data: " + string(delta) + "\n\ndata: " + string(last) + "\n\ndata: [DONE]\n\n"
+}
+
+// hasChunkKind / hasFinish 是上行事件表的断言辅助。
+func hasChunkKind(kinds []ChunkKind, want ChunkKind) bool {
+	for _, k := range kinds {
+		if k == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFinish(finishes []FinishReason, want FinishReason) bool {
+	for _, f := range finishes {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+// captureChunks 把上行的 Chunk 收进切片,并单独记下收尾事件。
+func captureChunks(kinds *[]ChunkKind, finishes *[]FinishReason) func(Chunk) error {
+	return func(c Chunk) error {
+		*kinds = append(*kinds, c.Kind)
+		if c.Kind == ChunkFinish {
+			*finishes = append(*finishes, c.Finish)
+		}
+		return nil
+	}
+}
+
 // ---- 夹具 ----
 
 // pool8 是 8 个节点的候选池,tag 字典序 = Pick 的确定性次序(无健康行时同
@@ -951,6 +1021,153 @@ func TestBlockEndToolCallMatchesByID(t *testing.T) {
 	}
 	if out.ToolCalls[1].ID != "c2" || out.ToolCalls[1].Arguments != "{}" {
 		t.Fatalf("追加条目形状不对: %+v", out.ToolCalls[1])
+	}
+}
+
+// ---- 上行通道端到端(审计 B13) ----
+
+// TestToolCallDeltasFoldIntoTheOutcome:真实上游的 delta.tool_calls 必须一路
+// 走到 Outcome.ToolCalls,并让上行事件表里出现 ChunkToolCallDelta —— 改造前
+// adapter 的上行通道只有文本,函数调用在网关这一侧被整段吞掉。
+func TestToolCallDeltasFoldIntoTheOutcome(t *testing.T) {
+	body := sseChatToolFrames(
+		map[string]any{"index": 0, "id": "call_1", "type": "function",
+			"function": map[string]any{"name": "search", "arguments": `{"q":`}},
+		map[string]any{"index": 0, "type": "function",
+			"function": map[string]any{"arguments": `"x"}`}},
+	)
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", body
+	})
+	var kinds []ChunkKind
+	var finishes []FinishReason
+	out, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"),
+		captureChunks(&kinds, &finishes))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(out.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls = %+v, want 一个按增量拼齐的调用", out.ToolCalls)
+	}
+	call := out.ToolCalls[0]
+	if call.ID != "call_1" || call.Name != "search" || call.Arguments != `{"q":"x"}` {
+		t.Fatalf("call = %+v", call)
+	}
+	if !hasChunkKind(kinds, ChunkToolCallDelta) {
+		t.Fatalf("上行里没有 ChunkToolCallDelta: %v", kinds)
+	}
+	if !hasFinish(finishes, FinishToolCalls) {
+		t.Fatalf("收尾 = %v, want FinishToolCalls", finishes)
+	}
+}
+
+// TestToolNameIsRestoredOnTheWayOut:调用方声明 Bash,闸门把线上名规范成 bash,
+// 回程必须换回 Bash —— 否则调用方收到的工具名与它声明的不是同一个。
+func TestToolNameIsRestoredOnTheWayOut(t *testing.T) {
+	body := sseChatToolFrames(map[string]any{"index": 0, "id": "call_b", "type": "function",
+		"function": map[string]any{"name": "bash", "arguments": `{"cmd":"ls"}`}})
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", body
+	})
+	req := simpleReq("big-pickle", "u1")
+	req.OpenAI["tools"] = []any{map[string]any{"type": "function",
+		"function": map[string]any{"name": "Bash", "parameters": map[string]any{"type": "object"}}}}
+	out, err := f.eng.Complete(context.Background(), req, nil)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(out.ToolCalls) != 1 || out.ToolCalls[0].Name != "Bash" {
+		t.Fatalf("ToolCalls = %+v, want 名字还原成调用方的 Bash", out.ToolCalls)
+	}
+}
+
+// TestReasoningDeltaReachesTheCallback:推理增量单独成帧上行(转发层把它写成
+// reasoning 字段),且不进正文。
+func TestReasoningDeltaReachesTheCallback(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChatReasoning("think", "answer")
+	})
+	var kinds []ChunkKind
+	var finishes []FinishReason
+	out, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"),
+		captureChunks(&kinds, &finishes))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if !hasChunkKind(kinds, ChunkReasoning) {
+		t.Fatalf("上行里没有 ChunkReasoning: %v", kinds)
+	}
+	if out.Text != "answer" {
+		t.Fatalf("Text = %q, want 只有正文", out.Text)
+	}
+}
+
+// TestBrokenToolCallFinishesAsMaxTokens:参数被截在半截 JSON 上时,上游照样报
+// finish "tool_calls"(实测 2026-09-25)。这种轮次必须降级成 max-tokens 并把这个
+// 不可执行的调用剪掉 —— 交给 harness 会让它执行失败、模型再撞同一个上限。
+func TestBrokenToolCallFinishesAsMaxTokens(t *testing.T) {
+	body := sseChatToolFrames(map[string]any{"index": 0, "id": "call_1", "type": "function",
+		"function": map[string]any{"name": "search", "arguments": `{"q":"x`}})
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", body
+	})
+	var kinds []ChunkKind
+	var finishes []FinishReason
+	out, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"),
+		captureChunks(&kinds, &finishes))
+	if err != nil {
+		t.Fatalf("截断不是失败,应正常收尾: %v", err)
+	}
+	if !out.Truncated {
+		t.Fatalf("Truncated 未置位: %+v", out)
+	}
+	if len(out.ToolCalls) != 0 {
+		t.Fatalf("半截 JSON 的调用必须被剪掉: %+v", out.ToolCalls)
+	}
+	if !hasFinish(finishes, FinishMaxTokens) {
+		t.Fatalf("收尾 = %v, want FinishMaxTokens", finishes)
+	}
+}
+
+// TestProviderLengthFinishTruncates:上游自己报 finish_reason "length" 的一轮是
+// 被输出上限截断的,必须写进 Truncated —— 否则转发层永远报 stop,调用方把半截
+// 答案当完整答案收下。
+func TestProviderLengthFinishTruncates(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChatTextFinish("partial answer", "length")
+	})
+	var kinds []ChunkKind
+	var finishes []FinishReason
+	out, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"),
+		captureChunks(&kinds, &finishes))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if !out.Truncated {
+		t.Fatalf("Truncated 未置位: %+v", out)
+	}
+	if !hasFinish(finishes, FinishMaxTokens) {
+		t.Fatalf("收尾 = %v, want FinishMaxTokens", finishes)
+	}
+}
+
+// TestEmptyStreamIsAnEmptyFailure:一条只出角色骨架与 usage 的流是退化完成。
+// 归成 EMPTY 才会走退避重试(并且吃 EMPTY 自己的 6 次额度,不占用扫池的 20 次),
+// 而静默的空回合会让调用方既没内容也没信号。
+func TestEmptyStreamIsAnEmptyFailure(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChatUsageOnly()
+	})
+	_, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"), nil)
+	fail := wantFailure(t, err)
+	if fail.Code != check.CodeEmpty {
+		t.Fatalf("code = %q, want %q", fail.Code, check.CodeEmpty)
+	}
+	if !strings.Contains(fail.Message, "empty response") {
+		t.Fatalf("message = %q, want 说明是退化完成的那句", fail.Message)
+	}
+	if got := f.up.count(); got != 6 {
+		t.Fatalf("退化完成应吃 EMPTY 的独立额度 6 次,得到 %d 次", got)
 	}
 }
 

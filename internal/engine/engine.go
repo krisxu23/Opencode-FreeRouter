@@ -557,13 +557,15 @@ type attemptInput struct {
 // finish reason of a successful end, whether any content was seen, and the
 // classified failure (nil on success).
 //
-// adapter.Complete 的回调只吐文本增量 —— reasoning/tool-call 增量与 usage/
-// finish 词汇由本层包装成 Chunk 的五种 Kind 交给转发层,转发层因此不必知道
-// stream/adapter 的存在。reasoning 与 tool-call 的细分以 adapter 实际能拿到的
-// 信息为准:Go adapter 的上行通道只有文本(其内部 feed 只投影 text delta),
-// 所以真实链路里只会产生 ChunkText 与收尾的 ChunkUsage/ChunkFinish;
-// ChunkReasoning / ChunkToolCallDelta 的折叠语义在 foldChunks 里照 JS 全量
-// 实现并配有直接单测,adapter 通道扩展时零改动接入。
+// adapter 的上行通道交出的是一组 Delta 事件(正文 / 推理 / tool-call 增量),
+// 本函数是它到 Chunk 五种 Kind 的唯一翻译点:adapter 在 L3、engine 在 L4,
+// adapter 不能反向 import engine,所以两侧各有一套词汇,在这里对齐。
+//
+// 收尾词汇有三个信源,优先级从高到低:投影层判出的「参数截在半截 JSON 上」
+// (→ max-tokens)、上游自己报的收尾 token、以及「确实折出了工具调用」这个事实。
+// 第一个信源只能来自投影层 —— 上游把被输出上限截断的一轮照样报成
+// finish "tool_calls"(实测 2026-09-25),只看 token 会把一个不可执行的调用
+// 交给 harness。
 func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishReason, bool, *errors.Failure) {
 	var out Outcome
 	sawContent := false
@@ -619,11 +621,11 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 		areq.MaxTokens = int(v)
 	}
 
-	usage, err := adapter.NewAdapter(deps).Complete(ctx, areq, func(text string) error {
-		return emit(Chunk{Kind: ChunkText, Text: text})
+	res, err := adapter.NewAdapter(deps).Complete(ctx, areq, func(d adapter.Delta) error {
+		return emit(chunkOfDelta(d))
 	})
-	if usage.HasUsage {
-		if err2 := emit(Chunk{Kind: ChunkUsage, Usage: usage}); err2 != nil && err == nil {
+	if res.Usage.HasUsage {
+		if err2 := emit(Chunk{Kind: ChunkUsage, Usage: res.Usage}); err2 != nil && err == nil {
 			err = err2
 		}
 	}
@@ -637,19 +639,63 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 		}
 		return out, FinishStop, sawContent, failure
 	}
-	finish := FinishStop
-	if len(out.ToolCalls) > 0 {
-		finish = FinishToolCalls
+	// 三个 saw 位全空 + 正常收尾:退化完成。交给调用方一个「成功的空回合」是最
+	// 难诊断的失败形态 —— 归成 EMPTY 才会走退避重试(js adapter.js:253-261)。
+	// EMPTY 有自己的额度(engine.attemptCapByCode),扫池的 20 次预算不由它占用。
+	if finishReasonOf(res.Finish) == FinishStop && !res.SawText && !res.SawToolCall && !res.SawReasoning && !res.BrokenToolCall {
+		return out, FinishStop, sawContent,
+			&errors.Failure{Code: check.CodeEmpty,
+				Message: "our free model returned an empty response", Retryable: true}
 	}
-	// FinishMaxTokens 经本 adapter 不可达:上行通道只有文本,max-tokens 收尾
-	// 没有信源;foldChunks 的 Truncated 折叠与 dropBrokenToolCalls 过滤保留
-	// 全量语义,由直接单测钉住。
+	finish := FinishStop
+	switch {
+	case res.BrokenToolCall:
+		// 参数被截在 JSON 半截上的调用是不可执行的:降级成 max-tokens 让
+		// Complete 分支 C 剪掉它(js adapter.js:239-252)。
+		finish = FinishMaxTokens
+	default:
+		finish = finishReasonOf(res.Finish)
+		if finish == FinishStop && len(out.ToolCalls) > 0 {
+			// 上游没报收尾 token(或报的是 stop)却确实折出了调用:调用方要的
+			// 信号比 token 诚实。转发层本来也按 ToolCalls 重新推导 finish。
+			finish = FinishToolCalls
+		}
+	}
 	if err2 := emit(Chunk{Kind: ChunkFinish, Finish: finish}); err2 != nil {
 		// 收尾帧都发不出去 = 客户端已走,按出内容后的失败收场。
 		return out, finish, sawContent,
 			&errors.Failure{Code: check.CodeServer, Message: err2.Error()}
 	}
 	return out, finish, sawContent, nil
+}
+
+// chunkOfDelta 把 adapter 的投影事件翻译成本层的 Chunk 词汇。
+func chunkOfDelta(d adapter.Delta) Chunk {
+	switch d.Kind {
+	case adapter.DeltaReasoning:
+		return Chunk{Kind: ChunkReasoning, Text: d.Text}
+	case adapter.DeltaToolCall:
+		return ToolCallDeltaChunk(d.Index, d.ID, d.Name, d.Text)
+	case adapter.DeltaToolCallEnd:
+		return ToolCallBlockEndChunk(d.Index, d.ID, d.Name, d.Arguments)
+	default:
+		return Chunk{Kind: ChunkText, Text: d.Text}
+	}
+}
+
+// finishReasonOf 对应 js stream.js:242-246 的 finishReason:三条线的收尾 token
+// 词表不同(OpenAI 的 tool_calls/length、Anthropic 的 tool_use/max_tokens、
+// Responses 的 function_call/incomplete),在这里一次性归一。缺失的 token 与
+// 不认识的 token 都算正常收尾 —— JS 就是这么落的 default 分支。
+func finishReasonOf(token string) FinishReason {
+	switch token {
+	case "tool_calls", "tool_use", "function_call":
+		return FinishToolCalls
+	case "length", "max_tokens", "max_output_tokens", "incomplete":
+		return FinishMaxTokens
+	default:
+		return FinishStop
+	}
 }
 
 // classifyAttemptError 把 adapter 吐回的错误归类成 Failure:adapter 自己的

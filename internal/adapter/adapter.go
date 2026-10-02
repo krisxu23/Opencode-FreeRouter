@@ -101,35 +101,44 @@ type turn struct {
 	t0      time.Time
 }
 
-// Complete performs one turn. onChunk receives text deltas in arrival order;
-// returning an error from it aborts the turn and closes the upstream body.
-func (a *Adapter) Complete(ctx context.Context, req Request, onChunk func(string) error) (stream.Usage, error) {
-	var acc stream.Usage
-	firstContent := false
+// Complete performs one turn. onChunk receives the projected deltas — 正文、
+// 推理、tool-call 三类增量,按到达顺序;从它返回 error 会中止这一轮并关掉上游
+// body。返回值里的 Result 除了 usage,还带着只有投影层看得见的收尾事实。
+func (a *Adapter) Complete(ctx context.Context, req Request, onChunk func(Delta) error) (Result, error) {
 	t0 := time.Now()
 
 	body, err := a.build(req)
 	if err != nil {
-		return acc, err
+		return Result{}, err
 	}
 	renames := upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return acc, err
+		return Result{}, err
 	}
 
 	t := &turn{req: req, body: body, payload: payload, renames: renames, t0: t0}
+	s := newSink(onChunk, renames)
 	// 骨架的发送/状态处理段落落在 exchange:stale-reasoning 的重放路径必须能
 	// 拿到剥过字段的 body map 与原 400 的分类素材,整段搬过去才可测。
-	return a.exchange(ctx, t, onChunk, &acc, &firstContent)
+	res, err := a.exchange(ctx, t, s)
+	if err != nil {
+		return res, err
+	}
+	// 收尾帧只在流被完整消费后补:出错帧/空闲截止会让这一轮从异常路径收场,
+	// 半截的 tool-call 块此时不该被登记成一个调用(js readStream:327)。
+	if err := s.closeAll(); err != nil {
+		return s.result(), err
+	}
+	return s.result(), nil
 }
 
 // exchange 发一次请求并处理状态分岔:非 2xx 分类(400 命中过期推理引用时剥字段
 // 重放一次),2xx 交 readReply。调用方保证 payload 与 body 同源。
-func (a *Adapter) exchange(ctx context.Context, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool) (stream.Usage, error) {
+func (a *Adapter) exchange(ctx context.Context, t *turn, s *sink) (Result, error) {
 	httpReq, err := a.newRequest(ctx, t)
 	if err != nil {
-		return *acc, err
+		return s.result(), err
 	}
 	resp, err := a.deps.Client.Do(httpReq)
 	if err != nil {
@@ -137,14 +146,14 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, onChunk func(string) er
 		// 自己的 context 实现的，先看 ctx.Err() 会把它误判成「客户端中止」
 		// （CodeAborted 不可重试、不冷却），而它其实是一个该换出口的 TIMEOUT。
 		if stderrors.Is(err, httpclient.ErrIdleTimeout) {
-			return *acc, errors.Failure{Code: check.CodeTimeout, Message: err.Error(), Retryable: true}
+			return s.result(), errors.Failure{Code: check.CodeTimeout, Message: err.Error(), Retryable: true}
 		}
 		// JS 对中止与传输失败分开记码(http.js:110-111):客户端取消不是
 		// 「换个出口」能治的传输抖动,引擎对 CodeAborted 也不冷却。
 		if ctx.Err() != nil {
-			return *acc, errors.Failure{Code: check.CodeAborted, Message: "request aborted"}
+			return s.result(), errors.Failure{Code: check.CodeAborted, Message: "request aborted"}
 		}
-		return *acc, errors.Failure{Code: check.CodeTransport, Message: err.Error(), Retryable: true}
+		return s.result(), errors.Failure{Code: check.CodeTransport, Message: err.Error(), Retryable: true}
 	}
 	defer resp.Body.Close()
 
@@ -156,16 +165,16 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, onChunk func(string) er
 		// doubled 400 looks like the provider refusing the model.
 		if resp.StatusCode == http.StatusBadRequest && upstream.IsStaleReasoningReference(string(raw)) {
 			if upstream.StripStaleReasoningInputs(t.body) {
-				return a.replay(ctx, t, onChunk, acc, firstContent,
-					resp.StatusCode, raw, errors.RetryAfter(resp.Header.Get("Retry-After")))
+				return a.replay(ctx, t, s, resp.StatusCode, raw,
+					errors.RetryAfter(resp.Header.Get("Retry-After")))
 			}
 		}
-		return *acc, errors.Classify(resp.StatusCode, raw, errors.RetryAfter(resp.Header.Get("Retry-After")))
+		return s.result(), errors.Classify(resp.StatusCode, raw, errors.RetryAfter(resp.Header.Get("Retry-After")))
 	}
-	if err := a.readReply(resp, t, onChunk, acc, firstContent); err != nil {
-		return *acc, idleOrPassthrough(err)
+	if err := a.readReply(resp, t, s); err != nil {
+		return s.result(), idleOrPassthrough(err)
 	}
-	return *acc, nil
+	return s.result(), nil
 }
 
 // idleOrPassthrough 把 httpclient 的空闲截止翻译成 TIMEOUT。
@@ -186,30 +195,29 @@ func idleOrPassthrough(err error) error {
 // replay 把剥过字段的 body 重发**一次**(js http.js:128-136)。重放又被拒时按
 // 重放的响应分类,不再剥第二次;重放连传输都没走通时回落**原始** 400 的分类
 // —— 第二条重试连不上,不改变第一条失败的形状。
-func (a *Adapter) replay(ctx context.Context, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool,
-	status int, raw []byte, retryAfter int64) (stream.Usage, error) {
+func (a *Adapter) replay(ctx context.Context, t *turn, s *sink, status int, raw []byte, retryAfter int64) (Result, error) {
 	payload, err := json.Marshal(t.body)
 	if err != nil {
-		return *acc, err
+		return s.result(), err
 	}
 	retry := &turn{req: t.req, body: t.body, payload: payload, renames: t.renames, t0: t.t0}
 	httpReq, err := a.newRequest(ctx, retry)
 	if err != nil {
-		return *acc, err
+		return s.result(), err
 	}
 	resp, err := a.deps.Client.Do(httpReq)
 	if err != nil {
-		return *acc, errors.Classify(status, raw, retryAfter)
+		return s.result(), errors.Classify(status, raw, retryAfter)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		replayRaw, _ := readAllCapped(resp.Body, maxBodyBytes)
-		return *acc, errors.Classify(resp.StatusCode, replayRaw, errors.RetryAfter(resp.Header.Get("Retry-After")))
+		return s.result(), errors.Classify(resp.StatusCode, replayRaw, errors.RetryAfter(resp.Header.Get("Retry-After")))
 	}
-	if err := a.readReply(resp, retry, onChunk, acc, firstContent); err != nil {
-		return *acc, err
+	if err := a.readReply(resp, retry, s); err != nil {
+		return s.result(), err
 	}
-	return *acc, nil
+	return s.result(), nil
 }
 
 // newRequest 组装 POST:端点按模型选线(js adapter.js:190),指纹头由 upstream
@@ -334,7 +342,7 @@ var (
 // 的响应体 —— 仅凭 Content-Type 分支会把整条流当 JSON 误杀。所以先嗅探首块
 // 字节按形状分类,Content-Type 只作兜底,且永不把流式响应整条读进内存
 // (js http.js:143-174 的实现语义)。
-func (a *Adapter) readReply(resp *http.Response, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool) error {
+func (a *Adapter) readReply(resp *http.Response, t *turn, s *sink) error {
 	head := make([]byte, 8)
 	n, _ := io.ReadFull(resp.Body, head)
 	head = head[:n]
@@ -345,24 +353,24 @@ func (a *Adapter) readReply(resp *http.Response, t *turn, onChunk func(string) e
 	}
 	body := io.MultiReader(bytes.NewReader(head), resp.Body)
 	if headSSERe.Match(head) || (!headJSONRe.Match(head) && strings.Contains(resp.Header.Get("Content-Type"), "event-stream")) {
-		return a.readSSE(body, t, onChunk, acc, firstContent)
+		return a.readSSE(body, t, s)
 	}
 	raw, _ := readAllCapped(body, maxBodyBytes)
-	return a.readJSON(raw, resp.StatusCode, errors.RetryAfter(resp.Header.Get("Retry-After")), t, onChunk, acc, firstContent)
+	return a.readJSON(raw, resp.StatusCode, errors.RetryAfter(resp.Header.Get("Retry-After")), t, s)
 }
 
 // readSSE 逐事件喂 feed;[DONE] 与非 JSON 帧在 feed 的入口被跳过。
-func (a *Adapter) readSSE(r io.Reader, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool) error {
+func (a *Adapter) readSSE(r io.Reader, t *turn, s *sink) error {
 	return stream.ReadSSE(r, func(ev stream.Event) error {
-		return a.feed(t, []byte(ev.Data), 0, onChunk, acc, firstContent)
+		return a.feed(t, []byte(ev.Data), 0, s)
 	})
 }
 
 // readJSON 消费非流式的整包回复(js http.js:157-170 的 JSON 分支)。usage 的
 // 字段名以 JS readStream 的非流式分支为准(mapUsage 的双拼写);全文一次性
-// 回调 —— 这是 Go 版对 JS 的一个刻意补齐:JS 的 feedChat 只读 delta,非流式
-// JSON 的正文会被丢掉,而计划要求 onChunk 拿到全文。
-func (a *Adapter) readJSON(raw []byte, status int, retryAfter int64, t *turn, onChunk func(string) error, acc *stream.Usage, firstContent *bool) error {
+// 交出 —— 这是 Go 版对 JS 的一个刻意补齐:JS 的 feedChat 只读 delta,非流式
+// JSON 的正文会被丢掉,而计划要求上层拿到全文。
+func (a *Adapter) readJSON(raw []byte, status int, retryAfter int64, t *turn, s *sink) error {
 	var p map[string]any
 	if err := json.Unmarshal(raw, &p); err != nil || p == nil {
 		return errors.Failure{Code: check.CodeServer,
@@ -371,26 +379,28 @@ func (a *Adapter) readJSON(raw []byte, status int, retryAfter int64, t *turn, on
 	if _, has := p["error"]; has {
 		return errors.Classify(status, raw, retryAfter)
 	}
-	if err := a.feed(t, raw, status, onChunk, acc, firstContent); err != nil {
+	if err := a.feed(t, raw, status, s); err != nil {
 		return err
 	}
 	if text := fullTextOf(p, a.deps.Wire); text != "" {
-		if !*firstContent {
-			*firstContent = true
-			acc.TTFTMS = time.Since(t.t0).Milliseconds()
-			a.reportTtft(acc.TTFTMS)
+		if !s.first {
+			s.first = true
+			s.acc.TTFTMS = time.Since(t.t0).Milliseconds()
+			a.reportTtft(s.acc.TTFTMS)
 		}
-		return onChunk(text)
+		// 走 sink 而不是直接回调:正文增量也得进 SawText 的账,否则一条合法的
+		// 非流式回复会被上层判成「空响应」。
+		return s.text("t", text)
 	}
 	return nil
 }
 
-// feed 是三条线共用的逐帧投影(js readStream → feedChat/feedClaude/
-// feedResponses)。本包的契约只搬运**文本增量**与 usage:reasoning 增量与
-// tool-call 增量没有上行通道(onChunk 只有一个 string 参数),由任务 18 的
-// engine 扩展 chunk 词汇时接管 —— renames 已随 turn 穿到位,tool 名还原届时
-// 挂在 tool_call delta 的处理点。
-func (a *Adapter) feed(t *turn, chunk []byte, status int, onChunk func(string) error, acc *stream.Usage, firstContent *bool) error {
+// feed 是三条线共用的逐帧投影入口:认错误帧、锚 TTFT、折 usage,然后把这一帧
+// 交给所属线对的投影函数。投影本身(开块、累积 tool-call 参数、还原工具名)住在
+// project.go —— 上行交出的是 Delta 事件(正文/推理/tool-call 增量),而不是
+// 只有正文:reasoning 与 function call 都在同一批帧里,只搬 delta.content 会让
+// 调用方的工具永远执行不到(审计 B13)。
+func (a *Adapter) feed(t *turn, chunk []byte, status int, s *sink) error {
 	var p map[string]any
 	if err := json.Unmarshal(chunk, &p); err != nil {
 		return nil // 畸形帧与 [DONE] 一律跳过(js readStream:300-302 的 try/catch)
@@ -402,24 +412,24 @@ func (a *Adapter) feed(t *turn, chunk []byte, status int, onChunk func(string) e
 	}
 	// TTFT 锚在第一个 delta 上,而不是第一个可见文本上:推理重的模型几分钟
 	// 后才吐可见文本(js carriesDelta:333-353)。
-	if a.carriesDelta(p) && !*firstContent {
-		*firstContent = true
-		acc.TTFTMS = time.Since(t.t0).Milliseconds()
-		a.reportTtft(acc.TTFTMS)
+	if a.carriesDelta(p) && !s.first {
+		s.first = true
+		s.acc.TTFTMS = time.Since(t.t0).Milliseconds()
+		a.reportTtft(s.acc.TTFTMS)
 	}
-	prior := *acc
+	prior := s.acc
 	// ScanUsage 折叠顶层 usage(chat 线的双拼写 + cache 细节)与 claude 文本
 	// 增量检测;三条线的嵌套落点与合并缺口在下面各线的补充里修。
-	stream.ScanUsage(chunk, acc, firstContent, t.t0)
+	stream.ScanUsage(chunk, &s.acc, &s.first, t.t0)
 	switch a.deps.Wire {
 	case upstream.WireChat:
-		return a.feedChat(p, onChunk)
+		return feedChat(p, s)
 	case upstream.WireResponses:
-		feedResponsesUsage(p, acc)
-		return feedResponses(p, onChunk)
+		feedResponsesUsage(p, &s.acc)
+		return feedResponses(p, s)
 	default:
-		feedClaudeUsage(p, prior, acc)
-		return feedClaude(p, onChunk)
+		feedClaudeUsage(p, prior, &s.acc)
+		return feedClaude(p, s)
 	}
 }
 
@@ -473,52 +483,9 @@ func (a *Adapter) carriesDelta(p map[string]any) bool {
 // feedChat 提取 chat 线的文本增量。畸形 choice([null]/"nope")跳过而不是
 // 抛 TypeError —— 上游帧是外部数据,那个 TypeError 曾让调用方拿到裸错误
 // (js feedChat:143-146 的实测注释)。
-func (a *Adapter) feedChat(p map[string]any, onChunk func(string) error) error {
-	choices, _ := p["choices"].([]any)
-	for _, choice := range choices {
-		cm, ok := choice.(map[string]any)
-		if !ok {
-			continue
-		}
-		delta, _ := cm["delta"].(map[string]any)
-		if delta == nil {
-			continue
-		}
-		if s, _ := delta["content"].(string); s != "" {
-			if err := onChunk(s); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// feedClaude 提取 messages 线的文本增量;thinking_delta 与 input_json_delta 在
-// 文本契约之外。
-func feedClaude(p map[string]any, onChunk func(string) error) error {
-	if p["type"] != "content_block_delta" {
-		return nil
-	}
-	delta, _ := p["delta"].(map[string]any)
-	if delta == nil || delta["type"] != "text_delta" {
-		return nil
-	}
-	if s, _ := delta["text"].(string); s != "" {
-		return onChunk(s)
-	}
-	return nil
-}
-
-// feedResponses 提取 responses 线的文本增量。
-func feedResponses(p map[string]any, onChunk func(string) error) error {
-	if p["type"] != "response.output_text.delta" {
-		return nil
-	}
-	if s, _ := p["delta"].(string); s != "" {
-		return onChunk(s)
-	}
-	return nil
-}
+//
+// feedChat/feedClaude/feedResponses 的逐帧投影住在 project.go:那里按槽位开块、
+// 累积 tool-call 参数,并把推理增量一并交出。
 
 // feedClaudeUsage 修 claude 线 usage 的两个 ScanUsage 盲区:
 //   - message_start 的 usage 藏在 message 下,且缓存计数字段名是

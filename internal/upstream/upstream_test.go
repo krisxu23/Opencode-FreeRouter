@@ -506,6 +506,41 @@ func TestDeclaredToolNamesSplitsDecoysFromRealCalls(t *testing.T) {
 	}
 }
 
+// testWireTool 是 messages.ToolDef 的形状替身。upstream 在 L0、messages 在
+// L1,分层检查不允许 upstream import messages —— 真实契约只能由鸭子类型表达
+// (ToolName / Renamed),这里用一个同形状的替身把契约钉住。
+type testWireTool struct{ name string }
+
+func (t testWireTool) ToolName() string       { return t.name }
+func (t testWireTool) Renamed(name string) any { t.name = name; return t }
+
+// TestApplyFingerprintAcceptsStructTools 钉住 B13 的 Go 独有回归:adapter 交来
+// 的是 messages.ToolDef 切片(经 build 投影),而旧代码只认解码出来的 []any,
+// 于是 hadClientTools 恒为 false —— chat 线被强制 tool_choice:"none",调用方
+// 声明的工具还会被两个诱饵整份覆盖。
+func TestApplyFingerprintAcceptsStructTools(t *testing.T) {
+	body := map[string]any{"tools": []any{testWireTool{name: "Bash"}}}
+	renames := ApplyFingerprint(body, false)
+	tools, _ := body["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %v, want 调用方的工具 + 一个 read 诱饵", tools)
+	}
+	first, ok := tools[0].(testWireTool)
+	if !ok || first.name != "bash" {
+		t.Fatalf("sent tool = %#v, want the caller's tool renamed to bash", tools[0])
+	}
+	if _, has := body["tool_choice"]; has {
+		t.Fatal("调用方声明了工具就不该被强制 tool_choice:none")
+	}
+	if got := RestoreToolName("bash", renames); got != "Bash" {
+		t.Fatalf("RestoreToolName(bash) = %q, want Bash", got)
+	}
+	// 响应侧认诱饵用的也是同一个取名函数。
+	if got := DeclaredToolNames(map[string]any{"tools": []any{testWireTool{name: "Bash"}}}); !reflect.DeepEqual(got, []string{"Bash"}) {
+		t.Fatalf("DeclaredToolNames = %v, want [Bash]", got)
+	}
+}
+
 // toolNamesOf 取非 flat 体里每个工具的 function.name,测试辅助。
 func toolNamesOf(body map[string]any) []string {
 	tools, _ := body["tools"].([]any)

@@ -3,7 +3,10 @@
 
 package upstream
 
-import "strings"
+import (
+	"reflect"
+	"strings"
+)
 
 // RequiredTools are the two lowercase names the gate requires to be declared.
 //
@@ -16,10 +19,54 @@ import "strings"
 // 原样透传。
 var RequiredTools = []string{"bash", "read"}
 
+// WireTool 是「一条已投影成线上形状的工具声明」的最小契约。
+//
+// 闸门必须按名字做大小写归一与去重,但 upstream 在 L0、messages.ToolDef 在 L1,
+// 分层检查不允许 upstream 反向 import messages —— 所以这里只用鸭子类型表达契约,
+// 由 messages.ToolDef 实现这两个方法。没有它,struct 形状的工具在闸门眼里就是
+// 「没有名字的工具」,调用方声明的 Bash 既不会被规范成 bash、也不会被认出是
+// 必需名(审计 B13)。
+type WireTool interface {
+	// ToolName 是该工具当前在线上的名字(未经闸门归一)。
+	ToolName() string
+	// Renamed 返回把线上名字换成 name 的副本;原值不得被就地改写(调用方的
+	// 声明还要用于响应侧回放)。返回 any 是因为本包看不见那个具体类型。
+	Renamed(name string) any
+}
+
+// toolListOf 取出 body["tools"] 的条目。
+//
+// 两种形状都要认:[]any 是 JSON 解码出来的形状,也是本包测试用的形状;而
+// adapter.build 直接往 map[string]any 的请求体里放的是 []messages.ToolDef
+// —— 一个具体切片类型,对 []any 的类型断言永远不成立。旧代码就卡在这一步:
+// hadClientTools 恒为 false,于是 chat/messages 线把 tool_choice 强写成
+// "none",并把调用方的工具整份换成两个诱饵 —— function calling 从请求侧就
+// 死掉了。upstream 不能 import messages,所以摊平用反射完成。
+func toolListOf(raw any) []any {
+	if list, ok := raw.([]any); ok {
+		return list
+	}
+	rv := reflect.ValueOf(raw)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		list := make([]any, 0, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			list = append(list, rv.Index(i).Interface())
+		}
+		return list
+	default:
+		return nil
+	}
+}
+
 // toolNameOf:flat(Responses,顶层 name)与非 flat(chat,function.name)两种
 // 工具形状取名不同(src/upstream.js:294-300)。function 分支不要求 trim 后
 // 非空(照抄 JS:fn.name.trim() 可以是空串),顶层 name 分支要求非空。
 func toolNameOf(tool any) string {
+	if wt, ok := tool.(WireTool); ok {
+		// 结构体形状的工具:名字只有一个来源,三条线都由它渲染。
+		return strings.TrimSpace(wt.ToolName())
+	}
 	tm, ok := tool.(map[string]any)
 	if !ok {
 		return "" // 数组/标量不是工具对象,与 JS 的 typeof 判定同效
@@ -32,6 +79,33 @@ func toolNameOf(tool any) string {
 		return strings.TrimSpace(name)
 	}
 	return ""
+}
+
+// renameTool 交出「线上名被规范成 key」的那一条声明。
+//
+// map 形状浅拷两份(chat 线还要拷嵌套的 function);结构体形状交给它自己的
+// Renamed —— 只有类型自己知道三条线各自的键序,换成 map 重建会把 MarshalJSON
+// 钉死的顺序按字母序重排。
+func renameTool(tool any, key string) any {
+	if wt, ok := tool.(WireTool); ok {
+		return wt.Renamed(key)
+	}
+	src, _ := tool.(map[string]any)
+	clone := make(map[string]any, len(src)+1)
+	for k, v := range src {
+		clone[k] = v
+	}
+	if fn, ok := src["function"].(map[string]any); ok {
+		fnClone := make(map[string]any, len(fn)+1)
+		for k, v := range fn {
+			fnClone[k] = v
+		}
+		fnClone["name"] = key
+		clone["function"] = fnClone
+	} else {
+		clone["name"] = key
+	}
+	return clone
 }
 
 // fingerprintKey:调用方工具名的规范键;闸门不关心的名字返回空串
@@ -79,15 +153,16 @@ func falsy(v any) bool {
 // 三条上游线路字段面完全不同且随上游演进,透传未知字段必须保持自动,否则
 // 每加一个上游字段就要改一次 Go 类型。flat=true 是 Responses 形状({name}),
 // false 是 chat 形状({function:{name}})。
+//
+// body["tools"] 的条目可能是 map 形状(解码出来的、测试用的),也可能是
+// messages.ToolDef 这类结构体(adapter 的真实投影):两者都由 toolListOf 认,
+// 名字都由 toolNameOf 读 —— 只认其中一种形状会让闸门静默失效。
 func ApplyFingerprint(body map[string]any, flat bool) map[string]string {
 	renames := map[string]string{}
 	if body == nil {
 		return renames
 	}
-	var tools []any
-	if raw, ok := body["tools"].([]any); ok {
-		tools = raw
-	}
+	tools := toolListOf(body["tools"])
 	hadClientTools := len(tools) > 0
 	seen := make(map[string]bool, len(RequiredTools))
 	out := make([]any, 0, len(tools)+len(RequiredTools))
@@ -105,23 +180,8 @@ func ApplyFingerprint(body map[string]any, flat bool) map[string]string {
 		seen[key] = true
 		if current != key {
 			renames[key] = current
-			// 复制而不是就地改:调用方的原 tool 还要用于响应侧回放
-			src, _ := tool.(map[string]any)
-			clone := make(map[string]any, len(src)+1)
-			for k, v := range src {
-				clone[k] = v
-			}
-			if fn, ok := src["function"].(map[string]any); ok {
-				fnClone := make(map[string]any, len(fn)+1)
-				for k, v := range fn {
-					fnClone[k] = v
-				}
-				fnClone["name"] = key
-				clone["function"] = fnClone
-			} else {
-				clone["name"] = key
-			}
-			out = append(out, clone)
+			// 复制而不是就地改:调用方的原 tool 还要用于响应侧回放。
+			out = append(out, renameTool(tool, key))
 		} else {
 			out = append(out, tool)
 		}
@@ -254,8 +314,7 @@ func StripStaleReasoningInputs(payload map[string]any) bool {
 func DeclaredToolNames(body map[string]any) []string {
 	var names []string
 	seen := map[string]bool{}
-	tools, _ := body["tools"].([]any)
-	for _, tool := range tools {
+	for _, tool := range toolListOf(body["tools"]) {
 		n := toolNameOf(tool)
 		if n == "" || seen[n] {
 			continue

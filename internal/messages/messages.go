@@ -635,6 +635,24 @@ func (d ToolDef) MarshalJSON() ([]byte, error) {
 	}
 }
 
+// ToolName 与 Renamed 实现 upstream.WireTool。
+//
+// 为什么要有这两个方法:请求体过闸门时 upstream 需要按工具名做大小写归一与
+// 去重,而 upstream 在 L0、本包在 L1,分层检查不允许它 import 进来 —— 契约只能
+// 由结构性接口表达。缺了它,adapter 交出的 []ToolDef 在闸门眼里就是「没有名字
+// 的工具」:调用方声明的 Bash 不会被规范成 bash,闸门还会以为调用方一个工具都
+// 没声明,把 tool_choice 强写成 "none"(审计 B13)。
+//
+// Renamed 返回**同一个具体类型**的副本,所以 MarshalJSON 仍然按 style 渲染
+// 原本那条线要求的键序 —— 换成 map 重建会把键按字母序重排。
+func (d ToolDef) ToolName() string { return d.Name }
+
+// Renamed 返回把线上名字换成 name 的副本;原值不动。
+func (d ToolDef) Renamed(name string) any {
+	d.Name = name
+	return d
+}
+
 // truncateName 按 rune 截到上游上限(JS 的 slice(0, MAX_TOOL_NAME_LEN) 是
 // UTF-16 单位,rune 对 BMP 等价,且避免把多字节字符切成非法 UTF-8)。
 func truncateName(name string) string {

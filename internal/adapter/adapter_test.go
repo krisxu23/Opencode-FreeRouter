@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +20,6 @@ import (
 	"freerouter/internal/errors"
 	"freerouter/internal/httpclient"
 	"freerouter/internal/messages"
-	"freerouter/internal/stream"
 	"freerouter/internal/upstream"
 )
 
@@ -128,9 +128,12 @@ func toolNamesOf(body map[string]any) []string {
 	return names
 }
 
-func collect(chunks *strings.Builder) func(string) error {
-	return func(s string) error {
-		chunks.WriteString(s)
+// collect 只把**文本**增量拼进 builder:多数既有用例断言的就是正文。
+func collect(chunks *strings.Builder) func(Delta) error {
+	return func(d Delta) error {
+		if d.Kind == DeltaText {
+			chunks.WriteString(d.Text)
+		}
 		return nil
 	}
 }
@@ -333,7 +336,7 @@ func TestCallbackErrorStopsTheTurn(t *testing.T) {
 	_, err := a.Complete(context.Background(), Request{
 		Messages: []messages.Message{{Role: "user", Content: "hi"}},
 		Stream:   true,
-	}, func(string) error {
+	}, func(Delta) error {
 		calls++
 		return errBoom
 	})
@@ -412,14 +415,12 @@ func TestStaleReasoningIsStrippedAndReplayed(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	tu := &turn{req: req, body: body, payload: payload, renames: renames, t0: time.Now()}
-	var acc stream.Usage
-	first := false
-	usage, err := a.exchange(context.Background(), tu, collect(&strings.Builder{}), &acc, &first)
+	res, err := a.exchange(context.Background(), tu, newSink(collect(&strings.Builder{}), renames))
 	if err != nil {
 		t.Fatalf("exchange: %v (a stale reasoning reference must be stripped and replayed once)", err)
 	}
-	if !usage.HasUsage {
-		t.Fatalf("usage lost across the replay: %+v", usage)
+	if !res.Usage.HasUsage {
+		t.Fatalf("usage lost across the replay: %+v", res.Usage)
 	}
 	got := f.requests()
 	if len(got) != 2 {
@@ -499,9 +500,12 @@ func TestUsageSurvivesANonStreamingReply(t *testing.T) {
 	usage, err := a.Complete(context.Background(), Request{
 		Messages: []messages.Message{{Role: "user", Content: "hi"}},
 		Stream:   false,
-	}, func(s string) error {
+	}, func(d Delta) error {
+		if d.Kind != DeltaText {
+			return nil
+		}
 		calls++
-		chunks.WriteString(s)
+		chunks.WriteString(d.Text)
 		return nil
 	})
 	if err != nil {
@@ -513,8 +517,8 @@ func TestUsageSurvivesANonStreamingReply(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("onChunk called %d times, want exactly once for a non-streaming reply", calls)
 	}
-	if !usage.HasUsage || usage.In != 7 || usage.Out != 3 {
-		t.Fatalf("usage = %+v, want HasUsage in=7 out=3", usage)
+	if !usage.Usage.HasUsage || usage.Usage.In != 7 || usage.Usage.Out != 3 {
+		t.Fatalf("usage = %+v, want HasUsage in=7 out=3", usage.Usage)
 	}
 }
 
@@ -595,6 +599,483 @@ func TestIdleUpstreamIsClassifiedAsTimeout(t *testing.T) {
 	}
 	if failure, ok := err.(errors.Failure); !ok || !failure.Retryable {
 		t.Fatalf("failure = %#v, want Retryable", err)
+	}
+}
+
+// collectAll 收全部上行事件,断言 tool-call / reasoning 增量用(B13 之前根本没有
+// 这两类事件,只有文本能走通)。
+func collectAll(got *[]Delta) func(Delta) error {
+	return func(d Delta) error {
+		*got = append(*got, d)
+		return nil
+	}
+}
+
+// pickOf 按种类取事件,断言顺序与数量用。
+func pickOf(got []Delta, kind DeltaKind) []Delta {
+	var out []Delta
+	for _, d := range got {
+		if d.Kind == kind {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// chatToolFrame 拼一个 chat 线的 delta.tool_calls 帧。空字段按上游的省略行为处理:
+// 只有非空的 id/name/arguments 才写进帧里。arguments 传**未转义**的 JSON 片段,
+// 由 json.Marshal 负责转义。
+func chatToolFrame(idx int, id, name, args string) string {
+	call := map[string]any{"index": idx}
+	if id != "" {
+		call["id"] = id
+	}
+	fn := map[string]any{}
+	if name != "" {
+		fn["name"] = name
+	}
+	if args != "" {
+		fn["arguments"] = args
+	}
+	if len(fn) > 0 {
+		call["function"] = fn
+	}
+	raw, _ := json.Marshal(map[string]any{"choices": []any{map[string]any{
+		"delta": map[string]any{"tool_calls": []any{call}}}}})
+	return string(raw)
+}
+
+// TestChatWireProjectsToolCallDeltas 钉住 B13 的核心缺口:chat 线的
+// delta.tool_calls 必须作为增量上行。改造前 feedChat 只读 delta.content,函数
+// 调用在网关这一侧被整段吞掉,调用方永远收不到 tool_calls。
+func TestChatWireProjectsToolCallDeltas(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			chatToolFrame(0, "call_7", "glob", ""),
+			chatToolFrame(0, "", "", `{"q":`),
+			chatToolFrame(0, "", "", `"src/**"}`),
+			`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+
+	var got []Delta
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	deltas := pickOf(got, DeltaToolCall)
+	ends := pickOf(got, DeltaToolCallEnd)
+	// 首帧只登记 id/name(JS 的 toolStart 不发帧),所以参数增量是两条。
+	if len(deltas) != 2 {
+		t.Fatalf("tool-call 增量 = %d, want 2(%+v)", len(deltas), got)
+	}
+	if deltas[0].ID != "call_7" || deltas[0].Name != "glob" || deltas[0].Text != `{"q":` {
+		t.Fatalf("首帧增量 = %+v", deltas[0])
+	}
+	if deltas[1].Text != `"src/**"}` {
+		t.Fatalf("次帧增量 = %+v", deltas[1])
+	}
+	if deltas[0].Index != deltas[1].Index {
+		t.Fatalf("同一 tool-call 的两帧必须同槽位: %d vs %d", deltas[0].Index, deltas[1].Index)
+	}
+	if len(ends) != 1 || ends[0].Arguments != `{"q":"src/**"}` || ends[0].ID != "call_7" || ends[0].Name != "glob" {
+		t.Fatalf("收尾帧 = %+v, want 拼齐的 arguments", ends)
+	}
+	if !res.SawToolCall || res.SawText || res.SawReasoning || res.BrokenToolCall {
+		t.Fatalf("result = %+v, want 只有 SawToolCall", res)
+	}
+	if res.Finish != "tool_calls" {
+		t.Fatalf("finish = %q, want tool_calls", res.Finish)
+	}
+}
+
+// TestChatWireProjectsReasoningDeltas 钉住推理增量:chat 线有 **delta.reasoning
+// 与 delta.reasoning_details[].text 两条来源**,过去都落在文本契约之外。
+func TestChatWireProjectsReasoningDeltas(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			`{"choices":[{"delta":{"reasoning":"think"}}]}`,
+			`{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":" more"}]}}]}`,
+			`{"choices":[{"delta":{"content":"answer"}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+
+	var got []Delta
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	reasoning := pickOf(got, DeltaReasoning)
+	text := pickOf(got, DeltaText)
+	if len(reasoning) != 2 || reasoning[0].Text != "think" || reasoning[1].Text != " more" {
+		t.Fatalf("reasoning 增量 = %+v", reasoning)
+	}
+	if len(text) != 1 || text[0].Text != "answer" {
+		t.Fatalf("text 增量 = %+v", text)
+	}
+	// 推理与正文是两个块,槽位序号必须分开(engine 按槽位归并)。
+	if reasoning[0].Index == text[0].Index {
+		t.Fatalf("推理与正文不得共用槽位: %d", text[0].Index)
+	}
+	if !res.SawReasoning || !res.SawText {
+		t.Fatalf("result = %+v, want SawReasoning 与 SawText 同时为真", res)
+	}
+}
+
+// TestMessagesWireProjectsThinkingAndToolUse 钉住 messages 线:thinking_delta
+// 与 input_json_delta 过去都不在 feedClaude 的读取范围内。
+func TestMessagesWireProjectsThinkingAndToolUse(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			`{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}`,
+			`{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_9","name":"glob"}}`,
+			`{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}`,
+			`{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"x\"}"}}`,
+			`{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "union-alpha")
+
+	var got []Delta
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	reasoning := pickOf(got, DeltaReasoning)
+	deltas := pickOf(got, DeltaToolCall)
+	ends := pickOf(got, DeltaToolCallEnd)
+	if len(reasoning) != 1 || reasoning[0].Text != "hmm" {
+		t.Fatalf("thinking 增量 = %+v", reasoning)
+	}
+	if len(deltas) != 2 || deltas[0].ID != "toolu_9" || deltas[0].Name != "glob" {
+		t.Fatalf("tool-call 增量 = %+v", deltas)
+	}
+	if len(ends) != 1 || ends[0].Arguments != `{"q":"x"}` {
+		t.Fatalf("收尾帧 = %+v", ends)
+	}
+	if deltas[0].Index != deltas[1].Index || deltas[0].Index == reasoning[0].Index {
+		t.Fatalf("槽位分配错乱: reasoning=%d tool=%d/%d", reasoning[0].Index, deltas[0].Index, deltas[1].Index)
+	}
+	if !res.SawReasoning || !res.SawToolCall || res.BrokenToolCall {
+		t.Fatalf("result = %+v", res)
+	}
+	if res.Finish != "tool_use" {
+		t.Fatalf("finish = %q, want tool_use", res.Finish)
+	}
+}
+
+// TestResponsesWireProjectsFunctionCallAndReasoning 钉住 responses 线:
+// function_call 项、arguments 增量与推理摘要过去都被丢掉。
+func TestResponsesWireProjectsFunctionCallAndReasoning(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}`,
+			`{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"because"}`,
+			`{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_3","name":"grep"}}`,
+			`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"pat\":"}`,
+			`{"type":"response.function_call_arguments.delta","output_index":1,"delta":"\"y\"}"}`,
+			`{"type":"response.output_text.delta","output_index":2,"delta":"hi"}`,
+			`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}`,
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "muse-spark-1.3-contributor-free")
+
+	var got []Delta
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	deltas := pickOf(got, DeltaToolCall)
+	ends := pickOf(got, DeltaToolCallEnd)
+	reasoning := pickOf(got, DeltaReasoning)
+	if len(deltas) != 2 || deltas[0].ID != "call_3" || deltas[0].Name != "grep" {
+		t.Fatalf("function_call 增量 = %+v", deltas)
+	}
+	if len(ends) != 1 || ends[0].Arguments != `{"pat":"y"}` {
+		t.Fatalf("收尾帧 = %+v", ends)
+	}
+	if len(reasoning) != 1 || reasoning[0].Text != "because" {
+		t.Fatalf("推理摘要 = %+v", reasoning)
+	}
+	if pickOf(got, DeltaText)[0].Text != "hi" {
+		t.Fatalf("正文增量 = %+v", got)
+	}
+	// response.completed 的 status 归一成 JS 的收尾 token 原文。
+	if res.Finish != "stop" {
+		t.Fatalf("finish = %q, want stop", res.Finish)
+	}
+	if !res.SawToolCall || !res.SawReasoning || !res.SawText {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+// TestBrokenToolCallIsReported 钉住 B13 的第二半:参数被输出上限截在半截 JSON
+// 上时,上游仍然报 finish_reason:"tool_calls"(实测 2026-09-25),所以只有拼齐的
+// 参数能判出「这轮被截断」。
+func TestBrokenToolCallIsReported(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			chatToolFrame(0, "call_1", "glob", `{"q":"unclosed`),
+			`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+
+	var got []Delta
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if !res.BrokenToolCall {
+		t.Fatalf("result = %+v, want BrokenToolCall", res)
+	}
+	// 半截参数原样交出:剪枝是 engine 侧的事,投影层不隐瞒内容。
+	ends := pickOf(got, DeltaToolCallEnd)
+	if len(ends) != 1 || ends[0].Arguments != `{"q":"unclosed` {
+		t.Fatalf("收尾帧 = %+v", ends)
+	}
+}
+
+// TestToolCallWithNoArgumentsStillEndsTheBlock:一个参数增量都没有的调用,收尾帧
+// 必须补 "{}" —— 否则 engine 折不出这个调用,调用方看不见它。
+func TestToolCallWithNoArgumentsStillEndsTheBlock(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			chatToolFrame(0, "call_z", "now", ""),
+			`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+
+	var got []Delta
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(pickOf(got, DeltaToolCall)) != 0 {
+		t.Fatalf("没有参数增量时不该有增量帧: %+v", got)
+	}
+	ends := pickOf(got, DeltaToolCallEnd)
+	if len(ends) != 1 || ends[0].Arguments != "{}" || ends[0].ID != "call_z" {
+		t.Fatalf("收尾帧 = %+v, want arguments=\"{}\"", ends)
+	}
+	if !res.SawToolCall || res.BrokenToolCall {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+// TestToolCallIDIsMintedWhenTheProviderOmitsIt:没有 id 的调用下一轮会带着空
+// toolCallId 回来,pairing 修复会把两侧一起丢掉,模型永远看不到自己的结果而无限
+// 重发同一个调用 —— 投影层要先铸一个稳定替身(js stream.js:23-25、:42-45)。
+func TestToolCallIDIsMintedWhenTheProviderOmitsIt(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			chatToolFrame(0, "", "now", "{}"),
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+
+	var got []Delta
+	if _, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got)); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	deltas := pickOf(got, DeltaToolCall)
+	if len(deltas) != 1 {
+		t.Fatalf("增量 = %+v", got)
+	}
+	re := regexp.MustCompile(`^call_[0-9a-f]{24}$`)
+	if !re.MatchString(deltas[0].ID) {
+		t.Fatalf("铸出的 tool-call id 形状不对: %q, want call_<24hex>", deltas[0].ID)
+	}
+}
+
+// TestClientToolsSurviveTheFingerprintGate 钉住 B13 的第二处 Go 独有回归:
+// adapter 交出去的是 []messages.ToolDef,而指纹闸门只断言 []any —— 断言永不
+// 成立,hadClientTools 恒 false:调用方的工具被两个诱饵整份顶掉,chat 线还被强写
+// tool_choice:"none",函数调用从请求侧就不可能发生。
+//
+// 同时钉住名字还原:线上小写归一(闸门要求),回程必须换回调用方的拼写。
+func TestClientToolsSurviveTheFingerprintGate(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			chatToolFrame(0, "call_b", "bash", `{"cmd":"ls"}`),
+			`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`[DONE]`,
+		)
+	})
+	a := NewAdapter(Deps{
+		Client: f.srv.Client(), Base: f.srv.URL, Model: "big-pickle",
+		Effort: "balanced", Entry: entryFor("big-pickle"), SessionID: "conversation-7",
+		Wire: upstream.WireFor("big-pickle"), NodeKey: "n1",
+		Tools: []messages.Tool{
+			{Name: "Bash", Description: "run"},
+			{Name: "glob", Description: "match"},
+		},
+	})
+
+	var got []Delta
+	if _, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got)); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	sent := decodeBody(t, f.requests()[0].body)
+	names := toolNamesOf(sent)
+	count := func(want string) int {
+		n := 0
+		for _, name := range names {
+			if name == want {
+				n++
+			}
+		}
+		return n
+	}
+	if got := count("bash"); got != 1 {
+		t.Fatalf("线上 bash 出现 %d 次, want 1(调用方的 Bash 归一后不得与诱饵重复): %v", got, names)
+	}
+	if count("read") != 1 {
+		t.Fatalf("诱饵 read 缺席: %v", names)
+	}
+	if count("glob") != 1 {
+		t.Fatalf("调用方的 glob 被顶掉了: %v", names)
+	}
+	if _, has := sent["tool_choice"]; has {
+		t.Fatalf("声明了工具的请求不得被强写 tool_choice: %v", sent["tool_choice"])
+	}
+	deltas := pickOf(got, DeltaToolCall)
+	if len(deltas) != 1 || deltas[0].Name != "Bash" {
+		t.Fatalf("回程的 tool 名没还原: %+v, want Bash", deltas)
+	}
+}
+
+// TestProviderFinishTokenIsReported 钉住收尾 token 的上行:上游说 length 时
+// 整轮是被输出上限截断的,engine 据此才报得出 finish_reason:"length"。
+func TestProviderFinishTokenIsReported(t *testing.T) {
+	cases := []struct {
+		wire string
+		body string
+		want string
+	}{
+		{"chat", sseBody(
+			`{"choices":[{"delta":{"content":"cut"}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"length"}]}`,
+			`[DONE]`), "length"},
+		{"responses", sseBody(
+			`{"type":"response.output_text.delta","delta":"cut"}`,
+			`{"type":"response.completed","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`,
+			`[DONE]`), "length"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.wire, func(t *testing.T) {
+			model := "big-pickle"
+			if tc.wire == "responses" {
+				model = "muse-spark-1.3-contributor-free"
+			}
+			f := newFakeUpstream(t, func(n int) (int, string, string) {
+				return 200, "text/event-stream", tc.body
+			})
+			a := newAdapter(f.srv.URL, f.srv.Client(), model)
+			res, err := a.Complete(context.Background(), Request{
+				Messages: []messages.Message{{Role: "user", Content: "hi"}},
+				Stream:   true,
+			}, collect(&strings.Builder{}))
+			if err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+			if res.Finish != tc.want {
+				t.Fatalf("finish = %q, want %q", res.Finish, tc.want)
+			}
+		})
+	}
+}
+
+// TestEmptyTurnReportsNoContentFlags:只出角色骨架与 usage 的一轮,三个 saw 位
+// 全空 —— engine 据此把它归成 CodeEmpty,而不是交给调用方一个静默的空回合。
+func TestEmptyTurnReportsNoContentFlags(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			`{"choices":[{"delta":{"role":"assistant"},"finish_reason":"stop"}]}`,
+			`{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}`,
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+
+	var got []Delta
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collectAll(&got))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("退化的一轮不该有任何上行帧: %+v", got)
+	}
+	if res.SawText || res.SawToolCall || res.SawReasoning || res.BrokenToolCall {
+		t.Fatalf("result = %+v, want 三个 saw 位全空", res)
+	}
+	if res.Finish != "stop" {
+		t.Fatalf("finish = %q, want stop", res.Finish)
+	}
+	if !res.Usage.HasUsage {
+		t.Fatalf("usage 应当仍然在: %+v", res.Usage)
+	}
+}
+
+// TestNonStreamingReplyMarksSawText:非流式整包的正文也走投影通道,所以它不算
+// 退化的一轮(否则 B13 的 CodeEmpty 会把补齐的正文判成空)。
+func TestNonStreamingReplyMarksSawText(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "application/json",
+			`{"choices":[{"message":{"content":"plain"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}`
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+
+	var got []Delta
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   false,
+	}, collectAll(&got))
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if len(pickOf(got, DeltaText)) != 1 || !res.SawText {
+		t.Fatalf("result = %+v deltas = %+v", res, got)
 	}
 }
 
