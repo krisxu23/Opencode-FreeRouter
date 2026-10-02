@@ -105,16 +105,19 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
+		// 四个计数都用指针:js 的 `??` 判的是 undefined,而 Go 的 int64 零值
+		// 分不出「字段缺失」与「上游显式发了 0」。没有这层区分,B4 的两种拼写
+		// 就没法按 `prompt_tokens ?? input_tokens` 择一,只能相加。
 		Usage *struct {
-			InputTokens         int64 `json:"input_tokens"`
-			OutputTokens        int64 `json:"output_tokens"`
-			PromptTokens        int64 `json:"prompt_tokens"`
-			CompletionTokens    int64 `json:"completion_tokens"`
+			InputTokens         *int64 `json:"input_tokens"`
+			OutputTokens        *int64 `json:"output_tokens"`
+			PromptTokens        *int64 `json:"prompt_tokens"`
+			CompletionTokens    *int64 `json:"completion_tokens"`
 			PromptTokensDetails *struct {
-				CachedTokens int64 `json:"cached_tokens"`
+				CachedTokens *int64 `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
 			InputTokensDetails *struct {
-				CachedTokens int64 `json:"cached_tokens"`
+				CachedTokens *int64 `json:"cached_tokens"`
 			} `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
@@ -122,23 +125,54 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 		return 0, false
 	}
 	if env.Usage != nil {
-		acc.HasUsage = true
-		// 上游的输入总数是**毛值**(prompt_tokens/input_tokens 已含缓存命中),
-		// 而 harness 的 disjoint-count 规则要求 inputTokens 是**未缓存输入**:
-		// js stream.js:11-13 把这条规则写在模块注释里,mapUsage:122 用
-		// Math.max(0, prompt - cached) 落地。CacheRead 单独一个量。
-		gross := env.Usage.InputTokens + env.Usage.PromptTokens
-		acc.Out = env.Usage.OutputTokens + env.Usage.CompletionTokens
-		acc.CacheRead = 0
-		if d := env.Usage.PromptTokensDetails; d != nil {
-			acc.CacheRead = d.CachedTokens
+		// B4:prompt_tokens/input_tokens 与 completion_tokens/output_tokens 是
+		// **同一个量的两种拼写**(js stream.js:115-116 的 `??`),不是两个量。
+		// 相加会让输入与输出一起翻倍(报告实测 gross=200 / Out=10,正确 100 / 5)。
+		prompt := env.Usage.PromptTokens
+		if prompt == nil {
+			prompt = env.Usage.InputTokens
 		}
-		if d := env.Usage.InputTokensDetails; d != nil {
-			acc.CacheRead = d.CachedTokens
+		completion := env.Usage.CompletionTokens
+		if completion == nil {
+			completion = env.Usage.OutputTokens
 		}
-		acc.In = gross - acc.CacheRead
-		if acc.In < 0 {
-			acc.In = 0
+		// js stream.js:120:两侧都不提的 usage 帧**不产出 usage**(`{"usage":{}}`
+		// 这种心跳帧过去会把整个累加器清零并置 HasUsage)。
+		if prompt != nil || completion != nil {
+			acc.HasUsage = true
+			// 缓存细节也是 `??` 而不是覆盖:prompt_tokens_details 里没有
+			// cached_tokens 才回退 input_tokens_details(js stream.js:117)。
+			var cached int64
+			switch {
+			case env.Usage.PromptTokensDetails != nil && env.Usage.PromptTokensDetails.CachedTokens != nil:
+				cached = *env.Usage.PromptTokensDetails.CachedTokens
+			case env.Usage.InputTokensDetails != nil && env.Usage.InputTokensDetails.CachedTokens != nil:
+				cached = *env.Usage.InputTokensDetails.CachedTokens
+			}
+			if prompt == nil {
+				// R14:只带输出侧的帧**并入**既有值,而不是整份覆盖
+				// (js stream.js:290-291 的三元)。Claude 线的 message_delta 就是
+				// 这个形状,整份覆盖会把 message_start 已给出的输入侧清零,
+				// 连带污染 sticky TTL(cacheRead/In 比例)与面板用量。
+				if completion != nil {
+					acc.Out = *completion
+				}
+			} else {
+				// 上游的输入总数是**毛值**(prompt_tokens/input_tokens 已含缓存命中),
+				// 而 harness 的 disjoint-count 规则要求 inputTokens 是**未缓存输入**:
+				// js stream.js:11-13 把这条规则写在模块注释里,mapUsage:122 用
+				// Math.max(0, prompt - cached) 落地。CacheRead 单独一个量。
+				acc.CacheRead = cached
+				acc.In = *prompt - cached
+				if acc.In < 0 {
+					acc.In = 0
+				}
+				if completion != nil {
+					acc.Out = *completion
+				} else {
+					acc.Out = 0
+				}
+			}
 		}
 	}
 	switch {

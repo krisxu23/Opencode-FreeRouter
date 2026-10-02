@@ -103,6 +103,90 @@ func TestScanUsageReadsBothCacheTokenLocations(t *testing.T) {
 	}
 }
 
+// B4:两种拼写是同一个量的**别名**,不是两个量。相加会把输入与输出一起翻倍
+// (报告实测:gross=200 / Out=10,正确值是 100 / 5)。js stream.js:115-116 逐字
+// 用 `prompt_tokens ?? input_tokens`、`completion_tokens ?? output_tokens`。
+func TestScanUsagePicksOneSpellingInsteadOfAddingThem(t *testing.T) {
+	var acc Usage
+	body := `{"usage":{"prompt_tokens":100,"input_tokens":100,"output_tokens":5,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40}}}`
+	if _, isContent := ScanUsage([]byte(body), &acc, new(bool), time.Now()); isContent {
+		t.Fatal("a usage-only frame is not content")
+	}
+	if acc.In != 60 || acc.Out != 5 || acc.CacheRead != 40 {
+		t.Fatalf("usage = %+v, want in=60(100-40) out=5 cacheRead=40", acc)
+	}
+}
+
+// B4 的另外两面:只给一种拼写时取值照旧;缓存细节是
+// `prompt_tokens_details?.cached_tokens ?? input_tokens_details?.cached_tokens`
+// (js stream.js:117),前者缺字段才回退后者,而不是后者无条件覆盖前者。
+func TestScanUsagePrefersTheFirstSpellingAndTheFirstCacheDetail(t *testing.T) {
+	cases := []struct {
+		name               string
+		body               string
+		in, out, cacheRead int64
+	}{
+		{"prompt-only", `{"usage":{"prompt_tokens":10,"completion_tokens":2}}`, 10, 2, 0},
+		{"input-only", `{"usage":{"input_tokens":10,"output_tokens":2}}`, 10, 2, 0},
+		{"prompt-detail-wins",
+			`{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":3},"input_tokens_details":{"cached_tokens":7}}}`,
+			7, 2, 3},
+		{"fallback-to-input-detail",
+			`{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{},"input_tokens_details":{"cached_tokens":7}}}`,
+			3, 2, 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var acc Usage
+			ScanUsage([]byte(tc.body), &acc, new(bool), time.Now())
+			if !acc.HasUsage || acc.In != tc.in || acc.Out != tc.out || acc.CacheRead != tc.cacheRead {
+				t.Fatalf("usage = %+v, want in=%d out=%d cacheRead=%d", acc, tc.in, tc.out, tc.cacheRead)
+			}
+		})
+	}
+}
+
+// R14:只带输出侧的 usage 帧必须**并入**既有值,而不是整份覆盖
+// (js stream.js:284-293 的三元表达式)。整份覆盖会把 In/CacheRead 清零,
+// 于是 sticky TTL(cacheRead/In 比例)与面板用量一起失真。
+func TestScanUsageMergesAnOutputOnlyFrame(t *testing.T) {
+	start := Usage{In: 11, CacheRead: 3, Out: 5, HasUsage: true}
+	for _, body := range []string{
+		`{"usage":{"output_tokens":7}}`,
+		`{"usage":{"completion_tokens":7}}`,
+		`{"type":"message_delta","usage":{"output_tokens":7}}`,
+	} {
+		acc := start
+		ScanUsage([]byte(body), &acc, new(bool), time.Now())
+		if acc.In != 11 || acc.CacheRead != 3 || acc.Out != 7 || !acc.HasUsage {
+			t.Fatalf("%s -> %+v, want in=11 cacheRead=3 out=7 (the input side is carried)", body, acc)
+		}
+	}
+}
+
+// R14 的另一半:输入侧与输出侧都不提的 usage 帧**不产出 usage**
+// (js stream.js:120 的 `if (prompt === undefined && completion === undefined)
+// return undefined`),acc 与 HasUsage 都不动。
+func TestScanUsageIgnoresAFrameThatNamesNeitherSide(t *testing.T) {
+	acc := Usage{In: 11, CacheRead: 3, Out: 5, HasUsage: true}
+	for _, body := range []string{
+		`{"usage":{}}`,
+		`{"usage":{"prompt_tokens_details":{"cached_tokens":7}}}`,
+		`{"usage":null}`,
+	} {
+		got := acc
+		ScanUsage([]byte(body), &got, new(bool), time.Now())
+		if got != acc {
+			t.Fatalf("%s -> %+v, want the accumulator untouched (%+v)", body, got, acc)
+		}
+	}
+	var fresh Usage
+	ScanUsage([]byte(`{"usage":{}}`), &fresh, new(bool), time.Now())
+	if fresh.HasUsage {
+		t.Fatalf("an empty usage object must not report usage: %+v", fresh)
+	}
+}
+
 func TestTTFTFreezesOnFirstContentNotFirstChunk(t *testing.T) {
 	var acc Usage
 	first := new(bool)
