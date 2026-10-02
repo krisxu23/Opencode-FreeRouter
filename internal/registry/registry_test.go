@@ -128,6 +128,33 @@ func TestRetainOnlyKeepsUnprobedTags(t *testing.T) {
 	}
 }
 
+func TestRetainOnlyProtectsObservationPeriodFails(t *testing.T) {
+	// 观察期节点(测过、失败、连败未到门槛)必须既不被淘汰、也不被清零连败。
+	// 它过去靠「塞进 alive 名单」来免淘汰,而 alive 名单同时会清零计数,于是
+	// 门槛永远够不到 —— 现场就是 `淘汰 0 · 观察期 1601` 长期钉死。
+	r := newReg(t)
+	r.Merge([]parse.Outbound{ob("a"), ob("b")})
+	r.NoteFail("a", time.Now()) // 观察期:1 < MaxFails
+	r.NoteFail("b", time.Now())
+	r.NoteFail("b", time.Now())
+	r.NoteFail("b", time.Now()) // 到门槛:b 本轮该被淘汰
+	// 本轮没有任何节点通关,所以 alive 是空的;a 靠 Protected 免淘汰。
+	dropped := r.RetainOnly([]string{}, RetainOpts{
+		ProbedTags: map[string]bool{"a": true, "b": true},
+		Protected:  map[string]bool{"a": true},
+		MaxFails:   3,
+	})
+	if len(dropped) != 1 || dropped[0] != "b" {
+		t.Fatalf("dropped = %v, want [b]", dropped)
+	}
+	if !r.Has("a") {
+		t.Fatal("观察期节点被淘汰了")
+	}
+	if got := r.FailCount("a"); got != 1 {
+		t.Fatalf("观察期连败被清零:%d, want 1", got)
+	}
+}
+
 func TestRetainOnlyWithMaxFailsInfinityKeepsFailedNodes(t *testing.T) {
 	// 事故轮(alive 比例异常低)走这条路:本轮只记账、不淘汰 —— 单轮判定曾在
 	// 一轮内清零整个池子(实测 2590 → 97),事故轮必须停掉二次伤害

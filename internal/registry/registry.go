@@ -254,23 +254,30 @@ func (r *Registry) NoteFail(tag string, now time.Time) {
 // 被判死并删除」,真正的故障原因被替换成一个无关的原因(JS :215-220)。
 // nil 集合等价于 JS 传 null(:218):全部视为已探测。
 //
+// Protected:本轮测过、失败,但连败还没到门槛的观察期节点。它们必须**既不淘汰、
+// 也不清零连败**。这一项过去不存在,观察期节点被塞进 alive 来「不淘汰」,而 alive
+// 同时意味着「通关 → 连败清零」,于是计数每轮 1→0,门槛永远够不到 —— 现场表现是
+// 日志里 `淘汰 0 · 观察期 1601` 长期钉死,整池死节点一个都不处理。
+//
 // MaxFails:-1 表示 Infinity(事故轮,只记账不淘汰)。正值的连败门槛由调用方
-// (health)在组 alive 名单时执行 —— Go 把 JS retainOnly 里耦在一起的「计败」
-// (e.fails += 1,JS :233)与「判决」(fails >= maxFails,JS :236)拆成了
-// NoteFail + alive 名单两步,本方法只认 -1 哨兵;常规轮请传 registry.MaxFails。
+// (health)用 alive/Protected 两个名单表达 —— Go 把 JS retainOnly 里耦在一起的
+// 「计败」(e.fails += 1,JS :233)与「判决」(fails >= maxFails,JS :236)拆成了
+// NoteFail + 两个名单,本方法只认 -1 哨兵;常规轮请传 registry.MaxFails。
 type RetainOpts struct {
 	ProbedTags map[string]bool
+	Protected  map[string]bool
 	MaxFails   int
 }
 
 // RetainOnly 执行淘汰判决,返回被淘汰的 tag(JS retainOnly 的 removedTags,
-// src/registry.js:213-256;调用方据此清理端口与健康状态)。alive 是本轮的
-// 最终存活名单:探测通关的,以及连败未到门槛、还在观察期的。
+// src/registry.js:213-256;调用方据此清理端口与健康状态)。alive 是**本轮通关**
+// 的名单;观察期(测过、失败、连败未到门槛)的节点走 opts.Protected。
 //
-//   - 淘汰判据 = 本轮测过 ∧ 不在 alive ∧ MaxFails != -1;
+//   - 淘汰判据 = 本轮测过 ∧ 不在 alive ∧ 不在 Protected ∧ MaxFails != -1;
 //   - 淘汰必先立墓碑再删条目:删除会带走条目本身,而连败计数必须活下来,
 //     这是整条机制唯一的持久记忆(JS :237-239);
-//   - 通关的节点把连败清零并顺手清掉同身份墓碑(JS :226-229)。
+//   - 通关的节点把连败清零并顺手清掉同身份墓碑(JS :226-229);观察期的节点
+//     计数不动 —— 清零就等于把它退回起点,门槛永远够不到。
 func (r *Registry) RetainOnly(alive []string, opts RetainOpts) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -288,6 +295,10 @@ func (r *Registry) RetainOnly(alive []string, opts RetainOpts) []string {
 			// 活过来了就把墓碑清掉:留着它只会在下次 churn 时把一次已失效的
 			// 旧判决重新贴到这个节点身上(JS :228-229)。
 			delete(r.tombstones, parse.IdentityOf(e.Outbound))
+			continue
+		}
+		if opts.Protected[tag] {
+			// 观察期:条目与连败计数都原样留着,下一轮继续往上累加。
 			continue
 		}
 		if opts.ProbedTags != nil && !opts.ProbedTags[tag] {

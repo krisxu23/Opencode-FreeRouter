@@ -325,6 +325,38 @@ func TestProbeNowEvictsWhenNotAccident(t *testing.T) {
 	}
 }
 
+// TestFailingNodeIsEvictedAfterConsecutiveRounds 跑真实的连续轮次,而不是像
+// TestProbeNowEvictsWhenNotAccident 那样手工预置三次 NoteFail。
+//
+// 这一条是回归测试:观察期的节点过去被塞进 RetainOnly 的 alive 名单,而 alive
+// 名单里的节点连败会被清零,于是连败计数每轮 0→1→0→1… 永远到不了
+// registry.MaxFails。现场表现就是日志里 `淘汰 0 · 观察期 1601` 长期钉死,
+// 整池死节点一个都不处理。手工预置 NoteFail 的测试绕开了累加环节,所以一直是绿的。
+func TestFailingNodeIsEvictedAfterConsecutiveRounds(t *testing.T) {
+	p := newProbeParts(t, 10)
+	fp := p.Prober.(*fakeProber)
+	fp.failedTags = map[string]bool{"n1": true} // 只有 n1 一直失败,9 个通关
+
+	// force=true:夹具的健康行每轮都是新的,不绕过结果缓存窗就只会测到一次。
+	for round := 1; round <= registry.MaxFails; round++ {
+		if _, err := p.ProbeNow(context.Background(), true); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		want := round
+		if round < registry.MaxFails && p.Registry.FailCount("n1") != want {
+			t.Fatalf("round %d 后连败 = %d, want %d(观察期不能清零计数)",
+				round, p.Registry.FailCount("n1"), want)
+		}
+	}
+	if p.Registry.Has("n1") {
+		t.Fatalf("连败 %d 轮的节点仍在池内,池子 %d 个 —— 淘汰从未生效",
+			registry.MaxFails, p.Registry.Len())
+	}
+	if p.Registry.Len() != 9 {
+		t.Fatalf("池子剩 %d 个, want 9", p.Registry.Len())
+	}
+}
+
 func TestAccidentNeedsMinimumSample(t *testing.T) {
 	p := newProbeParts(t, 5)
 	for i := 0; i < 5; i++ {

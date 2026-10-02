@@ -308,14 +308,17 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 		p.Registry.NoteFail(it.Tag, now)
 	}
 
-	// alive 名单 = 通关的 + 连败还没到门槛的。Go 把 JS retainOnly 里耦在一起的
-	// 「计败」与「判决」拆成两步,正值的门槛必须由调用方在这里执行;事故轮传
-	// 真正的 aliveTags(不能传空集,那会把本轮真通关的节点也记成一次失败),
-	// 只把 MaxFails 抬成 -1(Infinity,只记账不淘汰)。
+	// alive 名单 = 本轮通关的节点;连败未到门槛的是「观察期」名单。两者必须分开:
+	// RetainOnly 对 alive 做「清零连败 + 清墓碑」,把观察期节点塞进 alive 会让
+	// 计数每轮 1→0,门槛永远够不到(现场表现:淘汰恒为 0、观察期长期钉死)。
+	// Go 把 JS retainOnly 里耦在一起的「计败」与「判决」拆成两步,正值的门槛由这里
+	// 用两个名单执行。事故轮不能传空的 Protected —— 那会把本轮真通关的节点也记成
+	// 一次失败,所以只把 MaxFails 抬成 -1(Infinity,只记账不淘汰)。
 	aliveList := make([]string, 0, len(aliveTags))
 	for tag := range aliveTags {
 		aliveList = append(aliveList, tag)
 	}
+	protected := make(map[string]bool, len(items))
 	maxFails := registry.MaxFails
 	if accident {
 		maxFails = -1
@@ -325,12 +328,13 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 				continue
 			}
 			if p.Registry.FailCount(it.Tag) < registry.MaxFails {
-				aliveList = append(aliveList, it.Tag)
+				protected[it.Tag] = true
 			}
 		}
 	}
 	dropped := p.Registry.RetainOnly(aliveList, registry.RetainOpts{
 		ProbedTags: probedTags,
+		Protected:  protected,
 		MaxFails:   maxFails,
 	})
 	for _, tag := range dropped {
