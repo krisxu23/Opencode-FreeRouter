@@ -59,11 +59,11 @@ test('源码包里每个 .go 都在，且一个不多一个不少', async () => 
   assert.deepEqual(missing, [], `包里缺这些 .go: ${missing.join(', ')}`)
 })
 
-test('包内没有 data/、没有 .exe、没有 node_modules/', async () => {
+test('包内没有 data/、没有 .exe/.zip、没有 node_modules/', async () => {
   const { entries } = await buildAndExtract()
   const bad = entries.filter(e =>
-    /(^|\/)data\//.test(e) || /\.exe$/i.test(e) || /(^|\/)node_modules\//.test(e) ||
-    /(^|\/)archive\//.test(e))
+    /(^|\/)data\//.test(e) || /\.(exe|zip)$/i.test(e) || /(^|\/)node_modules\//.test(e) ||
+    /(^|\/)(archive|dist)\//.test(e))
   assert.deepEqual(bad, [], `包里出现了不该出现的条目: ${bad.join(', ')}`)
 })
 

@@ -18,3 +18,6 @@ difftest-tmp/
 /docs/
 /difftest/
 /scripts/diff-accept.mjs
+
+# CI 发布作业放 zip 的地方（本机跑同一段打包时也一样）
+/dist/

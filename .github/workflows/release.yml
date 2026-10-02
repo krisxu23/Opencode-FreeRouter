@@ -6,21 +6,26 @@ name: release
 # `npm run fetch-singbox` 全部失效（根 package.json 已无 dependencies，check.mjs 与
 # build-release.mjs 已随 JS 版归档）。
 #
-# 三个不显然的点：
+# 同日裁定改为对外发布（修正案 §13）：gates 之后加回发布作业，打 `v*` tag 即产出
+# Windows 可执行 zip，并把同版本的 GPL 对应源码包挂到同一个 Release 上 —— 只发 exe
+# 不发源码是一次 GPL 违规，所以两者必须在同一个分发位置，缺一不可。
+#
+# 四个不显然的点：
 #   - setup-node 仍然要装：CI 跑的是 scripts/*.mjs，它们是唯一的构建/测试入口
 #     （全局约束 1），不是可选的便捷封装。
 #   - `go mod download` 必须显式跑：scripts/go-build.mjs 的 goEnv() 硬写
 #     GOPROXY=off（本机 proxy 8s 超时、模块缓存已热，见该文件头注释），冷缓存的
-#     CI 不先下载就会直接失败。
-#   - 发布作业（原来打 tag 就构建 zip 并挂 GitHub Release）**删掉了**：Go 版的
-#     分发形态是 GPL-3.0 源码包，而它 2026-10-02 裁定**不外发、只本地生成**
-#     （见 docs/superpowers/plans/2026-10-01-plan-corrections.md §9-9）。没有分发点
-#     就没有需要挂源码的位置，留一个 release 作业只会构建没人要的东西。将来要发：
-#     exe 与同版本源码包必须出现在同一个分发位置，只发 exe 就是一次 GPL 违规。
+#     CI 不先下载就会直接失败。发布作业也要跑它 —— make-source-tarball.mjs 的
+#     依赖清单来自 `go list -deps`，同样离线。
+#   - 换行由 .gitattributes 锁成 LF：Windows runner 默认 core.autocrlf=true，
+#     会把 web/index.html 检出成 CRLF，而 internal/panel 的字节尾巴断言钉的就是
+#     `</html>\n`（2026-10-02 首跑即因此红在 Go tests）。
+#   - `paths-ignore: ['**.md']` 去掉了：它对 push 事件连带作用于 tag，README 单独
+#     改一行的那次发布就会静不触发。发布比省几分钟 CI 值钱。
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -83,3 +88,60 @@ jobs:
           } finally {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           }
+
+  # 只在 v* tag 上跑；gates 绿了才发（同一 run 里 needs 就是这道门）。
+  release:
+    needs: gates
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Warm the module cache
+        run: go mod download
+
+      - name: Build FreeRouter.exe
+        run: node scripts/build-tray-exe.mjs
+
+      # 二进制与「完整对应源码」必须指同一个版本，否则 GPL 的配对承诺是空的。
+      # 版本号只认 package.json，tag 得是它的 v 前缀形。
+      - name: Tag must match package.json
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("v$v" -ne $env:TAG) { throw "tag=$env:TAG 而 package.json=$v，两者必须一致" }
+
+      # zip 里带 web/ 不是冗余：面板是从文件系统读 web/index.html 与 web/app.js 的
+      # （resolveWebDir 的第一个候选就是 <exe 目录>/web），单发 exe 就只有转发能用、
+      # 打开面板是空白。
+      - name: Package zip + GPL source tarball
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path FreeRouter.exe, web, LICENSE, NOTICE, README.md -DestinationPath "dist/FreeRouter-$env:TAG-windows-x64.zip"
+          node scripts/make-source-tarball.mjs
+          Copy-Item release/*-source.tar.gz dist/
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Publish
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $notes = 'OpenAI 兼容的本地网关（Windows x64）。解压到任意目录，双击 FreeRouter.exe，托盘出现图标就已在跑；面板 http://127.0.0.1:3458/ ，接入点 http://127.0.0.1:3457/v1 。免安装、无运行时依赖；订阅地址要自己填。 同一个 Release 里的 freerouter-*-source.tar.gz 是这份二进制的完整对应源码（GPL-3.0-or-later，含依赖许可证全文与构建脚本）。'
+          gh release create $env:TAG --title "FreeRouter $env:TAG" --notes $notes (Get-ChildItem dist).FullName

@@ -15,8 +15,11 @@
 
 ## 上手
 
-1. `npm run build:exe` → 仓库根出现 `FreeRouter.exe`（单个 exe，运行期不需要 Node）
-2. 双击它 → 托盘出现图标（没有控制台窗口）→ 右键「打开面板」
+1. 到 [Releases](https://github.com/krisxu23/Opencode-FreeRouter/releases) 下载
+   `FreeRouter-v<版本>-windows-x64.zip`，解压到任意空目录（`web/` 要和 exe 同级，面板才打得开）；
+   想自己构建就 `npm run build:exe` → 仓库根出现 `FreeRouter.exe`
+2. 双击它 → 托盘出现图标（没有控制台窗口）→ 右键「打开面板」。exe 未签名，
+   Windows 可能弹 SmartScreen，选「仍要运行」；运行期不需要 Node
 3. 面板 **设置** 页填订阅地址、勾地区与回退顺序 → **保存并应用**
 4. 等首轮探测跑完，在 **出口节点** 页确认健康池，然后按下面的接入信息去配你的客户端
 
@@ -60,7 +63,7 @@ GPL-3.0-or-later（`LICENSE`）—— 因为 sing-box 是以库的形式链接�
 * `NOTICE`：sing-box 的名称条款、依赖按许可证类型的统计、上游致谢
 * `THIRD-PARTY-LICENSES/`：70 个依赖模块的许可证全文 + `INDEX.md` 清单
 * `npm run release` 重新汇总上面两项，并打出 GPL 源码包到 `release/`
-* 二进制由你自己构建。若你把它分发出去，记得同版本的完整源码要和二进制出现在同一个位置
+* Release 页同时挂 zip 与同版本的源码包 —— 只发二进制就是一次 GPL 违规
 
 > 构建契约（`GOPROXY=off`、链接标签、工具链版本）写在 `scripts/go-build.mjs` 的头注释里，
 > 分层与依赖规则在 `internal/LAYERS.md`，本文件只讲这个程序做什么。

@@ -216,10 +216,12 @@ function rewriteNotice(rows) {
 
 // Go 树扁平化到仓库根之后（2026-10-02），打包就是「走一遍根目录 + 排除清单」。
 // 不再维护 include 列表：新加一个顶层目录时，include 列表会静默把它漏掉，而排除
-// 清单不会 —— 排除项及理由：*.exe 是产物不是源码；data/ 里有用户的订阅 URL 与
-// forward key；node_modules/ 与 archive/ 属于已冻结的 MIT 作品；difftest-tmp/ 是
-// 工装的临时产物；docs/ 整棵不要，只单列其中的验收报告（见 EXTRA_DIRS）。
-const EXCLUDE_NAMES = new Set(['node_modules', 'data', 'archive', 'release', 'difftest-tmp', '.git', 'docs'])
+// 清单不会 —— 排除项及理由：*.exe 与 dist/ 是产物不是源码（dist/ 是 CI 发布作业
+// 放 zip 的地方，源码包混进二进制就没人核对「源码就是二进制里那份」了）；data/
+// 里有用户的订阅 URL 与 forward key；node_modules/ 与 archive/ 属于已冻结的 MIT
+// 作品；difftest-tmp/ 是工装的临时产物；docs/ 整棵不要，只单列其中的验收报告
+// （见 EXTRA_DIRS）。
+const EXCLUDE_NAMES = new Set(['node_modules', 'data', 'archive', 'release', 'difftest-tmp', 'dist', '.git', 'docs'])
 const EXTRA_DIRS = [[path.join(ROOT, 'docs', 'accept'), 'docs/accept']]
 
 /** 源码包的文件清单（确定性排序）。 */
