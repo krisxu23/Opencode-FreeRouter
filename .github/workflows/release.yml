@@ -63,12 +63,16 @@ jobs:
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
         run: |
+          # 见下面 Resolve 步骤的同一条说明：pwsh 步骤的 ErrorActionPreference 是 Stop，
+          # native 命令的 stderr 会变成终止性错误。这里用 `git rev-parse --quiet
+          # --verify`（失败只给非零退出码，不写 stderr）而不是 `git cat-file -e`
+          # —— 后者在 before 不可达时（强推、分支首推）会往 stderr 喊，把一次本该
+          # 「退化处理」的push变成红。
+          $ErrorActionPreference = 'Continue'
           $zero = '0000000000000000000000000000000000000000'
-          # 不用 `(cmd; expr)` 这种括号内多语句写法:pwsh 会把它当成子表达式数组,
-          # -and 拿到的是集合而不是布尔值,判定就会飘(而且不同版本行为不一致)。
           $reachable = $false
           if ($env:BEFORE -ne $zero) {
-            git cat-file -e "$($env:BEFORE)^{commit}" 2>$null
+            $null = git rev-parse --quiet --verify "$($env:BEFORE)^{commit}"
             $reachable = ($LASTEXITCODE -eq 0)
           }
           if ($reachable) {
@@ -172,6 +176,12 @@ jobs:
           REF: ${{ github.ref }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # GitHub 给 pwsh 步骤设的是 $ErrorActionPreference='Stop'，而 native 命令写到
+          # stderr 的东西会被 PowerShell 转成终止性错误（NativeCommandError）。这一步
+          # 恰恰要故意去读一个「可能不存在」的 release —— 404 走 stderr，于是 Stop 让
+          # 它在正常情况下必红（2026-10-03 首次上 CI 就是这样失败的）。所以要显式放宽，
+          # 并且只认 $LASTEXITCODE。
+          $ErrorActionPreference = 'Continue'
           $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
           $tag = "v$v"
           if ($env:REF -like 'refs/tags/*') {
@@ -179,13 +189,16 @@ jobs:
             if ($tagName -ne $tag) { throw "tag=$tagName 而 package.json=$v，两者必须一致" }
           }
           "tag=$tag" >> $env:GITHUB_OUTPUT
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "$tag 已经发布过，跳过发布（版本没前进的 push 不发新 exe）"
+          $null = gh release view $tag 2>&1
+          $exists = ($LASTEXITCODE -eq 0)
+          Write-Host "ref=$($env:REF) tag=$tag 已发布=$exists"
+          if ($exists) {
+            Write-Host "版本没前进的 push 不重发同一个 tag"
             "skip=true" >> $env:GITHUB_OUTPUT
           } else {
             "skip=false" >> $env:GITHUB_OUTPUT
           }
+          exit 0
 
       - uses: actions/setup-node@v4
         if: steps.rel.outputs.skip != 'true'
