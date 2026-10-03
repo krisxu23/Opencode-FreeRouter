@@ -53,7 +53,9 @@ func TestBootSeedsCatalogFromDiskCache(t *testing.T) {
 		t.Fatalf("写缓存: %v", err)
 	}
 
-	parts, err := Load(root)
+	// 端口走一次性分配（见 app_test.go 的 loadWithPorts）：这条验的是目录缓存装载，
+	// 让它去抢默认的 3457/3458 只会平白沾上端口重绑的 flake。
+	parts, err := loadWithPorts(t, root, nil)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}

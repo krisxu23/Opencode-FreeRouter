@@ -22,17 +22,124 @@ import (
 	"freerouter/internal/nodeprobe"
 )
 
-// load 起一个完整网关，并把关闭交给 t。所有测试都落在默认的 3457/3458 两个
-// 端口上：Go 的包内测试是顺序跑的，而阶段 2 已实测 server-first FIN 之后
-// Windows 立刻能重新绑上同一个端口，所以只要每个测试都关干净就不会互相踩。
+// load 起一个完整网关，并把关闭交给 t。
+//
+// 端口是**每个测试一对、只用一次**的。原来的写法假设「包内测试顺序跑，所以都
+// 用默认 3457/3458 也不会互相踩」，那个前提只对**连接**成立（server-first FIN
+// 之后 Windows 确实能立刻重绑同一个端口），对**监听套接字**不成立：listener
+// 关闭后端口会进 TimeWait（本机实测：跑完一轮后 3457 停在 TimeWait、pid 0），
+// 下一个测试的 net.Listen 就可能 EADDRINUSE，而 Load 不回落端口 —— 它直接
+// 返回错误。CI 的 4 核共享 runner 周期性踩到这条路径（run 37094536832 的
+// "Go tests" 步骤就红在这里，本地 -count=4 -cpu=2 多包并发能复现）。
+// 端口一对只用一次，就没有可互相踩的窗口；再兜一层：真被别的进程抢走（Windows
+// 还会把某些区段整块保留给 Hyper-V）就换一对重试，但只对「监听失败」这一类错误
+// 重试，别的错误不许被重试掩盖。
 func load(t *testing.T) *Parts {
 	t.Helper()
-	parts, err := Load(t.TempDir())
+	parts, err := loadWithPorts(t, t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	t.Cleanup(func() { _ = parts.Shutdown(context.Background()) })
 	return parts
+}
+
+// loadWithPorts 在给定 root 上跑 Load，端口由操作系统挑，并写进 settings.json
+// （盘上有值 ⇒ 默认值不生效，测试之间不再共用 3457/3458）。extra 是同一份文件里
+// 要一并写死的其它键（比如「盘上的值优先」那条要放的 countries）。
+//
+// 端口不是一次探完再交出去，而是**每一轮重试都重新让 Load 去绑**：先 bind :0 探
+// 到号、关掉、再让 Load 去绑同一个号，是探测-释放-重绑的经典竞态 —— 并排跑的其
+// 它包（httptest 也从同一动态区取端口）完全可以在中间把它拿走，实测多包并发下
+// 正是这样红的。所以这里对「监听失败」这一类错误整轮重来，而不是假装端口是稳的。
+func loadWithPorts(t *testing.T, root string, extra map[string]any) (*Parts, error) {
+	t.Helper()
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		f, p := freePortPair(t)
+		if err := writeSettingsPorts(t, root, f, p, extra); err != nil {
+			return nil, err
+		}
+		parts, err := Load(root)
+		if err == nil {
+			return parts, nil
+		}
+		lastErr = err
+		if !strings.Contains(err.Error(), "监听") {
+			return nil, err // 不是端口冲突：不许用重试把它掩盖掉
+		}
+	}
+	return nil, lastErr
+}
+
+// writeSettingsPorts 在 Load 之前把端口与 extra 键写进 data/settings.json。
+func writeSettingsPorts(t *testing.T, root string, forwardPort, panelPort int, extra map[string]any) error {
+	t.Helper()
+	dataDir := filepath.Join(root, "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return err
+	}
+	body := map[string]any{"forwardPort": forwardPort, "panelPort": panelPort}
+	for k, v := range extra {
+		body[k] = v
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dataDir, "settings.json"), raw, 0o644)
+}
+
+// freePortPair 让操作系统挑两个空闲端口：它给的一定不在本机保留区段内，
+// 比「从固定区间猜」可靠。探测完立刻关闭，端口只被随后的 Load 用一次。
+func freePortPair(t *testing.T) (int, int) {
+	t.Helper()
+	a := probeFreePort(t)
+	b := probeFreePort(t)
+	for b == a {
+		b = probeFreePort(t)
+	}
+	return a, b
+}
+
+func probeFreePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("探空闲端口: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// waitBindable 等一组端口真的可以被重新绑定（TimeWait 消散）。只给那些**必须**
+// 用固定默认端口的测试用（它们验的就是默认值本身）。
+func waitBindable(t *testing.T, ports ...int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		free := true
+		lns := make([]net.Listener, 0, len(ports))
+		for _, p := range ports {
+			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+			if err != nil {
+				free = false
+				break
+			}
+			lns = append(lns, ln)
+		}
+		for _, ln := range lns {
+			_ = ln.Close()
+		}
+		if free {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("端口 %v 在 10s 内始终不可绑定（上一个测试的 TimeWait 没散？）", ports)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func client() *http.Client {
@@ -129,6 +236,10 @@ func TestLoadCreatesEveryStoreUnderRoot(t *testing.T) {
 
 func TestLoadOnAnEmptyRootWritesSettingsDefaults(t *testing.T) {
 	root := t.TempDir()
+	// 这条验的就是「默认值本身」，所以必须用固定的 3457/3458，不能换成一次性
+	// 端口；等上一轮测试的 TimeWait 散去再绑，否则它就成了上面那个 flake 的
+	// 又一个受害者。
+	waitBindable(t, 3457, 3458)
 	parts, err := Load(root)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -153,25 +264,26 @@ func TestLoadOnAnEmptyRootWritesSettingsDefaults(t *testing.T) {
 
 func TestLoadDoesNotOverwriteExistingSettings(t *testing.T) {
 	root := t.TempDir()
-	dataDir := filepath.Join(root, "data")
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	file := filepath.Join(dataDir, "settings.json")
-	if err := os.WriteFile(file, []byte(`{"forwardPort":9999,"countries":["JP"]}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	parts, err := Load(root)
+	// countries 是我们写进去的既有值，端口交给 helper 挑（含端口冲突重试）：这条要
+	// 验的是「盘上的值优先、文件不被默认值改写」，而不是「某个号恰好没人用」。
+	parts, err := loadWithPorts(t, root, map[string]any{"countries": []string{"JP"}})
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	defer func() { _ = parts.Shutdown(context.Background()) }()
 
-	if parts.Settings.ForwardPort != 9999 {
-		t.Errorf("ForwardPort = %d, want 9999（盘上的值优先）", parts.Settings.ForwardPort)
+	file := filepath.Join(root, "data", "settings.json")
+	got := readJSON(t, file)
+	if int(got["forwardPort"].(float64)) != parts.Settings.ForwardPort ||
+		int(got["panelPort"].(float64)) != parts.Settings.PanelPort {
+		t.Fatalf("盘上端口(%v/%v)与运行时(%d/%d)不一致：Load 改写了盘上的值或没按盘上的值起",
+			got["forwardPort"], got["panelPort"], parts.Settings.ForwardPort, parts.Settings.PanelPort)
 	}
-	if got := readJSON(t, file)["forwardPort"]; got != float64(9999) {
-		t.Errorf("盘上的 forwardPort 被改写成 %v", got)
+	if parts.Settings.ForwardPort == 3457 || parts.Settings.PanelPort == 3458 {
+		t.Fatalf("盘上的端口被默认值盖掉了: %d/%d", parts.Settings.ForwardPort, parts.Settings.PanelPort)
+	}
+	if cc, ok := got["countries"].([]any); !ok || len(cc) != 1 || cc[0] != "JP" {
+		t.Errorf("countries 被动过: %v", got["countries"])
 	}
 }
 
@@ -267,7 +379,9 @@ func TestShutdownIsSafeTwice(t *testing.T) {
 
 func TestShutdownFlushesEveryStore(t *testing.T) {
 	root := t.TempDir()
-	parts, err := Load(root)
+	// 这条只关心「Shutdown 把每个存储都落盘」，端口给它一对一次性的：裸 Load
+	// 会去绑默认的 3457/3458，而那是上面那个 TimeWait flake 的靶子。
+	parts, err := loadWithPorts(t, root, nil)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
