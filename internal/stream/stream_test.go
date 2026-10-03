@@ -245,6 +245,34 @@ func TestEventDataIsBounded(t *testing.T) {
 	}
 }
 
+// TestOversizedSingleLineSurfacesAsEventTooLarge 是协议审计 L4 的钉:一条
+// 超过 8MB 的**单行** data 先撞的是 bufio.Scanner 的行长上限(累加器要等
+// 这行扫完才看得到它),过去漏出的是 bufio.ErrTooLong —— 与多行拼出来的
+// ErrEventTooLarge 是两个不同的哨兵,同一个语义却叫两个名字。现在必须收敛
+// 成同一个 ErrEventTooLarge。
+//
+// 用 io.Pipe 流式喂(与上面 :230 的越界测试同一手法):测试自己先分配一个
+// 8MB+ 的字符串,测的就不是被测代码的内存了。
+func TestOversizedSingleLineSurfacesAsEventTooLarge(t *testing.T) {
+	pr, pw := io.Pipe()
+	go func() {
+		defer func() { _ = pw.Close() }()
+		if _, err := pw.Write([]byte("data: ")); err != nil {
+			return
+		}
+		chunk := []byte(strings.Repeat("a", 64*1024))
+		for sent := 0; sent <= maxEventBytes; sent += len(chunk) {
+			if _, err := pw.Write(chunk); err != nil {
+				return // 读侧已返回,pipe 关闭
+			}
+		}
+	}()
+	err := ReadSSE(pr, func(Event) error { return nil })
+	if !errors.Is(err, ErrEventTooLarge) {
+		t.Fatalf("err = %v, want ErrEventTooLarge(L4:单行超限必须与多行超限同一哨兵,不得漏出 bufio.ErrTooLong)", err)
+	}
+}
+
 // TestEventCapDoesNotRejectAnEventExactlyAtTheLimit 是 R11 的差一字节钉子。
 // 多行事件在 Join 时会插入换行,只有非首行才该计入;否则一个正好等于上限的
 // 事件会被多算字节而误拒。

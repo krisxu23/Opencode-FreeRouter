@@ -1338,6 +1338,77 @@ func TestUnreadableSuccessBodyIsRetriedAsTransport(t *testing.T) {
 	}
 }
 
+// TestLargeValidAnswerIsNotTruncatedIntoServerSweep 是上游层审计「1MiB 静默
+// 截断」的钉:一份**合法**的大 JSON 回答(>1MiB,非流式的整包)过去被
+// readAllPrefix 在 1MB 处砍断 → json.Unmarshal 失败 → readJSON 的守卫报
+// 「unexpected non-SSE response」→ SERVER。三条谎言:上游明明回了可解析的
+// JSON;SERVER 不在 cooldownOn(坏出口不冷却);SERVER 在 retryOn —— 于是一
+// 个能答的出口被判坏、白扫 20 个出口把整篇回答重新生成一遍(上游按次计费)。
+//
+// 修复把 2xx 整包读取从「静默前缀」换成严格读 + 16MiB 上限,这条回答现在
+// 必须解析成功、文本完整交出。用 io.Pipe 流式喂,测试自己先分配 2MB 字符串
+// 就测不到被测代码的内存了(与 :230 的手法一致)。
+func TestLargeValidAnswerIsNotTruncatedIntoServerSweep(t *testing.T) {
+	const contentLen = 2 << 20 // 2MiB 正文,> 旧的 1MiB 静默截断点
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// {"choices":[{"message":{"content":"aaaa…2MiB…"}}]}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"`)
+		chunk := strings.Repeat("a", 64*1024)
+		for sent := 0; sent < contentLen; sent += len(chunk) {
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+		}
+		_, _ = io.WriteString(w, `"}}]}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newAdapter(srv.URL, srv.Client(), "big-pickle")
+	var out strings.Builder
+	_, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   false,
+	}, collect(&out))
+	if err != nil {
+		t.Fatalf("合法大回答被判失败(截断→SERVER→扫池的复发): code=%q err=%v", errors.CodeOf(err), err)
+	}
+	if out.Len() < contentLen {
+		t.Fatalf("正文 = %d 字节, want ≥%d(必须完整不被截)", out.Len(), contentLen)
+	}
+}
+
+// TestOversizeAnswerFailsAsTransportNotServer 钉住修复的另一半:超过
+// maxAnswerBodyBytes(8MiB)严格上限的 2xx 体不是合法回答,必须走
+// bodyReadFailure 的 TRANSPORT(在 retryOn 里、换出口),而不是继续骗成
+// SERVER。读断的整包与读断的错误信封同一条 R18 语义:「整包没读全」不等于
+// 「上游回了奇怪的东西」。
+func TestOversizeAnswerFailsAsTransportNotServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"`)
+		chunk := strings.Repeat("a", 64*1024)
+		// 无限吐,直到读侧在 8MiB+1 处报错返回、pipe 关闭。
+		for {
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newAdapter(srv.URL, srv.Client(), "big-pickle")
+	_, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   false,
+	}, collect(&strings.Builder{}))
+	if code := errors.CodeOf(err); code != check.CodeTransport {
+		t.Fatalf("code = %q, want TRANSPORT(超限整包是传输故障,不是「奇怪响应」的 SERVER)", code)
+	}
+}
+
 func TestDecoyToolsAreInjectedOnEveryWire(t *testing.T) {
 	for _, model := range []string{"big-pickle", "muse-spark-1.3-contributor-free", "union-alpha"} {
 		f := newFakeUpstream(t, func(n int) (int, string, string) {

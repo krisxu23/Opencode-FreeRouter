@@ -291,6 +291,14 @@ func (h *Health) rankLocked(node PoolNode, req PickRequest, busy map[string]int,
 		} else if r.LatencyMS != 0 {
 			latency = r.LatencyMS
 		}
+		// **这是对 JS 的一处有意修正**:-1 在本项目里是「没有任何延迟数据」的
+		// 内部哨兵(noteQuota 给新行的 LatencyMS=-1、dead 行的 LatencyMin=-1),
+		// 而 JS 把它当一个可以参战的数字 —— cost = (load+1)×(-1) 是**负数**,
+		// 于是「一个测量都没做过的节点」在同 bucket 里稳赢所有有真实延迟的
+		// 节点,成为每个回合的首选。这里把 ≤0 归回哨兵语义:没有数据 = 排最后。
+		if latency <= 0 {
+			latency = orderSentinelCut + 1
+		}
 	}
 	// 同 bucket 内再按 (load+1)×latency 排:负载每多一条就把等效延迟放大一档,
 	// 于是「快而挤」会输给「略慢而空」。用乘法而不是先比负载,是为了不让一个

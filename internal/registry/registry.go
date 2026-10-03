@@ -412,13 +412,17 @@ func (r *Registry) pruneTombstonesLocked() {
 	}
 }
 
-// EnforceCap 池子超上限时按加入时间淘汰最旧的,返回驱逐数(JS :271-282)。
+// EnforceCap 池子超上限时按加入时间淘汰最旧的,返回**被驱逐的 tag 列表**
+// (JS :271-282)。返回名单而不是个数:调用方必须把这批 tag 交给
+// Health.Forget —— 只删注册表不删健康行,被淘汰节点的行会一直留在
+// node-health.json 里(生命周期审计 D-C1/D-A2)。PruneStale 只在**探测轮**
+// 里跑,池子静默(订阅刷新淘汰而探测没跑)时没有任何回收点。
 // 容量不是节点的罪,驱逐**不立墓碑** —— 这些只是挤不下的,不是被判死的。
-func (r *Registry) EnforceCap(cap int) int {
+func (r *Registry) EnforceCap(cap int) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.entries) <= cap {
-		return 0
+		return nil
 	}
 	type kv struct {
 		tag string
@@ -436,18 +440,18 @@ func (r *Registry) EnforceCap(cap int) int {
 		// Go map 无序,退化成 tag 字典序 —— 只影响同批内谁先出局,不影响总量。
 		return all[i].tag < all[j].tag
 	})
-	removed := 0
+	var evicted []string
 	for _, x := range all {
 		if len(r.entries) <= cap {
 			break
 		}
 		delete(r.entries, x.tag)
-		removed++
+		evicted = append(evicted, x.tag)
 	}
-	if removed > 0 {
+	if len(evicted) > 0 {
 		r.generation++
 	}
-	return removed
+	return evicted
 }
 
 // Remove 彻底删除一个节点(check 自愈剔除用),**不立墓碑**(JS :200-204):

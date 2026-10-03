@@ -86,6 +86,24 @@ func TestRequestIDIsStableForTheSameTurn(t *testing.T) {
 	}
 }
 
+// BaseFromEnv 是 OUR_FREE_MODEL_BASE 的唯一读取口径。钉三件事:
+//  1. 没设变量 → 默认值 UpstreamBase(车道没被误指向别处);
+//  2. 设了变量 → 覆盖生效(数据面 + catalog + B 档探针同一入口);
+//  3. 设了空串 → 回落到默认值(空串**不是**「指向空 URL」,那是启动即崩的形状)。
+//
+// 这条测试同时是给「两处各读各的 env」上的一道结构性护栏:过去 adapter 写死
+// 常量、Parts.base 单独 getenv,自测开关在数据面上失效(上游层审计)。
+func TestBaseFromEnvHonorsTheSelftestOverride(t *testing.T) {
+	t.Setenv("OUR_FREE_MODEL_BASE", "")
+	if got := BaseFromEnv(); got != UpstreamBase {
+		t.Fatalf("空 env = %q, want 默认 %q(空串必须回落,不得当空 URL 用)", got, UpstreamBase)
+	}
+	t.Setenv("OUR_FREE_MODEL_BASE", "http://127.0.0.1:1")
+	if got := BaseFromEnv(); got != "http://127.0.0.1:1" {
+		t.Fatalf("设了 env = %q, want 覆盖值", got)
+	}
+}
+
 // 计划表第 7 条:剥尾部 "(level)" 思考前缀(src/upstream.js:213-215)。
 // 实测(node,2026-10-01):正则 \([^()]+\)\s*$ 只剥尾部的**简单**括号组 ——
 // 嵌套串 "a(b(c))" 尾部不是简单组,整体不匹配,原样返回;多个尾组

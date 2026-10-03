@@ -172,6 +172,15 @@ func (p *Prober) log(level, msg string) {
 
 // fetchVia 经 dial 对 url 发一次 GET，单发预算 timeoutMs。
 //
+// 返回的 cancel **必须活到响应体被读完再调**（第三个返回值）：响应体的读挂在
+// shot ctx 上，RoundTrip 一返回就 cancel 会把刚拿到的 body 立刻掐死 —— 本项目
+// 自己在 httpclient.idleTransport 里把这条规则写成了注释（「实测症状是
+// context canceled」），nodeprobe 曾是它的违例者：闸门体是几百 KB 的模型清单、
+// echo 体经代理常被拆成头/体两段，defer cancel 让这类多段 body 恒读不完，
+// 于是「到得了上游但到不了 Cloudflare」这种**本应存活**的节点每轮被判 dead，
+// exitIp 也大面积空（同 IP 归组与配额扩散静默失效）。timeoutMs 仍由 ctx 的
+// deadline 与 client.Timeout 双保险：不提前 cancel ≠ 无界等待。
+//
 // 每次调用新建一个 httpclient，不复用连接池（JS fetchVia 每次现做 dispatcher，
 // 同理）：A 节点的复活连接若是池化复用的，会被记到 B 头上。redirect 按 JS 的
 // `redirect: 'error'` 关闭——映射为 ErrUseLastResponse，被门户重定向时判决层只
@@ -184,9 +193,8 @@ func (p *Prober) log(level, msg string) {
 // 「僵尸拨号占着 sing-box inbound」事故的 Go 版形状。以 shot 为父重发期限，预算
 // 与取消两条线都接回来；代价是放弃了 transport「拨号结果给下一个请求复用」的
 // 优化——本就每 shot 一个 client、无池可复用，无所谓。
-func fetchVia(ctx context.Context, dial httpclient.Dialer, url string, timeoutMs int, ua string) (*http.Response, error) {
+func fetchVia(ctx context.Context, dial httpclient.Dialer, url string, timeoutMs int, ua string) (*http.Response, context.CancelFunc, error) {
 	shot, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
-	defer cancel()
 	bounded := dial
 	if bounded != nil { // nil = 直连，交给 httpclient 的默认拨号器
 		bounded = func(_ context.Context, network, addr string) (net.Conn, error) {
@@ -199,11 +207,17 @@ func fetchVia(ctx context.Context, dial httpclient.Dialer, url string, timeoutMs
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	req, err := http.NewRequestWithContext(shot, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		cancel()
+		return nil, nil, err
 	}
 	req.Header.Set("accept", "application/json")
 	req.Header.Set("user-agent", ua)
-	return client.Do(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	return resp, cancel, nil
 }
 
 // firstSuccess 并发打满 urls，首个「判出结果」的 shot 赢，其余当场取消，全败
@@ -237,9 +251,14 @@ func firstSuccess(
 		shotCtx, cancel := context.WithCancel(ctx)
 		cancels[i] = cancel
 		go func(shotCtx context.Context, url string) {
-			resp, err := fetchVia(shotCtx, dial, url, timeoutMs, uaOf(url))
+			resp, cancelShot, err := fetchVia(shotCtx, dial, url, timeoutMs, uaOf(url))
 			var v any
 			if err == nil {
+				// cancel 活到 body 被排干并关闭:H1 的修复核心 —— 判决与排干
+				// 都发生在响应体上,fetchVia 一返回就 cancel 会掐死多段的
+				// 大 body(闸门模型清单/代理下的 echo JSON),把可服务的节点
+				// 每轮判死。defer 在发送 outcome 之后运行,败者与胜者同待遇。
+				defer cancelShot()
 				v, err = judge(resp, url)
 				// 判决后一律排干并关 body（JS drain / body.cancel）：不关会把
 				// 这条连接和它的 goroutine 留在 transport 里。

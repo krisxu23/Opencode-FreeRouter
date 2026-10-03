@@ -184,6 +184,35 @@ func TestSurvivingCoarseProbeKeepsBTier(t *testing.T) {
 	}
 }
 
+// TestBTierIsInvalidatedWhenTheExitIPMoved 是上游层审计「过期 B 档钉死」的
+// 镜像钉:B 的含义是「从这个出口出去,门控模型可用」。同一个 tag 的节点换了
+// 出口 IP(动态 IP / 后端池漂移),这句话就不再成立;而 runTierPipeline 对
+// 已证 B 的节点**永不重测**,所以不在这里撤销凭证,一个漂到墙外国家的节点
+// 会永远挂着 B,被 gated 流量优选(rankLocked 给 B 桶位 −1),每轮真实对话
+// 先付一次 REGION 失败再轮换 —— 坏凭证永不自愈。
+//
+// 判据只用**本轮量到**的 IP:echo 失败(没量到)不构成移动证据,凭证保留 ——
+// 那条路径由 TestMarkProbeKeepsTheLastExitIPWhenEchoFails 钉住。
+func TestBTierIsInvalidatedWhenTheExitIPMoved(t *testing.T) {
+	h := NewHealth("")
+	h.MarkProbe("n1", aliveRes(100, "1.1.1.1", "US"))
+	h.MarkTierProbe("n1", "available")
+	if got := h.TierOf("n1"); got != TierB {
+		t.Fatalf("setup: tier = %q, want B", got)
+	}
+	time.Sleep(5 * time.Millisecond)
+	// 同一个 tag,出口 IP 变成 2.2.2.2 → 降回 A(下一轮 runTierPipeline 重验)。
+	h.MarkProbe("n1", aliveRes(110, "2.2.2.2", "US"))
+	if got := h.TierOf("n1"); got != TierA {
+		t.Fatalf("tier after exit-IP move = %q, want A: 换出口即作废 B 凭证", got)
+	}
+	// 反面对照:本轮没量到 IP(沿用旧值)→ 不动凭证。
+	h.MarkProbe("n1", aliveRes(120, "", ""))
+	if got := h.TierOf("n1"); got != TierA {
+		t.Fatalf("tier = %q, want A(沿用上一步的降档,不因 echo 失败升回 B)", got)
+	}
+}
+
 func TestNoteQuotaOnAUnknownNodeCreatesARow(t *testing.T) {
 	h := NewHealth("")
 	h.NoteQuota("n1")
@@ -344,6 +373,35 @@ func TestStickyDropsWhenTheWholeExitDies(t *testing.T) {
 	}
 	if len(h.stickyFail) != 0 {
 		t.Fatalf("stickyFail rows = %d, want 0", len(h.stickyFail))
+	}
+}
+
+func TestStickyRotationPrefersLowerLatency(t *testing.T) {
+	// M4a 的钉:同 IP 内有多个存活替补时,轮换必须按 latencyMin 择优 ——
+	// 注释一直这么承诺(「排序与 pick 一致」),旧代码只比存活位,并列时取
+	// 字典序第一个,于是一个 500ms 的替补会赢过 20ms 的。
+	h := NewHealth("")
+	h.MarkProbe("a", aliveRes(10, "1.1.1.1", "US"))
+	h.MarkProbe("b", aliveRes(500, "1.1.1.1", "US"))
+	h.MarkProbe("c", aliveRes(20, "1.1.1.1", "US"))
+	h.NoteSticky("s", "a", false)
+	h.MarkProbe("a", deadRes()) // 原节点死 → 同 IP 轮换
+	if got := h.ExitForSession("s"); got != "c" {
+		t.Fatalf("ExitForSession = %q, want c(20ms 替补): 同 IP 轮换必须按延迟择优", got)
+	}
+}
+
+func TestStickyRotationPrefersAliveOverLatency(t *testing.T) {
+	// 存活位优先于延迟:20ms 但 dead 的 b 不得赢过 500ms 且 alive 的 c。
+	h := NewHealth("")
+	h.MarkProbe("a", aliveRes(10, "1.1.1.1", "US"))
+	h.MarkProbe("b", aliveRes(20, "1.1.1.1", "US"))
+	h.MarkProbe("c", aliveRes(500, "1.1.1.1", "US"))
+	h.NoteSticky("s", "a", false)
+	h.MarkProbe("a", deadRes())
+	h.MarkProbe("b", deadRes()) // 最快的替补也死了
+	if got := h.ExitForSession("s"); got != "c" {
+		t.Fatalf("ExitForSession = %q, want c: 存活优先,延迟只做同档比较", got)
 	}
 }
 

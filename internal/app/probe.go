@@ -399,7 +399,11 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 	for _, tag := range dropped {
 		p.Health.Forget(tag)
 	}
-	p.Registry.EnforceCap(registry.PoolCap)
+	// 池子超上限的淘汰同样要清健康行(D-C1):RetainOnly 的 dropped 只覆盖
+	// 「本轮测过且没活」的,容量挤出的是另一批人。
+	for _, tag := range p.Registry.EnforceCap(registry.PoolCap) {
+		p.Health.Forget(tag)
+	}
 	if err := p.Health.Persist(); err != nil {
 		logger.Warn(fmt.Sprintf("[app] 健康表落盘失败: %v", err))
 	}
@@ -438,16 +442,11 @@ func (p *Parts) probeWorkers(n int) int {
 	return workers
 }
 
-// probationCount 是还在观察期的节点数(连败 > 0)。registry 没有
-// ProbationCount(),因为「观察期」是探测轮的措辞,不是池子的固有属性。
+// probationCount 是还在观察期的节点数(连败 > 0)。走 Registry 的一次性聚合:
+// 逐 tag 调 FailCount 是每 tag 一次 RLock 往返(引擎审计 M5),池子几千个
+// 节点时一轮探测白付几千次锁竞争。
 func (p *Parts) probationCount() int {
-	n := 0
-	for _, o := range p.Registry.All() {
-		if p.Registry.FailCount(o.Tag) > 0 {
-			n++
-		}
-	}
-	return n
+	return p.Registry.ProbationCount()
 }
 
 // runTierPipeline 对 A 档通关的节点跑 B 档区域探针,返回本轮新验证为 B 的节点数。

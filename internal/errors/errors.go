@@ -49,7 +49,16 @@ func CodeOf(err error) string {
 }
 
 var (
-	regionRe = regexp.MustCompile(`(?i)not available in your country|region`)
+	// regionRe 只认**明确**的地区拒绝文案。这是对 JS 的一处有意收紧:
+	// 原来这里还有一个裸词 `region`,它匹配任何文案里出现 region / regional /
+	// regions 的响应 —— 一句 500 的 "regional datacenter issue" 就被判成
+	// REGION;而 REGION 在 engine 里除了轮换还会调 NoteRegionError,把该出口的
+	// B 档凭证**无条件打回 A**。B 是全池唯一的「门控模型可用」证据
+	// (GatedUsable),一次误判就让 muse-spark 从 /v1/models 上消失、gated
+	// 请求全部报「无健康出口」,且只能等下一轮粗探(≥5 分钟)自愈。
+	// 结构化的 type == "RegionError" 仍是首选判据(任何状态码都认),文案判据
+	// 只保留完整短语,并在 Classify 里额外要求 4xx。
+	regionRe = regexp.MustCompile(`(?i)not available in your country|not available in this region`)
 	quotaRe  = regexp.MustCompile(`(?i)usage limit|rate limit`)
 	freeRe   = regexp.MustCompile(`(?i)freetier|free.?tier`)
 	modelRe  = regexp.MustCompile(`(?i)model is unavailable|not supported`)
@@ -86,7 +95,10 @@ func Classify(status int, body []byte, retryAfterMS int64) Failure {
 	flat := strings.ToLower(msg)
 
 	switch {
-	case typ == "RegionError" || regionRe.MatchString(flat):
+	// 显式的 type == "RegionError" 是结构信号,任何状态码都认;文案判据必须
+	// 配 4xx —— 5xx 文案里提到地区是供应商自身的基础设施问题,与本出口的
+	// 国家无关,把它算成地区拒绝会误伤 B 档凭证(见 regionRe 注释)。
+	case typ == "RegionError" || (status >= 400 && status < 500 && regionRe.MatchString(flat)):
 		return Failure{Code: check.CodeRegion, Status: status, Type: typ, Message: msg, Retryable: true}
 
 	// 配额分支必须在凭证分支之前:文案是 "usage limit" 的 403 是配额拒绝,

@@ -29,9 +29,23 @@ import (
 	"freerouter/internal/upstream"
 )
 
-// maxBodyBytes 封顶非 2xx 与整包 JSON 的读取:失败路径要的是错误信封,不是
-// 整个响应体(计划:封顶 1MB)。
+// maxBodyBytes 封顶**错误信封**的读取:失败路径要的是错误信封,不是整个
+// 响应体(计划:封顶 1MB)。readAllPrefix 的静默截断在这两条路上是正确语义
+// —— 拿到开头就够分类了。
 const maxBodyBytes = 1 << 20
+
+// maxAnswerBodyBytes 封顶 2xx **整包 JSON 回答**的读取。与信封上限分开是
+// 因为截断在这里有害无益:非流式的整包回答大小由模型的 maxOutput 决定。
+// 最坏合法形状算得出来:space-bunny-free 的 maxOutput = 524288 token,一个
+// token 在 JSON 里最坏摊 6 字节(CJK 单字转义成 \uXXXX),524288 × 6 ≈ 3MB;
+// 8MB 给这个上界留 2.5× 余量,同时把恶意/被劫持上游能塞进**每一个在途请求**
+// 的内存封顶住(审计纪律:限额只放宽到真实需要,不为「大一点更保险」放行)。
+// 旧实现 readAllPrefix 在 1MB 处静默砍断 → json.Unmarshal 失败 → readJSON
+// 报「unexpected non-SSE response」→ SERVER:分类撒谎(上游明明回了 JSON)、
+// 不进 cooldownOn(坏出口不被冷却)、还在 retryOn 里 —— 一轮白扫 20 个出口,
+// 每个出口把整篇回答**重新生成**一遍(上游为此计费!)。超过 8MB 的 2xx 体
+// 不是合法回答,按 TRANSPORT 拒掉才是诚实的判决。
+const maxAnswerBodyBytes = 8 << 20
 
 // Deps is everything one adapter needs. A struct rather than a dozen arguments
 // because app builds it once and hands it to the rotation engine per exit.
@@ -411,7 +425,15 @@ func (a *Adapter) readReply(resp *http.Response, t *turn, s *sink) error {
 	if headSSERe.Match(head) || (!headJSONRe.Match(head) && strings.Contains(resp.Header.Get("Content-Type"), "event-stream")) {
 		return a.readSSE(body, t, s)
 	}
-	raw, readErr := readAllPrefix(body, maxBodyBytes)
+	// 整包回答用**严格**读取(上游层审计):readAllPrefix 在 1MB 处静默砍断,
+	// 一份合法的大 JSON 回答会被截成不可解析,再被 readJSON 的守卫报成
+	// 「unexpected non-SSE response」→ SERVER。分类在这里撒了三次谎:上游
+	// 明明回了 JSON;SERVER 不进 cooldownOn(坏出口不会被冷却,下一轮还会
+	// 选中它);SERVER 在 retryOn 里 —— 一轮白扫 20 个出口,每个出口把这
+	// 一整篇回答**重新生成**一遍,上游按次计费。超过 maxAnswerBodyBytes
+	// 的 2xx 体不是合法回答,按 bodyReadFailure 既有的 R18 语义归
+	// TRANSPORT(轮换且冷却),而不是继续骗成 SERVER。
+	raw, readErr := httpclient.ReadCapped(body, maxAnswerBodyBytes)
 	if readErr != nil {
 		return bodyReadFailure(readErr)
 	}

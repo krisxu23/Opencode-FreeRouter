@@ -233,10 +233,18 @@ func Build(ids []string) []Model {
 	entries := make([]Model, 0, len(ids))
 	for _, raw := range ids {
 		id := strings.TrimSpace(raw)
-		if id == "" || !IsFreeLane(id) || IsMeasuredDead(id) {
+		if id == "" || !IsFreeLane(id) {
 			continue
 		}
 		base := upstream.BaseModelID(id)
+		// denylist 检查必须落在 **base id** 上(上游层审计):它和 seen、
+		// CapabilitiesFor 用同一个键。过去这里传的是**原始** listing 串,
+		// 于是 "ling-3.0-flash-fin-free (high)" 这种带思考后缀的变体绕开
+		// 了 denylist —— 实测已死的那条车道被重新发布出来。isMeasuredDead
+		// 的文档本来就写着「报告一个 base id」,是实现没把 base 递进去。
+		if base == "" || IsMeasuredDead(base) {
+			continue
+		}
 		if seen[base] {
 			continue
 		}

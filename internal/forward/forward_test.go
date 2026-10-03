@@ -876,6 +876,198 @@ func TestResponsesEndpointErrorIs502(t *testing.T) {
 	}
 }
 
+// TestResponsesNonStreamTruncatedIsIncomplete 是协议审计 H1 的钉:非流式
+// /v1/responses 被 max_output_tokens 腰斩(out.Truncated)时必须报
+// status:"incomplete" + incomplete_details.reason + finish_reason:"length",
+// 不能像过去那样硬编码 completed —— 否则被截断的回答与完整回答在线路上完全
+// 不可区分,Codex 类非流式客户端永远不知道该续写。chat 线对同一个 Outcome
+// 早已映射成 finish_reason:"length"(chatCompletionOnce),两条线现在同判据。
+func TestResponsesNonStreamTruncatedIsIncomplete(t *testing.T) {
+	st := newStub()
+	st.complete = func(context.Context, engine.Request, func(engine.Chunk) error) (engine.Outcome, error) {
+		return engine.Outcome{Text: "半截回答", Truncated: true}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/responses", auth(), `{"model":"m","stream":false}`)
+	got := decode(t, body)
+	if got["status"] != "incomplete" {
+		t.Fatalf("status = %v, want incomplete(截断轮绝不能谎报 completed)", got["status"])
+	}
+	if got["finish_reason"] != "length" {
+		t.Errorf("finish_reason = %v, want length", got["finish_reason"])
+	}
+	det, ok := got["incomplete_details"].(map[string]any)
+	if !ok || det["reason"] != "max_output_tokens" {
+		t.Errorf("incomplete_details = %v, want {reason: max_output_tokens}", got["incomplete_details"])
+	}
+}
+
+// TestResponsesNonStreamCompletedHasStopFinishReason 钉住成功轮的对称面:
+// 未截断时 status=completed、finish_reason=stop,且**不带** incomplete_details
+// (omitempty 在 nil 指针上生效)。
+func TestResponsesNonStreamCompletedHasStopFinishReason(t *testing.T) {
+	st := newStub()
+	st.complete = func(context.Context, engine.Request, func(engine.Chunk) error) (engine.Outcome, error) {
+		return engine.Outcome{Text: "完整回答"}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/responses", auth(), `{"model":"m","stream":false}`)
+	got := decode(t, body)
+	if got["status"] != "completed" || got["finish_reason"] != "stop" {
+		t.Fatalf("status/finish = %v/%v, want completed/stop", got["status"], got["finish_reason"])
+	}
+	if _, present := got["incomplete_details"]; present {
+		t.Errorf("成功轮不该有 incomplete_details: %v", got["incomplete_details"])
+	}
+}
+
+// responsesSSEEvents 把一段 responses SSE 文本拆成 [{type, 原始 JSON}] 行,
+// 供形状断言逐事件消费(data: 行按事件边界聚合,与客户端看到的帧一致)。
+func responsesSSEEvents(t *testing.T, body string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	// 每个 `data:` 就是一帧;本实现的帧不带 event: 行,类型在 JSON 的 type 键里。
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimRight(line, "\r")
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok || data == "[DONE]" {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			t.Fatalf("SSE 帧不是 JSON: %q err=%v", data, err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+// TestResponsesStreamEventShapePins 是协议审计 M1–M4 的合并钉:走一遍完整的
+// responses 流(一个 message 项 + 一个 reasoning 项 + 一个 function_call 项),
+// 逐事件核对形状不变量。修复前的具体失败:
+//   - M1: output_item.added 的 output_index 在 0 号项上**整个键消失**;
+//   - M2: output_text.delta 的 content_index 同理蒸发;
+//   - M3: added 的 message 项没有 content:[](reasoning 项没有 summary:[]);
+//   - M4: function_call 项的 output_item.done 之前缺 arguments.done。
+func TestResponsesStreamEventShapePins(t *testing.T) {
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		// 顺序:先 reasoning(0 号项),再正文(1 号项),最后工具调用(2 号项)。
+		if err := onChunk(engine.Chunk{Kind: engine.ChunkReasoning, Text: "想一想"}); err != nil {
+			return engine.Outcome{}, err
+		}
+		if err := onChunk(engine.Chunk{Kind: engine.ChunkText, Text: "你好"}); err != nil {
+			return engine.Outcome{}, err
+		}
+		if err := onChunk(engine.Chunk{Kind: engine.ChunkToolCallDelta, Index: 0, ToolID: "c1", ToolName: "search", ToolDelta: `{"q":"x"}`}); err != nil {
+			return engine.Outcome{}, err
+		}
+		return engine.Outcome{Text: "你好"}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/responses", auth(), `{"model":"m","stream":true}`)
+	evs := responsesSSEEvents(t, body)
+
+	// 首事件必须是 created,completed 必须收尾。
+	if len(evs) == 0 || evs[0]["type"] != "response.created" {
+		t.Fatalf("首事件 = %v, 期望 response.created", evs)
+	}
+	if evs[len(evs)-1]["type"] != "response.completed" {
+		t.Fatalf("末事件 = %v, 期望 response.completed", evs[len(evs)-1]["type"])
+	}
+
+	byType := map[string][]map[string]any{}
+	for _, ev := range evs {
+		byType[ev["type"].(string)] = append(byType[ev["type"].(string)], ev)
+	}
+
+	// M1:每个 output_item.added 必须带一个**数字** output_index(含 0 号项)。
+	added := byType["response.output_item.added"]
+	if len(added) != 3 {
+		t.Fatalf("added 事件 = %d, want 3(reasoning/message/function_call)", len(added))
+	}
+	for i, ev := range added {
+		idx, ok := ev["output_index"]
+		if !ok {
+			t.Fatalf("added[%d] 缺 output_index(M1:0 号项的键不能蒸发): %v", i, ev)
+		}
+		if idx.(float64) != float64(i) {
+			t.Errorf("added[%d].output_index = %v, want %d", i, idx, i)
+		}
+	}
+
+	// M3:message 的 added 带 content:[]、reasoning 的 added 带 summary:[]。
+	var msgAdded, reAdded map[string]any
+	for _, ev := range added {
+		item := ev["item"].(map[string]any)
+		switch item["type"] {
+		case "message":
+			msgAdded = item
+		case "reasoning":
+			reAdded = item
+		}
+	}
+	if c, ok := msgAdded["content"].([]any); !ok || len(c) != 0 {
+		t.Errorf("message.added.content = %v, want [](空数组,不是缺键)", msgAdded["content"])
+	}
+	if s, ok := reAdded["summary"].([]any); !ok || len(s) != 0 {
+		t.Errorf("reasoning.added.summary = %v, want []", reAdded["summary"])
+	}
+
+	// M2:每个 output_text.delta 必须带数字 content_index(含 0)。
+	for i, ev := range byType["response.output_text.delta"] {
+		if _, ok := ev["content_index"]; !ok {
+			t.Fatalf("output_text.delta[%d] 缺 content_index(M2): %v", i, ev)
+		}
+	}
+
+	// M4:function_call 的 output_item.done 之前必须先发 arguments.done,
+	// 且 done 的 arguments 已定稿。
+	if len(byType["response.function_call_arguments.done"]) != 1 {
+		t.Fatalf("function_call_arguments.done 事件数 = %d, want 1(M4 曾被整体省略)",
+			len(byType["response.function_call_arguments.done"]))
+	}
+	// done 事件顺序:arguments.done 必须紧邻在该 function_call 的 item.done 前。
+	var argDoneIdx, fcItemDoneIdx = -1, -1
+	for i, ev := range evs {
+		switch ev["type"] {
+		case "response.function_call_arguments.done":
+			argDoneIdx = i
+		case "response.output_item.done":
+			if it, ok := ev["item"].(map[string]any); ok && it["type"] == "function_call" {
+				fcItemDoneIdx = i
+			}
+		}
+	}
+	if !(argDoneIdx >= 0 && fcItemDoneIdx == argDoneIdx+1) {
+		t.Errorf("arguments.done(%d) 必须紧接 function_call 的 item.done(%d)", argDoneIdx, fcItemDoneIdx)
+	}
+}
+
+// TestJSONResponsesCarryCORS 是协议审计 M5 的钉:OPTIONS 预检承诺了跨源可用,
+// 实际 JSON 响应(非流式)必须带 Access-Control-Allow-Origin,否则浏览器在
+// 预检通过之后仍把响应拦在 CORS 之外,跨源 harness 连错误体都读不到。
+func TestJSONResponsesCarryCORS(t *testing.T) {
+	st := newStub()
+	ts := st.serve(t)
+	// /v1/models 的 200 JSON
+	res, _ := do(t, ts, http.MethodGet, "/v1/models", auth(), "")
+	if res.Header.Get("Access-Control-Allow-Origin") == "" {
+		t.Errorf("/v1/models JSON 缺 ACAO(M5): %v", res.Header)
+	}
+	// 401 错误体也必须带(客户端要能读到错误形状)
+	hdr := map[string]string{"Authorization": "Bearer wrong"}
+	res2, _ := do(t, ts, http.MethodPost, "/v1/chat/completions", hdr, `{"model":"m"}`)
+	if res2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("错误路径 status = %d, want 401", res2.StatusCode)
+	}
+	if res2.Header.Get("Access-Control-Allow-Origin") == "" {
+		t.Errorf("401 JSON 缺 ACAO(M5): %v", res2.Header)
+	}
+}
+
+// TestResponsesEndpointFallsBackToMessages 的占位已由上方用例覆盖,保留原测试。
+
 // TestNotWiredCompleteIs500NotPanic:Config 只给了 ForwardKey 时,handler 必须
 // 答 500 而不是 nil 解引用崩掉整个进程。这是"没接线"与"接线了但坏了"的分界。
 func TestNotWiredCompleteIs500NotPanic(t *testing.T) {

@@ -250,23 +250,34 @@ func (p *Parts) wait(d time.Duration) <-chan time.Time {
 	return time.After(d)
 }
 
-// base 是上游根地址。OUR_FREE_MODEL_BASE 覆盖它 —— 与 JS 的
-// upstream.js:24 同一开关;catalog 刷新与 B 档探针都从这里拼 URL,
-// 测试把它指向本地 httptest 服务。
+// base 是上游根地址,与 adapter 的 Deps.Base 共用 upstream.BaseFromEnv ——
+// **单一读取口径**。过去它是全仓唯一自己读 OUR_FREE_MODEL_BASE 的地方,而
+// 数据面(adapter)写死常量:设了该变量的自测里 catalog 与 B 档探针指向假
+// 上游、真对话回合照旧打 opencode.ai 烧配额,开关在它声称要解决的问题上失效
+// (上游层审计)。
 func (p *Parts) base() string {
-	if v := os.Getenv("OUR_FREE_MODEL_BASE"); v != "" {
-		return v
-	}
-	return upstream.UpstreamBase
+	return upstream.BaseFromEnv()
 }
 
 // probeInterval 是探测周期:max(5, probeIntervalMin) 分钟。下限 5 分钟来自
 // src/index.js:1102 —— 更密的探测只会烧配额、把出口 IP 打成 429,不会让
 // 池子更健康。
+//
+// 上限是一道**防御性 clamp**,不依赖校验层(生命周期审计 #2):validateSettingsPatch
+// 只管面板 PUT 那条路,手改 settings.json 或旧版本落盘的超大值会绕过它直接
+// 到达这里。time.Duration(minutes)*time.Minute 在 minutes 超过约 1.5 亿时溢出
+// 成 ≤0,而调用方的 time.After(≤0) **立即就绪** —— probeLoop 于是变成整轮
+// O(pool) 缓存扫描的自旋,没有一秒睡眠。判据写成「先算溢出、再 clamp」而不是
+// 「minutes > N」的硬阈值:用 maxProbeIntervalMinutes 卡入口,任何会溢出的值
+// 都落不进来。0..4 归 5(下限)与超上限归 43200(30 天)共用同一次比较。
 func (p *Parts) probeInterval() time.Duration {
+	const maxProbeIntervalMinutes = 43200 // 30 天,与 status.go 的 PUT 校验同一上限
 	minutes := p.settingsSnapshot().ProbeIntervalMin
 	if minutes < 5 {
 		minutes = 5
+	}
+	if minutes > maxProbeIntervalMinutes {
+		minutes = maxProbeIntervalMinutes
 	}
 	return time.Duration(minutes) * time.Minute
 }
@@ -416,9 +427,12 @@ func (p *Parts) limitsLoop(ctx context.Context) {
 // Status 是喂给面板与 /api/status 的完整快照。
 //
 // forward.key 会出现在这里:控制台监听 127.0.0.1,JS 版同样把它交给本地面板
-// (src/index.js:1072),设置页的「测试请求」按钮靠它带 Authorization。计划
-// 正文写「绝不回显 key」并称 JS 也没回显 —— 那半句与 JS 源码相反,按 JS 裁决
-// (修正案阶段 4 条目)。
+// (src/index.js:1072)。面板对它的**实际**消费是概览页的两处一键复制
+// (web/app.js:425 的 API Key 字段、:1254-1260 的 curl 模板把 key 拼进
+// Authorization 头),README 记载了这一行为。计划正文写「绝不回显 key」并称
+// JS 也没回显 —— 那半句与 JS 源码相反,按 JS 裁决(修正案阶段 4 条目)。
+// 披露面与本地威胁模型一致:能读到这个响应的本机进程本就能直读
+// data/settings.json,而面板还额外有 Host 白名单 + Origin/端口双闸。
 func (p *Parts) Status() any {
 	// 一次加锁读全部重建状态:lastRebuild.added/removed 原先在锁外裸读,和
 	// setRebuildResult 的写构成数据竞争(-race 下会报)。
@@ -812,6 +826,18 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 				// 收 256、运行时按 128 跑,设置页展示值与事实不符。
 				if n > 128 {
 					return nil, fmt.Errorf("app: 设置 probeWorkers 不能超过 128")
+				}
+			case "probeIntervalMin":
+				// 必须有上限(生命周期审计 #2):probeInterval() 算的是
+				// time.Duration(minutes)*time.Minute,而 settingsInt 放行到
+				// ±2^53。minutes 超过约 1.5 亿时这个乘法**溢出成 ≤0**,
+				// probeLoop 的 time.After(≤0) 立即就绪 → 整轮 O(pool) 缓存
+				// 扫描的空转循环,探测预算全部烧在 spin 上。下限 5 在
+				// probeInterval() 的读取处 clamp(0..4 归 5),这里只管上限:
+				// 30 天(43200 分钟)已是操作上无意义的长(真要停探有
+				// probeEnabled 开关),且比溢出点低三个数量级。
+				if n > 43200 {
+					return nil, fmt.Errorf("app: 设置 probeIntervalMin 不能超过 43200（30 天）")
 				}
 			case "exitConcurrency":
 				// 0 = 不限是合法值;上限取 128 与 probeWorkers 同级 —— 超过

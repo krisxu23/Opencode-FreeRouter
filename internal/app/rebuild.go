@@ -131,7 +131,9 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 		}
 	} else {
 		added := p.Registry.Merge(picked)
-		p.Registry.EnforceCap(registry.PoolCap)
+		for _, tag := range p.Registry.EnforceCap(registry.PoolCap) {
+			p.Health.Forget(tag) // D-C1:池外节点不留健康行
+		}
 		if err := p.Registry.Flush(); err != nil {
 			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
 		}
@@ -226,20 +228,34 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 // 会各等 20s(最多四分钟),然后日志把责任推给订阅源,而真正的原因是
 // 「一个活出口都没有」。池子空的时候正确答案是纯直连
 // (src/index.js:393-400)。
+//
+// 取哪几个:先收齐**全部**活节点,再随机抽样到上限(生命周期审计 D-C3)。
+// 旧写法边遍历边 break 在第一个凑够的 N 个上 —— Registry.All() 是 Go map
+// 序,看似随机实则每轮偏一份,同一批节点会被反复选中而其余活出口永远轮不到
+// (一个坏出口反复烧同一个订阅源,12 次重试全花在它身上)。快照 + 洗牌让每个
+// 活出口被借到的概率相同;拨号器只对**中选者**构建,不给全池付 O(pool) 的
+// Host.Dialer。窗口判定也走一次 NodeSnapshot,不再每 tag 一次 RLock(M5
+// 同源)。
 func (p *Parts) subExits() []sub.Exit {
+	snap := p.Health.NodeSnapshot()
+	all := p.Registry.All()
+	alive := make([]string, 0, len(all))
+	for _, o := range all {
+		if view, ok := snap[o.Tag]; ok && view.State == health.StateAlive {
+			alive = append(alive, o.Tag)
+		}
+	}
+	rand.Shuffle(len(alive), func(i, j int) { alive[i], alive[j] = alive[j], alive[i] })
 	exits := make([]sub.Exit, 0, check.SubRetryExits)
-	for _, o := range p.Registry.All() {
+	for _, tag := range alive {
 		if len(exits) >= check.SubRetryExits {
 			break
 		}
-		if p.Health.HealthOf(o.Tag) != health.StateAlive {
-			continue
-		}
-		d, err := p.Host.Dialer(o.Tag)
+		d, err := p.Host.Dialer(tag)
 		if err != nil {
 			continue
 		}
-		exits = append(exits, sub.Exit{Name: o.Tag, Dial: d})
+		exits = append(exits, sub.Exit{Name: tag, Dial: d})
 	}
 	return exits
 }
@@ -645,20 +661,37 @@ func (p *Parts) PanelURL() string {
 // Reload 是托盘「重启网关」的动作:重读 settings.json(用户可能在面板上
 // 改过订阅与间隔),重建出站,刷新目录。它**不重启进程**、不重绑转发端口,
 // 因此在途连接不断。sing-box 的 SyncOutbounds 已经是热插,换出口不需要重启。
+//
+// 读盘 + 发布这段必须在 applyMu 里(生命周期审计 #1):ApplySettings 的
+// 「候选校验 → store.Update → store.Flush → setSettings」整段靠这把锁串行,
+// 而 store 自己的 mu 只保证**单次调用**原子。Reload 原先不持锁直接 Load():
+// 面板 PUT 走到 Update 之后、Flush 之前时,reload 的 Load 会把 store 覆回
+// 磁盘上的旧内容,PUT 随后 Flush 的就是这份**被回退的** map —— 最终
+// 活设置 ≠ store ≠ 磁盘,用户这次保存静默消失,下次关停还会把它钉死。
+//
+// 锁只包住「读盘 + setSettings」,**不包住 Rebuild**:重建要跑几分钟
+// (订阅 + 探测排队),持 applyMu 跨它会冻结面板保存;而 Rebuild 有自己的
+// rebuildMu 串行。锁序上不存在环:没有任何路径先持 rebuildMu 再取 applyMu
+// (Rebuild 全程不碰 applyMu),所以 applyMu→(释放)→rebuildMu 是唯一方向。
 func (p *Parts) Reload(ctx context.Context) error {
 	if p.settingsStore == nil {
 		return fmt.Errorf("app: 设置存储未装配")
 	}
-	if err := p.settingsStore.Load(); err != nil {
+	p.applyMu.Lock()
+	err := p.settingsStore.Load()
+	var next Settings
+	if err == nil {
 		// 解析失败时绝不写回 p.Settings:把运行中的网关降级成默认配置比
 		// 保留一份旧设置糟得多。
+		next, err = settingsFromStore(p.settingsStore)
+	}
+	if err == nil {
+		p.setSettings(next)
+	}
+	p.applyMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("app: 重读设置: %w", err)
 	}
-	next, err := settingsFromStore(p.settingsStore)
-	if err != nil {
-		return err
-	}
-	p.setSettings(next)
 	// 顺序固定:先设置,再重建出站,最后刷新目录。反过来会让目录与新出站
 	// 代际错配一轮 —— 目录决定哪些模型可用,而出站决定它们经谁出去。
 	if err := p.Rebuild(ctx); err != nil {

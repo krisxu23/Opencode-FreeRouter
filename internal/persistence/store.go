@@ -110,7 +110,10 @@ func WriteJSONFile(file string, v any, indent bool) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("persistence: 关临时文件 %s: %w", tmp, err)
 	}
-	if err := os.Chmod(tmp, 0o644); err != nil {
+	// 权限 0600:这些文件全是用户私有数据(settings.json 带 forwardKey 与
+	// 订阅 URL、node-* 带出口 IP 画像),多用户机器或云同步目录里不该被同组
+	// /他人可读。Windows 上 os.Chmod 只切只读位,无副作用;POSIX 上是真收紧。
+	if err := os.Chmod(tmp, 0o600); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("persistence: 设权限 %s: %w", tmp, err)
 	}

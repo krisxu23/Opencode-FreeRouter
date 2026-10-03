@@ -127,6 +127,46 @@ func TestCodeOfReturnsCodeOrEmpty(t *testing.T) {
 	}
 }
 
+// TestClassifyRegionTextRequiresFourXX 钉住上游层审计的 REGION 投毒链的咽喉:
+// 旧 regionRe 里有一个裸词 `region`,匹配任何文案含 region/regional/regions
+// 的响应**且不分状态码** —— 一句 500 的 "regional datacenter issue" 就被判成
+// REGION。REGION 在 engine 里除了换出口还会调 NoteRegionError,把该出口的
+// B 档凭证无条件打回 A;B 是全池唯一的「门控模型可用」证据,误判一次就让
+// muse-spark 从 /v1/models 消失、gated 请求全报「无健康出口」,只能等下一轮
+// 粗探自愈。现在:显式 type==RegionError 任何状态都认;文案判据只留完整短语
+// 且必须配 4xx。
+func TestClassifyRegionTextRequiresFourXX(t *testing.T) {
+	// 真地区拒绝的两种文案:4xx 上必须仍判 REGION(收紧不能把真判决也收紧掉)。
+	for _, body := range []string{
+		`{"error":{"message":"The model is not available in your country"}}`,
+		`{"error":{"message":"this model is not available in this region"}}`,
+	} {
+		for _, status := range []int{403, 451} {
+			if f := Classify(status, []byte(body), 0); f.Code != check.CodeRegion {
+				t.Fatalf("status %d body %s: code = %q, want REGION", status, body, f.Code)
+			}
+		}
+	}
+	// 结构化类型:任何状态都认,包括 5xx(type 是权威信号,不受文案收紧影响)。
+	if f := Classify(503, []byte(`{"error":{"type":"RegionError","message":"whatever"}}`), 0); f.Code != check.CodeRegion {
+		t.Fatalf("type=RegionError on 503: code = %q, want REGION (类型判据不分状态码)", f.Code)
+	}
+	// 投毒面:5xx 文案里出现 region/regional/regions,不得再判 REGION。
+	for _, body := range []string{
+		`{"error":{"message":"a regional datacenter issue occurred"}}`,
+		`{"error":{"message":"we are migrating to new regions"}}`,
+		`{"error":{"message":"RegionError is a red herring"}}`, // 文案提到这个词,但 type 不是
+	} {
+		f := Classify(500, []byte(body), 0)
+		if f.Code == check.CodeRegion {
+			t.Fatalf("500 %s 被判成 REGION —— 投毒链复发(误打 B 档凭证)", body)
+		}
+		if f.Code != check.CodeServer {
+			t.Fatalf("500 %s: code = %q, want SERVER(落回默认分支)", body, f.Code)
+		}
+	}
+}
+
 // TestClassifyBareErrorObjectIsThePayloadToo 钉住 `payload?.error ?? payload`
 // 的后半句(src/errors.js:40):上游偶发的裸错误对象(type/message 直接在顶层)
 // 也必须走完整分类链 —— 少这一层兜底时,同样的响应体会掉进 default 的 server

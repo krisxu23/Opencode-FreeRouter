@@ -96,6 +96,17 @@ func ReadSSE(r io.Reader, fn func(Event) error) error {
 		}
 	}
 	if err := sc.Err(); err != nil {
+		// bufio 的行长上限与 maxEventBytes 是同一个 8MB,"data: " 前缀让
+		// **单行**超限先在这里撞响,而不是在上面的累加器(协议审计 L4)。
+		// 翻译成 ErrEventTooLarge 是让它与多行拼出来的超限走**同一个哨兵**:
+		// 两条路径的语义完全相同(一个事件超过了上限),不该因为测量点不同
+		// 而叫两个名字。诚实记录:engine 的 classifyAttemptError 现在把这两
+		// 者都归 SERVER(它只认 errors.Failure),所以这条翻译改变的是**本包
+		// 的返回契约一致性**,不是下游的分类/冷却;真要区分冷却,得在 engine
+		// 那一侧动分类,而那张矩阵是被 JS 逐条钉死的,不在这里擅动。
+		if errors.Is(err, bufio.ErrTooLong) {
+			return ErrEventTooLarge
+		}
 		return err
 	}
 	return flush()

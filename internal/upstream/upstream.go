@@ -29,6 +29,23 @@ import (
 // 注入,本包只提供默认值。
 const UpstreamBase = "https://opencode.ai"
 
+// BaseFromEnv 是 OUR_FREE_MODEL_BASE 的**唯一**读取口径:默认值 UpstreamBase,
+// 环境变量非空则覆盖。上游层审计指出过一个真陷阱 —— 这个开关的存在理由是
+// 「自测时把**全部**流量指到假上游,一行真配额都不烧」,但过去只有 catalog
+// 刷新与 B 档探针经它拼 URL,adapter 的 Deps.Base 在装配时写死了常量:设了
+// OUR_FREE_MODEL_BASE 的自测里,真对话回合照样打到 opencode.ai 烧车道配额,
+// 开关恰好在它声称要解决的问题上失效。修复不是再加一处读取,而是让**所有**
+// 读取共用这一个函数(adapter 装配、Parts.base)。
+//
+// 环境变量按进程生命周期看待(Load 读一次即可):runtime 改 os.Setenv 不是
+// 本产品支持的操作面,而数据面每请求重读一个 getenv 是白付的开销。
+func BaseFromEnv() string {
+	if v := os.Getenv("OUR_FREE_MODEL_BASE"); v != "" {
+		return v
+	}
+	return UpstreamBase
+}
+
 // ClientVersion / ClientKind 是 1.x 时代的桌面端指纹。src/upstream.js:26-52
 // 记录了五个在现场被试过又被回滚的"更好"候选:平台三元组 UA(opencode2api
 // 的形状)、四段式 opencode/latest/2.0.16/cli UA(取自真 v2 CLI 二进制)、

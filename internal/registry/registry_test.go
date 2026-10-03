@@ -48,7 +48,7 @@ func TestGenerationTracksMembershipOnly(t *testing.T) {
 		t.Fatal("Merge 新节点后应涨代数")
 	}
 	base = r.Generation()
-	if r.EnforceCap(2) == 0 {
+	if len(r.EnforceCap(2)) == 0 {
 		t.Fatal("EnforceCap 应当有驱逐")
 	}
 	if g := r.Generation(); g == base {
@@ -468,8 +468,18 @@ func TestEnforceCapEvictsTheOldest(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		r.Merge([]parse.Outbound{ob(string(rune('a' + i)))})
 	}
-	if n := r.EnforceCap(3); n != 2 {
+	if n := len(r.EnforceCap(3)); n != 2 {
 		t.Fatalf("evicted = %d, want 2", n)
+	}
+	// 返回值必须是**名单**:调用方(app/rebuild/probe)靠它给被淘汰的 tag
+	// 清健康行(D-C1)。只验证个数的话,把返回值改回 int 也能过这条测试。
+	r2 := newReg(t)
+	for i := 0; i < 5; i++ {
+		r2.Merge([]parse.Outbound{ob(string(rune('a' + i)))})
+	}
+	got := r2.EnforceCap(3)
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("evicted tags = %v, want [a b](最旧的两个)", got)
 	}
 	if r.Len() != 3 {
 		t.Fatalf("len = %d, want 3", r.Len())

@@ -135,7 +135,16 @@ type Boot struct {
 	Nodes        []any          `json:"nodes"`
 	Usage        any            `json:"usage"`
 	Settings     any            `json:"settings"`
-	Logs         []logger.Line  `json:"logs"`
+	// Lanes/Probing 补齐「Boot 形状与轮询快照一致」这句承诺(协议审计 L1):
+	// 开机几秒内 warmUp 探测就可能已经在跑,浏览器这时打开面板 —— 缺这两个
+	// 键,首帧的「立即探测」按钮可点而真实状态是探测中,点下去只收到一句
+	// 「probe already running」。lanes 在开机瞬间恒是空对象,带上它只为形状
+	// 一致,前端默认值本来就等价。
+	Lanes any `json:"lanes"`
+	// Probing 是真布尔而不是 any:前端 `typeof s.probing === 'boolean'` 才
+	// 吸收它,nil 在这里等于「没这个键」,起不到作用。
+	Probing bool          `json:"probing"`
+	Logs    []logger.Line `json:"logs"`
 }
 
 // settingsView is the settings subset the console form needs. The JS version
@@ -153,6 +162,11 @@ type settingsView struct {
 	MaxWallClockMS   any `json:"maxWallClockMs"`
 	ForwardPort      any `json:"forwardPort"`
 	PanelPort        any `json:"panelPort"`
+	// ExitConcurrency 必须在白名单里:前端 readSettings() 把它灌进表单、
+	// 每次保存又**无条件**把整个表单 PUT 回来。boot 视图少这一个键 →
+	// 冷启动读到 undefined → 表单显示 0 → 用户改别的字段点保存 → 0 落盘,
+	// 单出口并发闸门被静默关掉(协议审计 H2)。
+	ExitConcurrency any `json:"exitConcurrency"`
 }
 
 // Server is the console HTTP service.
@@ -517,6 +531,13 @@ func (s *Server) bootstrap() Boot {
 			"byModel":  map[string]any{},
 		}
 	}
+	// lanes 缺省给空对象(与前端 DATA 的默认值等价);probing 从 Status 的
+	// 真布尔取,取不到给 false。这两个键过去不在 boot 里(协议审计 L1)。
+	lanes := st["lanes"]
+	if lanes == nil {
+		lanes = map[string]any{}
+	}
+	probing, _ := st["probing"].(bool)
 
 	return Boot{
 		Version:      s.deps.Version,
@@ -528,6 +549,8 @@ func (s *Server) bootstrap() Boot {
 		RegionModels: toSlice(st["regionModels"]),
 		Nodes:        toSlice(st["nodes"]),
 		Usage:        usage,
+		Lanes:        lanes,
+		Probing:      probing,
 		Settings: settingsView{
 			SubURLs:          orEmptySlice(cfg["subUrls"]),
 			Countries:        orEmptySlice(cfg["countries"]),
@@ -539,6 +562,7 @@ func (s *Server) bootstrap() Boot {
 			MaxWallClockMS:   cfg["maxWallClockMs"],
 			ForwardPort:      cfg["forwardPort"],
 			PanelPort:        cfg["panelPort"],
+			ExitConcurrency:  cfg["exitConcurrency"],
 		},
 		Logs: logs,
 	}

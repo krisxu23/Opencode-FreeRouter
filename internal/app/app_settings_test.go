@@ -12,9 +12,11 @@ package app
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"freerouter/internal/catalog"
 	"freerouter/internal/health"
@@ -82,6 +84,72 @@ func TestSettingsSnapshotIsAnIsolatedCopy(t *testing.T) {
 // TestSettingsAreRaceFreeUnderConcurrentReadAndWrite 是 B7 的回归测试:
 // 一个 goroutine 反复面板 PUT(写),另一个反复读 SettingsView/Status。
 // 修复前 -race 会报 status.go 的写与 status.go 的读竞争。
+// TestProbeIntervalIsClampedAgainstDurationOverflow 是生命周期审计 #2 的钉:
+// time.Duration(minutes)*time.Minute 在 minutes 超过约 1.5 亿时**溢出成 ≤0**,
+// 而调用方 probeLoop 的 time.After(≤0) 立即就绪 → 整轮 O(pool) 缓存扫描的
+// 自旋循环,探测预算全烧在 spin 上。审计员的复现:2e8 → -1790760h,2^53 → 0s。
+//
+// 这条路径**不经面板 PUT 校验**就能到达:手改 settings.json 或旧版本落盘的
+// 超大值,Load/Reload 直接把它灌进 Settings.ProbeIntervalMin。所以修复必须落
+// 在**实时读取处**(probeInterval 的 clamp),而不是只在 validateSettingsPatch
+// 加个上限 —— 这里同时钉两处。
+func TestProbeIntervalIsClampedAgainstDurationOverflow(t *testing.T) {
+	p := settingsOnlyParts(t)
+
+	for _, tc := range []struct {
+		name    string
+		minutes int
+		wantMin int // clamp 之后期望的分钟数
+	}{
+		{"正常值不动", 30, 30},
+		{"下界", 5, 5},
+		{"低于下界归 5", 0, 5},
+		{"审计复现值 2e8 溢出", 200000000, 43200},
+		{"2^53 归零", 1 << 53, 43200},
+		{"恰好上限", 43200, 43200},
+		{"超上限归 43200", 43201, 43200},
+	} {
+		p.setSettings(Settings{ProbeIntervalMin: tc.minutes})
+		got := p.probeInterval()
+		if want := time.Duration(tc.wantMin) * time.Minute; got != want {
+			t.Errorf("%s: probeInterval() = %v, want %v(clamp 到 %d 分钟;溢出成 ≤0 就是这条 bug)",
+				tc.name, got, want, tc.wantMin)
+		}
+		// 溢出即 ≤0,这条直接判死自旋条件。
+		if got <= 0 {
+			t.Errorf("%s: probeInterval() = %v,必须恒 >0(≤0 = probeLoop 自旋)", tc.name, got)
+		}
+	}
+}
+
+// TestApplySettingsRejectsProbeIntervalOverTheCap 钉住 PUT 那条路的同步上限:
+// 面板字段只有 min=5、没有 max,填 1e9 必须被拒,且**不动磁盘**(与 B10 同一
+// 纪律)。与上面的实时 clamp 是两道独立的闸:一个管新写入,一个管已落盘的历史值。
+func TestApplySettingsRejectsProbeIntervalOverTheCap(t *testing.T) {
+	p := newProbeParts(t, 1)
+	settingsFile := filepath.Join(p.Root, "settings.json")
+	p.settingsStore = persistence.NewStore("settings", settingsFile, settingsMap(defaultSettings()))
+	if err := p.settingsStore.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := p.settingsStore.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	before, _ := os.ReadFile(settingsFile)
+
+	if _, err := p.ApplySettings(map[string]any{"probeIntervalMin": float64(1_000_000_000)}); err == nil {
+		t.Fatal("ApplySettings 接受了溢出的 probeIntervalMin(1e9),未设上限")
+	}
+	after, _ := os.ReadFile(settingsFile)
+	if string(after) != string(before) {
+		t.Fatalf("被拒的补丁动了磁盘:\n before %s\n after  %s", before, after)
+	}
+	// 合法的上界值必须仍能写入(别把 clamp 写成一律拒绝)。
+	if _, err := p.ApplySettings(map[string]any{"probeIntervalMin": float64(43200)}); err != nil {
+		t.Fatalf("probeIntervalMin=43200 应当合法: %v", err)
+	}
+}
+
 func TestSettingsAreRaceFreeUnderConcurrentReadAndWrite(t *testing.T) {
 	p := settingsOnlyParts(t)
 

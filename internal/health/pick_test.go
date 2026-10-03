@@ -147,6 +147,44 @@ func TestPickCostsLatencyTimesLoad(t *testing.T) {
 	}
 }
 
+// TestPickNegativeLatencySortsLast 是引擎审计 M2 的钉:latencyMin/latencyMS
+// 的 -1 是「没有任何延迟数据」的内部哨兵,不是可以参战的真实数字。过去
+// cost=(load+1)×(-1) 是**负数**,于是「一个测量都没做过」的节点在同 bucket
+// 里稳赢所有有真实延迟的节点 —— 每回合都被首选。修复把 ≤0 归回哨兵语义
+// (排最后)。
+//
+// 造一个 alive 但延迟字段是 -1 的节点:MarkProbe 对 alive 且 res.LatencyMS=0
+// 的行,会按 (src/health.js:284/:290) 的 ?? 回退把 latMS/latMin 都写成 -1
+// —— 正是「节点被判活但这一轮没拿到任何延迟样本」的形状(noteQuota 的
+// synthetic 行走同一 -1 通道)。
+func TestPickNegativeLatencySortsLast(t *testing.T) {
+	h := NewHealth("")
+	// nBad:alive,延迟字段 -1(两个 IP 分开,load 恒 0,排除 sticky 干扰)。
+	h.MarkProbe("nBad", nodeprobe.ProbeResult{State: nodeprobe.StateAlive, LatencyMS: 0, LatencyMin: 0, ExitIP: "9.9.9.9", ExitCountry: "US"})
+	// nGood:alive,真实 10ms。
+	h.MarkProbe("nGood", nodeprobe.ProbeResult{State: nodeprobe.StateAlive, LatencyMS: 10, LatencyMin: 10, ExitIP: "8.8.8.8", ExitCountry: "US"})
+	pool := []PoolNode{{Tag: "nBad", Country: "US"}, {Tag: "nGood", Country: "US"}}
+	p := h.Pick(PickRequest{Pool: pool})
+	if p == nil {
+		t.Fatal("Pick = nil")
+	}
+	if p.NodeKey != "nGood" {
+		t.Fatalf("picked = %q, want nGood: 无延迟数据(-1 哨兵)的节点不得赢过 10ms 的真实节点(M2 负 cost 复发)", p.NodeKey)
+	}
+	// 排序快照里 nBad 必须压底(哨兵 cost),且**仍在候选里**(没有数据 ≠ 除名)。
+	if len(p.Order) != 2 || p.Order[len(p.Order)-1].Tag != "nBad" {
+		t.Fatalf("order = %+v, want nBad 排最后但保留", p.Order)
+	}
+	// 哨兵在落盘行里被有意压成 0(见 orderRowOf:MaxInt64 是面板看不懂的魔数),
+	// 所以这里判的是**次序**而不是 cost 量级:cost 不得为负(旧病根是
+	// (load+1)×(-1) = -1 稳赢全桶),而 nBad 必须排在有真实数据的节点之后。
+	for _, r := range p.Order {
+		if r.Cost < 0 {
+			t.Fatalf("%s cost = %d,不得为负(M2 的病根就是这个负 cost 稳赢全桶)", r.Tag, r.Cost)
+		}
+	}
+}
+
 func TestRestrictedOnlyConsidersBTier(t *testing.T) {
 	h := newPickFixture(t) // 全是 A
 	if p := h.Pick(PickRequest{Restricted: true, Pool: pickPool(allTags...)}); p != nil {

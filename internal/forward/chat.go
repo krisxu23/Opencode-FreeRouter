@@ -183,15 +183,20 @@ type responsesContent struct {
 }
 
 type responsesOutput struct {
-	Type      string             `json:"type"`
-	Role      string             `json:"role,omitempty"`
-	Content   []responsesContent `json:"content,omitempty"`
-	CallID    string             `json:"call_id,omitempty"`
-	Name      string             `json:"name,omitempty"`
-	Arguments string             `json:"arguments,omitempty"`
+	Type      string `json:"type"`
+	Role      string `json:"role,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	// Content/Summary 声明为 any 而不是 []T + omitempty:空切片在 omitempty 下
+	// 会连键一起消失(协议审计 M3),而 reasoning 行的公开形状是
+	// {"type":"reasoning","summary":[]};null 又不是合法的缺席表示。any 的
+	// omitempty 只看接口本身是否 nil —— 装着空切片的非 nil 接口恒发键,
+	// 不相关的行(如 function_call)传 nil 仍干净地不带键。
+	Content any `json:"content,omitempty"`
 	// Summary 是 reasoning 输出项的字段(流式与最终体都会出现);非 reasoning
 	// 项不携带。这条车道没有推理摘要流,恒为空数组。
-	Summary []any `json:"summary,omitempty"`
+	Summary any `json:"summary,omitempty"`
 }
 
 type responsesUsage struct {
@@ -211,51 +216,67 @@ type responsesBody struct {
 	// IncompleteDetails 只在 status:"incomplete" 时出现:镜像上游
 	// response.incomplete 事件的 max_output_tokens 截断形状,让流式客户端
 	// 与非流式(finish_reason:length)一样能区分「正常完成」和「被截断」。
-	IncompleteDetails *struct {
-		Reason string `json:"reason"`
-	} `json:"incomplete_details,omitempty"`
+	IncompleteDetails *incompleteDetails `json:"incomplete_details,omitempty"`
+	// FinishReason 是本轮的公开结束原因(带 response 事件时都出现,带 item 的
+	// 事件仍不携带):截断轮必须发 "length",与 chat 线的
+	// finish_reason:"length" 对齐 —— 过去非流式恒发 completed 且没有这个字段,
+	// 被腰斩的回答与完整回答在线路上完全不可区分(协议审计 H1)。
+	FinishReason string `json:"finish_reason,omitempty"`
 	// Error 只在「已出内容后断流」的非流式响应上出现(与 chat 线的顶层 error
 	// 标记同理):让半截回答与完整回答可区分。成功路径恒不出现。
 	Error *openAIErrorDetail `json:"error,omitempty"`
 }
 
+// incompleteDetails 是 responsesBody 里截断原因那一小块;具名是为了两处
+// (流式收尾 / 非流式收尾)共用同一形状而不用各写一遍匿名 struct 再让
+// 类型系统对「完全一致的结构」较真。
+type incompleteDetails struct {
+	Reason string `json:"reason"`
+}
+
 // responsesEvent 是生命周期事件(created/in_progress/output_item.added/
 // output_item.done/failed/completed)的信封:要么带 response,要么带 item。
-// OutputIndex 带 omitempty —— 过去它恒出现,created/completed 这类不含
-// output_index 语义的事件里也挂着 "output_index":0 的噪音。
+// OutputIndex 是指针:created/completed 这类**没有** output_index 语义的事件
+// 不发这个键(裸 int 会在零值处静默丢键),而 output_item.added/done 恒发
+// —— 哪怕是 0 号项。严格客户端靠 added 事件里的 output_index 把后续增量
+// 关联到 item,键在 index 0 处蒸发等于第一项永不归位(协议审计 M1)。
 type responsesEvent struct {
 	Type        string         `json:"type"`
 	Response    *responsesBody `json:"response,omitempty"`
 	Item        *responsesItem `json:"item,omitempty"`
-	OutputIndex int            `json:"output_index,omitempty"`
+	OutputIndex *int           `json:"output_index,omitempty"`
 }
 
 // responsesDeltaEvent 是增量事件(output_text.delta / reasoning_summary_text.delta /
 // function_call_arguments.delta / content_part.added)的信封:item_id 与
-// output_index 是定位键,恒出现。content_index 只有正文增量语义上需要,而
-// 正文恒在 content_index=0 —— omit 后 function_call 增量不再挂多余的 0,
-// 正文增量按 item_id 定位、按 part 数组内序累积,不依赖这个键。
+// output_index 是定位键,恒出现。content_index 同样恒出现(去掉了 omitempty):
+// 公开 API 的 schema 把它列为 output_text.delta/.done/content_part.* 的必填
+// 字段,零值 0 被 omit 掉时按 item_id 归位、按 part 数组内序累积的严格客户端
+// 会读不到定位键(协议审计 M2)。function_call 增量多带一个值为 0 的键是
+// 无害噪音,一致性优先。
 type responsesDeltaEvent struct {
 	Type         string            `json:"type"`
 	ItemID       string            `json:"item_id"`
 	OutputIndex  int               `json:"output_index"`
-	ContentIndex int               `json:"content_index,omitempty"`
+	ContentIndex int               `json:"content_index"`
 	Delta        string            `json:"delta,omitempty"`
 	Part         *responsesContent `json:"part,omitempty"`
 }
 
 // responsesItem 是流式 output_item.added/done 里的 item 形状(与 responsesOutput
-// 分开:id/status 只属于流式项)。
+// 分开:id/status 只属于流式项)。Content/Summary 是 any + omitempty(同
+// responsesOutput 的理由,协议审计 M3):message 恒发数组(added 时是刻意的
+// 空 [],done 时带全文),reasoning 恒发 summary 数组,function_call 两者都不带。
 type responsesItem struct {
-	ID        string             `json:"id"`
-	Type      string             `json:"type"`
-	Role      string             `json:"role,omitempty"`
-	Status    string             `json:"status,omitempty"`
-	Content   []responsesContent `json:"content,omitempty"`
-	CallID    string             `json:"call_id,omitempty"`
-	Name      string             `json:"name,omitempty"`
-	Arguments string             `json:"arguments,omitempty"`
-	Summary   []any              `json:"summary,omitempty"`
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Role      string `json:"role,omitempty"`
+	Status    string `json:"status,omitempty"`
+	Content   any    `json:"content,omitempty"`
+	CallID    string `json:"call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+	Summary   any    `json:"summary,omitempty"`
 }
 
 // sseStream 是延迟发头的 SSE 通道。
@@ -414,6 +435,8 @@ func (s *Server) chatCompletionOnce(w *writer, r *http.Request, body map[string]
 	// js :219 的 `text` 是 outcome.text 与 toolCalls.map(()=>'') 的拼接,而后者
 	// 只贡献空串 —— 所以它就是 outcome.Text。
 	msg := chatMessage{Role: "assistant"}
+	// 空回答与「说了话」必须可区分:Content 保持 nil → 序列化成 null,
+	// 而不是 content:"" —— 客户端把 "" 当正文读,把 null 当「没有正文」。
 	if out.Text != "" {
 		msg.Content = ptr(out.Text)
 	}
@@ -659,9 +682,20 @@ func (s *Server) responsesEndpoint(w *writer, r *http.Request, body map[string]a
 	}
 
 	output, usage := responsesOutputOf(out)
+	// 截断判决与流式分支、chat 线共用同一个 Outcome 上的同一个标志:过去这里
+	// 硬编码 status:"completed",一个被 max_output_tokens 腰斩的回答在非流式
+	// 线路上与完整回答**完全不可区分**(协议审计 H1 —— chat 线会把
+	// out.Truncated 映成 finish_reason:"length",responses 线却没有对应物,
+	// Codex 类非流式客户端因此永远不会续写)。
+	status, details, finish := "completed", (*incompleteDetails)(nil), "stop"
+	if out.Truncated {
+		status = "incomplete"
+		details = &incompleteDetails{Reason: "max_output_tokens"}
+		finish = "length"
+	}
 	resp := responsesBody{
-		ID: id, Object: "response", CreatedAt: nowSeconds(), Model: model, Status: "completed",
-		Output: output, Usage: usage,
+		ID: id, Object: "response", CreatedAt: nowSeconds(), Model: model, Status: status,
+		Output: output, Usage: usage, IncompleteDetails: details, FinishReason: finish,
 	}
 	if out.Error != "" {
 		// 与 chat 线同理:半截回答按 200 交付,顶层 error 标记让它可区分。
@@ -803,7 +837,7 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 		it := &respStreamItem{itemID: itemID, kind: kind, outIdx: nextItemIdx}
 		nextItemIdx++
 		items = append(items, it)
-		ev := responsesEvent{Type: "response.output_item.added", OutputIndex: it.outIdx, Item: &responsesItem{
+		ev := responsesEvent{Type: "response.output_item.added", OutputIndex: ptr(it.outIdx), Item: &responsesItem{
 			ID: it.itemID, Type: kind, Status: "in_progress",
 		}}
 		switch kind {
@@ -844,6 +878,12 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 				Type: "response.output_text.delta", ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.Text,
 			})
 		case engine.ChunkReasoning:
+			if c.Text == "" {
+				// 与 chat 线同一守卫:空思考增量不发帧(chattidy 形状 1 在
+				// responses 线上同样会一字一行)。不发帧就不花 created 头 ——
+				// 一整轮只有空思考的回合留给 usage-only 的兜底。
+				return nil
+			}
 			sendCreated()
 			var it *respStreamItem
 			for _, cand := range items {
@@ -876,7 +916,7 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 					nextItemIdx++
 					items = append(items, it)
 					itemBySlot[c.Index] = it
-					sse.sendEvent("response.output_item.added", responsesEvent{Type: "response.output_item.added", OutputIndex: it.outIdx, Item: &responsesItem{
+					sse.sendEvent("response.output_item.added", responsesEvent{Type: "response.output_item.added", OutputIndex: ptr(it.outIdx), Item: &responsesItem{
 						ID: it.itemID, Type: "function_call", Status: "in_progress",
 						CallID: c.ToolID, Name: c.ToolName, Arguments: "",
 					}})
@@ -944,6 +984,9 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 	// 收尾:按打开顺序逐个 item 发 done,再发 completed。completed 的 output
 	// 直接从**已流出的 items** 投影 —— 从 Outcome 重投影会丢掉 reasoning 项,
 	// 且 message/function_call 的固定排序与流上 output_index 的创建序矛盾。
+	// sendCreated 幂等:一整轮没有任何可发帧时(只有被守卫吃掉的空增量),
+	// completed 仍不能当流上的第一个事件(C-新2 的不变量,与 usage-only 兜底同理)。
+	sendCreated()
 	finalOutput := make([]responsesOutput, 0, len(items))
 	for _, it := range items {
 		done := responsesItem{ID: it.itemID, Type: it.kind, Status: "completed"}
@@ -977,8 +1020,15 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 				Type: "function_call", CallID: it.callID, Name: it.name, Arguments: args,
 			})
 		}
+		// M4:function_call 项在 output_item.done **之前**先发表单事件,再关项。
+		if it.kind == "function_call" {
+			sse.sendEvent("response.function_call_arguments.done", responsesDeltaEvent{
+				Type: "response.function_call_arguments.done", ItemID: it.itemID,
+				OutputIndex: it.outIdx, Delta: done.Arguments,
+			})
+		}
 		sse.sendEvent("response.output_item.done", responsesEvent{
-			Type: "response.output_item.done", OutputIndex: it.outIdx, Item: &done,
+			Type: "response.output_item.done", OutputIndex: ptr(it.outIdx), Item: &done,
 		})
 	}
 	if len(finalOutput) == 0 {
@@ -988,18 +1038,18 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 	if tu, ok := openAIUsageOf(finalUsage); ok {
 		u = responsesUsage{InputTokens: tu.PromptTokens, OutputTokens: tu.CompletionTokens, TotalTokens: tu.TotalTokens}
 	}
-	// 截断轮镜像上游 response.incomplete 的形状:status=incomplete + 截断原因。
-	status, details := "completed", (*struct {
-		Reason string `json:"reason"`
-	})(nil)
+	// 截断轮镜像上游 response.incomplete 的形状:status=incomplete + 截断原因
+	// + finish_reason。流式与非流式在同一个 Outcome 上做同一个判决(协议审计
+	// H1:过去只有这条线上有这套映射,非流式分支恒发 completed)。
+	status, details, finish := "completed", (*incompleteDetails)(nil), "stop"
 	if out.Truncated {
 		status = "incomplete"
-		details = &struct {
-			Reason string `json:"reason"`
-		}{Reason: "max_output_tokens"}
+		details = &incompleteDetails{Reason: "max_output_tokens"}
+		finish = "length"
 	}
 	resp := skeleton(status, finalOutput, &u)
 	resp.IncompleteDetails = details
+	resp.FinishReason = finish
 	sse.sendEvent("response.completed", responsesEvent{Type: "response.completed", Response: resp})
 }
 

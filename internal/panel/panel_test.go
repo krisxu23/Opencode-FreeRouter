@@ -155,6 +155,41 @@ func baseDeps(dir string) PanelDeps {
 	}
 }
 
+// TestBootCarriesLanesAndProbing 是协议审计 L1 的钉:Boot 的结构注释写着
+// 「形状与轮询快照一致」,但 lanes 与 probing 两个键过去只在 /api/status 的
+// map 里存在,boot 不带 —— 开机后 warmUp 探测几秒内就会开跑,浏览器这时
+// 打开面板:前端 S.probing 的初值是 false,首帧把「立即探测」画成可点,
+// 点下去只收到一句 already running(最坏情况还白等一轮)。这两个键现在必须
+// 出现在 __BOOT__ 里,probing 必须是**真布尔**(前端只吸收 boolean)。
+func TestBootCarriesLanesAndProbing(t *testing.T) {
+	dir := writeAssets(t, goodShell, "console.log('app')\n")
+	deps := baseDeps(dir)
+	deps.Status = func() any {
+		return map[string]any{
+			"probing": true,
+			"lanes":   map[string]any{"1.2.3.4": map[string]any{"busy": 2, "limit": 3, "queue": 1}},
+		}
+	}
+	base := startPanel(t, deps)
+	_, _, body := do(t, http.MethodGet, base+"/", "")
+	if !strings.Contains(body, `"probing":true`) {
+		t.Fatalf("__BOOT__ 缺 probing 或没序列化成真布尔:\n%s", firstLineWith(body, "window.__BOOT__"))
+	}
+	if !strings.Contains(body, `"lanes":{`) {
+		t.Fatalf("__BOOT__ 缺 lanes:\n%s", firstLineWith(body, "window.__BOOT__"))
+	}
+
+	// 反面对照:Status 不带这两个键时,boot 也要给出可用默认(空对象 + false),
+	// 而不是整个键消失 —— 前端对 nil 的 typeof 是 "object",吸收守卫会跳过,
+	// 与键缺失等价,但那不该是 Status() 正常形状下的路径。
+	deps2 := baseDeps(dir)
+	base2 := startPanel(t, deps2)
+	_, _, body2 := do(t, http.MethodGet, base2+"/", "")
+	if !strings.Contains(body2, `"probing":false`) || !strings.Contains(body2, `"lanes":{}`) {
+		t.Fatalf("Status 为空时 boot 仍须带默认形状:\n%s", firstLineWith(body2, "window.__BOOT__"))
+	}
+}
+
 // TestRootServesHTMLWithInjectedBoot:第一帧就靠注入的 boot JSON 画出真实数字，
 // 所以标记必须被替换掉、且后面跟的是 JSON 而不是字面 null。
 func TestRootServesHTMLWithInjectedBoot(t *testing.T) {
@@ -189,6 +224,57 @@ func TestRootServesHTMLWithInjectedBoot(t *testing.T) {
 	// 面板只回显「是否已设 key」，绝不把 key 本身送进浏览器。
 	if strings.Contains(body, "super-secret-key") {
 		t.Errorf("boot 泄露了 forwardKey: %s", body)
+	}
+}
+
+// TestBootSettingsCarryExitConcurrency 是协议审计 H2 的钉:__BOOT__ 的
+// settings 投影是**白名单**结构(settingsView),漏一个字段,前端
+// readSettings() 就把它灌成 undefined → 表单显示 0,而 app.js 每次保存
+// 都**无条件**把整个表单 PUT 回来 —— 用户改任何一个别的设置都会顺带把
+// exitConcurrency 写回 0,单出口并发闸门被静默关掉,且重启后依然如此
+// (boot 是唯一的首帧数据源,/api/settings 从不被轮询)。
+func TestBootSettingsCarryExitConcurrency(t *testing.T) {
+	dir := writeAssets(t, goodShell, "console.log('app')\n")
+	deps := baseDeps(dir)
+	deps.GetSettings = func() any {
+		return map[string]any{"exitConcurrency": 3, "probeWorkers": 64}
+	}
+	base := startPanel(t, deps)
+	_, _, body := do(t, http.MethodGet, base+"/", "")
+	if !strings.Contains(body, `"exitConcurrency":3`) {
+		t.Fatalf("__BOOT__ 的 settings 里必须带 exitConcurrency(H2,漏了它 = 每次保存清零):\n%s", firstLineWith(body, "window.__BOOT__"))
+	}
+	if !strings.Contains(body, `"probeWorkers":64`) {
+		t.Fatalf("对照字段丢了:视图整体坏了")
+	}
+}
+
+// TestBootSettingsWhitelistCoversEveryFormKey 把 settingsView 与前端表单
+// 键表钉成一对:app.js 的 readSettings 读什么,__BOOT__ 就必须给什么。
+// 新增设置字段时**只改 app 侧 SettingsView()** 是不够的(这条测试会红),
+// panel 的白名单结构必须同步补 —— H2 的病根就是这两处各自演化了。
+func TestBootSettingsWhitelistCoversEveryFormKey(t *testing.T) {
+	// web/app.js 的 readSettings(:150-159)读取 + saveSettings(:1206-1224)
+	// 无条件回写的**往返键**全集。少给一个,冷启动读 undefined、下次保存就
+	// 把该字段清零 —— H2 的病根。forwardPort/panelPort 不在这条往返里
+	// (改了要重启,由别处单独展示),所以不列。
+	formKeys := []string{
+		"subUrls", "countries", "probeEnabled", "probeWorkers", "probeIntervalMin",
+		"effortLevel", "defaultMaxTokens", "maxWallClockMs", "exitConcurrency",
+	}
+	dir := writeAssets(t, goodShell, "console.log('app')\n")
+	deps := baseDeps(dir)
+	all := map[string]any{}
+	for _, k := range formKeys {
+		all[k] = "x"
+	}
+	deps.GetSettings = func() any { return all }
+	base := startPanel(t, deps)
+	_, _, body := do(t, http.MethodGet, base+"/", "")
+	for _, k := range formKeys {
+		if !strings.Contains(body, `"`+k+`"`) {
+			t.Errorf("__BOOT__.settings 缺 %q —— 前端表单会把它灌成 undefined 并在下次保存时清零", k)
+		}
 	}
 }
 

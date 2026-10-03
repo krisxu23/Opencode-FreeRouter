@@ -422,11 +422,18 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 		// 出口车道闸门(magpie lanes):同一出口 IP 最多 ExitConcurrency 个
 		// 在途,超出的排队等槽 —— 排队不是失败,不换出口、不记错误。排队
 		// 时不占在途 busyIP 计数(那是发给上游后的量),轮到才取 IP。
+		// 没有可信出口 IP 的节点**不进闸**(exitIP 空串):按 rankLocked 的
+		// 同一原则,「未知」不是「与谁共享」—— 让所有未量测节点共用一条名
+		// 为 "" 的车道,会把物理上互不相干的出口串行成一条队。
 		exitIP := snapshot.Health.ExitIPOf(picked.NodeKey, attemptStartedAt)
-		releaseLane, ok := e.exitLanes.acquire(ctx, exitIP, settings.ExitConcurrency)
-		if !ok {
-			// 客户端在排队时离开了:这一轮作废,什么都没发出去。
-			return Outcome{}, ctx.Err()
+		releaseLane := func() {}
+		if exitIP != "" {
+			var ok bool
+			releaseLane, ok = e.exitLanes.acquire(ctx, exitIP, settings.ExitConcurrency)
+			if !ok {
+				// 客户端在排队时离开了:这一轮作废,什么都没发出去。
+				return Outcome{}, ctx.Err()
+			}
 		}
 		// 在途计数拿 IP 当令牌,acquire 时取一次、release 还同一个
 		// (engine.js:269/:312)。不能在 release 时重新解析 IP:探测轮可能

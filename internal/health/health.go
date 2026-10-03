@@ -499,6 +499,17 @@ func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
 		} else {
 			tier = TierA
 		}
+		// **出口 IP 变了就作废 B 档凭证**:B 的含义是「从这个出口出去,门控
+		// 模型可用」,IP 一变这句话就不再成立。过去 B 被无条件保留、且已证 B
+		// 永不重测(runTierPipeline 跳过),一个动态 IP 节点漂到墙外国家后会
+		// 永远挂着 B,被 gated 流量**优选**(rankLocked 给 B 桶位 −1),每轮
+		// 真实对话先付一次 REGION 失败再轮换——坏凭证永不自愈。判据:本轮
+		// **量到**的 IP(measuredIp,不是沿用下来的 exitIp)与上一行不同 →
+		// 降回 A,下一轮 runTierPipeline 就会重验它;本轮没量到则不动 ——
+		// 没有 IP 变化的证据就不撤销凭证(与分支 2 的保守保留同一口径)。
+		if tier == TierB && hasPrev && measuredIp != "" && prev.ExitIP != "" && prev.ExitIP != measuredIp {
+			tier = TierA
+		}
 	}
 
 	// 配额记号跟着节点走,探测轮不改写它(src/health.js:299-300):粗探打的是
@@ -1104,21 +1115,22 @@ func (h *Health) StickyBurned(session string) bool {
 // sameExitNodeLocked 在同一个出口 IP 内挑一个还能用的节点。(src/health.js:716-741)
 // 池子重度聚簇(96 个 IP / 191 个节点,19 个 IP 被 2-7 个节点共用),原节点坏掉
 // 时通常有替代品,而换节点不换 IP 对提示词缓存无损。排序与 pick 一致:先存活、
-// 再按 latencyMin —— 这里只有 alive/非 alive 两档;同档并列时按 tag 字典序
-// (JS 靠 Map 插入序,Go map 无序,确定性优先)。
+// 再按 latencyMin(-1/0 视为无数据、排最后),并列按 tag 字典序(JS 靠 Map 插入
+// 序,Go map 无序,确定性优先)。
+//
+// 实现是一次遍历选最优,不是「排序全表再取第一」:调用点在锁内,而全表排序
+// (O(n log n) 加一次 n 大小的分配)在 2000 节点池上是每次同 IP 轮换都要付的
+// 税;逐点比较用同样的判据(状态档 → 延迟 → tag 字典序)取 min,结果与排序后
+// 取第一**逐位相同**,与 map 迭代顺序无关。
 func (h *Health) sameExitNodeLocked(exitIP, excludeKey string) string {
 	if exitIP == "" {
 		return ""
 	}
 	now := time.Now().UnixMilli()
-	keys := make([]string, 0, len(h.nodes))
-	for key := range h.nodes {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	bestState := -1 // JS 的 best = null
+	bestState := 2 // 没有候选时的终值;任何能进循环体的候选都 < 2
+	bestLat := int64(math.MaxInt64)
 	bestKey := ""
-	for _, key := range keys {
+	for key := range h.nodes {
 		if key == excludeKey {
 			continue
 		}
@@ -1132,9 +1144,14 @@ func (h *Health) sameExitNodeLocked(exitIP, excludeKey string) string {
 		if h.nodes[key].State == StateAlive {
 			state = 0
 		}
-		if bestState == -1 || state < bestState {
-			bestState = state
-			bestKey = key
+		lat := h.nodes[key].LatencyMin
+		if lat <= 0 {
+			lat = math.MaxInt64
+		}
+		if state < bestState ||
+			(state == bestState && lat < bestLat) ||
+			(state == bestState && lat == bestLat && key < bestKey) {
+			bestState, bestLat, bestKey = state, lat, key
 		}
 	}
 	return bestKey

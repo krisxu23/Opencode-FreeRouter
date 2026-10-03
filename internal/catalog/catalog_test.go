@@ -221,6 +221,38 @@ func TestBuildDedupesByBaseID(t *testing.T) {
 	}
 }
 
+// TestBuildRemovesMeasuredDeadIncludingSuffixVariants 钉住实测 denylist 的
+// 完整效力:裸 id 与**带思考后缀的变体**都必须被摘掉。
+//
+// 裸 id 那条(:236 注释提到「单独在下面的 denylist 测试里钉它」,其实并没有
+// 这样一条测试)。后缀这条是上游层审计发现的旁路:Build 过去把**原始**
+// listing 串递给 IsMeasuredDead,而文档写着它「报告一个 base id」,于是
+// 上游列出 "ling-3.0-flash-fin-free (high)" 时 denylist 整个绕过、实测已死
+// 的车道被重新发布,面板出现一个每一发都 500/404 的模型。
+func TestBuildRemovesMeasuredDeadIncludingSuffixVariants(t *testing.T) {
+	if !IsMeasuredDead("ling-3.0-flash-fin-free") {
+		t.Fatal("夹具变了:这条 id 不在 denylist 里,本测试失去意义")
+	}
+	for _, tc := range []struct {
+		name string
+		ids  []string
+	}{
+		{"裸 id", []string{"ling-3.0-flash-fin-free"}},
+		{"思考后缀变体(审计发现的旁路)", []string{"ling-3.0-flash-fin-free (high)"}},
+		{"混在活模型里", []string{"mimo-v2.6-flash-free", "ling-3.0-flash-fin-free", "big-pickle"}},
+	} {
+		rows := Build(tc.ids)
+		for _, r := range rows {
+			if r.ID == "ling-3.0-flash-fin-free" {
+				t.Errorf("%s: denylist 里的 id 仍被发布 → %+v", tc.name, rows)
+			}
+		}
+		if tc.name == "混在活模型里" && len(rows) != 2 {
+			t.Errorf("活模型不该被误伤: rows = %v, want 2 行(mimo + big-pickle)", idsOf(rows))
+		}
+	}
+}
+
 // 对照 tests/limits.test.js 的「buildCatalog carries the Zen-lane numbers」:
 // 本地表数值要端到端流进 Build 的产物。
 func TestBuildCarriesZenLaneNumbers(t *testing.T) {

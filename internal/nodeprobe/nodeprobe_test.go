@@ -272,6 +272,63 @@ func slowServer(t *testing.T, first, second time.Duration) *httptest.Server {
 	return srv
 }
 
+// TestMultiSegmentBodySurvivesFetchVia 是 H1 的回归钉:fetchVia 曾在
+// RoundTrip 返回时就 cancel shot ctx,于是「判决与排干都发生在响应体上」的
+// 两个消费者(gateVerdict 的 ReadCapped、echoJudge 的 ReadCapped)在 body
+// 被拆成多段时恒读不完 —— 实测症状是 context canceled,后果是「到得了上游
+// 但到不了 Cloudflare」这类**本应存活**的节点每轮被判 dead,exitIp 大面积空。
+//
+// 判据用真实链路(ProbeNode),不直接调 fetchVia:把 liveness 源指到一个必败
+// 地址,让**闸门**成为 stage-1 里唯一的胜者,这样 gateVerdict 必然执行;闸门
+// 体写成一份 300KB 的模型清单并**强制多段**(先 Flush 头段、再逐块 Flush,
+// 且关掉 Content-Length 让传输走分块),echo 同理。修复前这里 State=dead;
+// 修复后 State=alive 且 ExitIP 非空(两个消费者都读完了各自的多段体)。
+func TestMultiSegmentBodySurvivesFetchVia(t *testing.T) {
+	mux := http.NewServeMux()
+	// 闸门:200 + 一份 data 数组,但故意拆成很多小段刷出去,逼出多段 body。
+	mux.HandleFunc("/gate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		// 无 Content-Length → net/http 走 chunked,body 一定会被拆成多段。
+		_, _ = io.WriteString(w, `{"data":[`)
+		filler := strings.Repeat("x", 4096)
+		for i := 0; i < 80; i++ { // ~320KB,远超单段
+			if i > 0 {
+				_, _ = io.WriteString(w, ",")
+			}
+			_, _ = io.WriteString(w, `{"id":"`+filler+`"}`)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush() // 每一段都刷,确保分段
+			}
+		}
+		_, _ = io.WriteString(w, `]}`)
+	})
+	// echo:小 body,但同样分两段刷,验证 echoJudge 的 ReadCapped 也读完。
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"ip":"1.2.`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		_, _ = io.WriteString(w, `3.4","country_code":"US"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	p := NewProber(nil)
+	// liveness 指向一个必败端口:闸门因此是 stage-1 的唯一候选胜者。
+	p.liveness = []string{"http://127.0.0.1:1/live"} // 端口 1 拒连
+	p.gate = srv.URL + "/gate"
+	p.echo = []string{srv.URL + "/echo"}
+
+	res := p.ProbeNode(context.Background(), nil, 5000, 1)
+	if res.State != StateAlive {
+		t.Fatalf("State = %q, want alive —— 多段闸门体没能读完就是 H1 复发(gateVerdict 被 cancel 掐死会判 dead)", res.State)
+	}
+	if res.ExitIP != "1.2.3.4" {
+		t.Errorf("ExitIP = %q, want 1.2.3.4 —— echo 的多段体必须被 echoJudge 完整读出", res.ExitIP)
+	}
+}
+
 // TestSuccessfulProbeCollectsMinLatency（Go 特有）钉住"多轮采样取最小值"：
 // 50/200 → LatencyMS=50 且 LatencyMin=50；200/50 → LatencyMS=200 且 LatencyMin=50。
 // 这是 JS 版修不了的历史缺陷（样本按全程累计计时，min 恒等于首样本；Go 按每轮

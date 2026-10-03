@@ -506,7 +506,13 @@ func Load(root string) (*Parts, error) {
 			})
 		},
 		AdapterDeps: adapter.Deps{
-			Base: upstream.UpstreamBase,
+			// 经 upstream.BaseFromEnv 而不是写死常量(上游层审计):
+			// OUR_FREE_MODEL_BASE 的存在理由是「自测把全部流量指到假上游,
+			// 一行真配额都不烧」。过去只有 catalog/B 档探针对它,数据面
+			// (真对话回合)绕开它直打 opencode.ai —— 设了这个变量的自测
+			// 照样烧真车道,开关恰好在它声称解决的问题上失效。env 在进程
+			// 启动前设定、Load 读一次,与 Parts.base 同一口径、同一函数。
+			Base: upstream.BaseFromEnv(),
 			// Effort/Entry/Model/Wire/SessionID/NodeKey/Tools/Client are all
 			// overwritten per attempt by engine; only the assembly-level
 			// template lives here.
@@ -600,8 +606,25 @@ func Load(root string) (*Parts, error) {
 		// 订阅里被 sing-box 拒收的节点数(非法 uuid / 不认的 cipher / 未知传输)。
 		// 前端拿它显示「剔除 N 个坏节点」,不传过去那条告警就永远不出现。
 		dropped := len(picked) - len(clean)
+		// 落盘前复核 ctx(生命周期审计 #3):sub.Fetch 是网络等待,这期间 Load
+		// 可能已因端口占用而失败,fail() 会 cancel() 让 ctx 进入取消态。Fetch
+		// 在取消前恰好成功返回时,旧的写法照样往下走 —— reg.Flush 会把这一轮
+		// 订阅结果写进注册表文件,而进程随即退出:一次**从未成功启动**的运行
+		// 在磁盘上留下了注册表,下次开机继承它。joinBoot 只保证「返回之后不再
+		// 写」,管不了「失败之后仍在写」。取消的一轮什么都不写:池子原样留给
+		// 下一次真正的开机。
+		if ctx.Err() != nil {
+			logger.Info("[app] 开机订阅已完成拉取但启动已中止 — 本轮不写注册表,池子保持磁盘现状")
+			return
+		}
 		merged := reg.Merge(clean)
 		evicted := reg.EnforceCap(registry.PoolCap)
+		for _, tag := range evicted {
+			// 池子外的节点不该留健康行:D-C1 —— Forget 掉,否则被淘汰者的行
+			// 永远留在 node-health.json(PruneStale 只在探测轮里跑,这里不补
+			// 就没有回收点)。
+			parts.Health.Forget(tag)
+		}
 		if err := reg.Flush(); err != nil {
 			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
 		}
@@ -623,7 +646,7 @@ func Load(root string) (*Parts, error) {
 		}
 		parts.setRebuildResult(syncAdded, syncRemoved, dropped, nil)
 		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，淘汰 %d），池内现有 %d 个（热插 %d，撤下 %d）",
-			len(clean), merged, evicted, reg.Len(), syncAdded, syncRemoved))
+			len(clean), merged, len(evicted), reg.Len(), syncAdded, syncRemoved))
 	}()
 
 	// 7. the forward listener, last: the port may only open once it can serve.

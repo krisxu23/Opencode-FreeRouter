@@ -486,6 +486,11 @@ func openAIError(w http.ResponseWriter, status int, typ, message string) {
 }
 
 // writeJSON 照 js :78-82:content-type / content-length / cache-control: no-store。
+//
+// 外加 applyCORS:OPTIONS 预检放行 + 允许 x-api-key 的**承诺**只对了一半 ——
+// 过去只有 SSE 头带 ACAO,所有 JSON(含 4xx/5xx 错误体)都不带,浏览器在
+// 预检通过之后仍把实际响应拦在 CORS 之外,跨源的 harness 连错误形状都读不到
+// (协议审计 M5)。流式与非流式现在给同一套头。
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	body, err := marshalNoEscape(payload)
 	if err != nil {
@@ -493,6 +498,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 		status = http.StatusInternalServerError
 	}
 	h := w.Header()
+	applyCORS(h)
 	h.Set("Content-Type", "application/json")
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	h.Set("Cache-Control", "no-store")

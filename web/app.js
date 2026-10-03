@@ -190,6 +190,9 @@
     const todayKey = new Date().toISOString().slice(0, 10)
     D = {
       nodes: nodes, alive: alive,
+      // 车道视图直传：渲染层读 D.lanes（实时负载卡）。DATA.lanes 由
+      // absorbStatus 随 /api/status 更新；缺省空对象让 laneRows 返回空串。
+      lanes: DATA.lanes || {},
       tierB: alive.filter(n => n.tier === 'B').length,
       tierA: alive.filter(n => n.tier === 'A').length,
       bucketCount: bucketCount, models: models, usage: usage, rows: rows,
@@ -923,7 +926,7 @@
     + '      <div class="inline" style="gap:20px">'
     + '        <label class="inline"><input type="checkbox" id="f-probeEnabled"' + (S.form.probeEnabled ? ' checked' : '') + '> 自动探测</label>'
     + '        <label class="inline">探测并发 <input type="number" id="f-probeWorkers" value="' + esc(S.form.probeWorkers) + '" style="width:76px" min="1" max="128"></label>'
-    + '        <label class="inline">探测周期 <input type="number" id="f-probeIntervalMin" value="' + esc(S.form.probeIntervalMin) + '" style="width:76px" min="5"> 分钟</label>'
+    + '        <label class="inline">探测周期 <input type="number" id="f-probeIntervalMin" value="' + esc(S.form.probeIntervalMin) + '" style="width:76px" min="5" max="43200"> 分钟</label>'
     + '      </div>'
     + '      <div class="help">并发越高越快，但更容易触发上游限流。当前 ' + D.nodes.length + ' 个节点，'
     + '一轮约需 ' + Math.max(10, Math.round(D.nodes.length / Math.max(1, Number(S.form.probeWorkers) || 24) * 15)) + ' 秒。</div>'
@@ -1206,7 +1209,11 @@
       probeEnabled: S.form.probeEnabled,
       /* 后端硬上限 128，HTML 的 max 只是提示。前端 clamp 而不是放行 400 */
       probeWorkers: Math.min(128, Math.max(1, Number(S.form.probeWorkers) || 24)),
-      probeIntervalMin: Number(S.form.probeIntervalMin) || 30,
+      /* 探测周期上限 43200(30 天)是后端硬闸:time.Duration(分钟)*分钟在约
+         1.5 亿处溢出成 <=0,probeLoop 退化成零睡眠自旋(生命周期审计 #2)。
+         下限 5 与后端运行时 clamp 同口径 —— 过去填 1 能保存、能显示,实际每 5
+         分钟一轮,展示与事实不符。同一纪律:前端 clamp,不放行 400。 */
+      probeIntervalMin: Math.min(43200, Math.max(5, Math.round(Number(S.form.probeIntervalMin) || 30))),
       /* 0 = 不限(默认)；负数按 0 归一 */
       maxWallClockMs: Math.max(0, Math.round(Number(S.form.maxWallClockMs) || 0)),
       /* 0 = 不限(默认)；同一出口 IP 的最大在途数 */
@@ -1445,6 +1452,10 @@
   } catch (e) { setTheme('light') }
 
   readSettings()
+  /* L1:boot 现在带 probing/lanes 了,首帧也要吸收一次 —— 开机后 warmUp
+     探测立刻在跑,浏览器这时打开面板,不吸收就把「立即探测」按钮画成可点,
+     点下去只收到一句 already running。守卫与 absorbStatus 逐字相同。 */
+  if (typeof DATA.probing === 'boolean') S.probing = DATA.probing
   const v = $('verTxt')
   if (v && window.__BOOT__ && window.__BOOT__.version) v.textContent = 'v' + window.__BOOT__.version
 

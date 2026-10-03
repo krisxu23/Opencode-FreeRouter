@@ -217,6 +217,13 @@ func Fetch(ctx context.Context, sources []string, exits []Exit) (Result, error) 
 // 内网触探器,Detail.Error 的文案差异("HTTP 404" vs 「没有识别出任何节点」)
 // 还能当内网端口/服务存在性的侧信道。nodeprobe 的 client 早就这么设了,
 // 订阅这条车道是漏网之鱼。
+//
+// **守卫只覆盖重定向,配置 URL 本身不查**,这是有意取舍而不是遗漏:本机
+// 127.0.0.1 上的订阅转换器(subconverter 这类)是这套生态的常见合法用法,
+// 把它们拦死会误伤真实用户。威胁模型也对得上:面板只绑回环、写方法有
+// Host+Origin 双闸,跨源浏览器写不进 subUrls;能 PUT 本机的进程已以同一
+// 用户身份运行(本可直读文件/自己发请求),网关代它触探不构成提权。
+// 能注入第三方主机的只有重定向,而那条车道已经被上面的判据封住。
 func subHTTPClient(dial httpclient.Dialer) *http.Client {
 	c := httpclient.NewClient(dial, attemptTimeout)
 	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
