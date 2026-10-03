@@ -91,7 +91,13 @@ func Classify(status int, body []byte, retryAfterMS int64) Failure {
 
 	// 配额分支必须在凭证分支之前:文案是 "usage limit" 的 403 是配额拒绝,
 	// 换出口恰恰是正确的应对(src/errors.js:47)。
-	case status == 429 || typ == "FreeUsageLimitError" || quotaRe.MatchString(flat):
+	case status == 429 || typ == "FreeUsageLimitError" || typ == "GoUsageLimitError" ||
+		status == 402 || quotaRe.MatchString(flat) || strings.Contains(flat, "insufficient"):
+		// GoUsageLimitError 是配额分支的第二个类型名(dsh harness 仓库 2026-10
+		// 实测:它以 403 且文案不含 "usage limit" 的形状出现,漏认会掉进下面的
+		// 凭证分支变成不可重试的慢失败;自带 retry-after ≈600s)。402 与
+		// "insufficient funds" 是上游账户侧的计费拒绝(同仓库实测信封),对
+		// 网关语义同样是「这个出口的配额没了」—— 换出口重试,不冷却节点。
 		return Failure{Code: check.CodeQuota, Status: status, Type: typ, Message: msg, RetryAfterMS: retryAfterMS, Retryable: true}
 
 	// 故意限定 status == 403(src/errors.js:50-57 的两个限定都不可选):

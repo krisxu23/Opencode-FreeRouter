@@ -895,7 +895,7 @@
     + '    <div class="card-body">'
     + '      <div class="inline" style="gap:20px">'
     + '        <label class="inline"><input type="checkbox" id="f-probeEnabled"' + (S.form.probeEnabled ? ' checked' : '') + '> 自动探测</label>'
-    + '        <label class="inline">探测并发 <input type="number" id="f-probeWorkers" value="' + esc(S.form.probeWorkers) + '" style="width:76px" min="1" max="256"></label>'
+    + '        <label class="inline">探测并发 <input type="number" id="f-probeWorkers" value="' + esc(S.form.probeWorkers) + '" style="width:76px" min="1" max="128"></label>'
     + '        <label class="inline">探测周期 <input type="number" id="f-probeIntervalMin" value="' + esc(S.form.probeIntervalMin) + '" style="width:76px" min="5"> 分钟</label>'
     + '      </div>'
     + '      <div class="help">并发越高越快，但更容易触发上游限流。当前 ' + D.nodes.length + ' 个节点，'
@@ -1027,9 +1027,21 @@
       return r.json()
     })
   }
-  /* W22：阻塞型动作请求(探测一轮可达数分钟)必须有超时 —— fetch 不设超时的
-     话，一个半死的连接会把 S.probing 永久卡在 true，两个探测按钮从此禁用，
-     只能整页刷新。探测给 10 分钟(大池 + 低并发的最坏值)，其余动作更短。 */
+  /* W22：阻塞型动作请求必须有超时 —— fetch 不设超时的话，一个半死的连接会
+     把动作按钮永久卡在 disabled，只能整页刷新。超时中止在 j() 里被翻译成
+     明确的中文文案：TimeoutError 的原始 message 是浏览器内部串（"signal timed
+     out"/"The operation was aborted"），直接 toast 出去用户看不懂。 */
+  function j(url, opt) {
+    return fetch(url, opt).catch(function (e) {
+      if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+        throw new Error('请求超时，请稍后重试')
+      }
+      throw e
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(t) })
+      return r.json()
+    })
+  }
   function post(url, timeoutMs) {
     const opt = { method: 'POST' }
     if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
@@ -1048,6 +1060,9 @@
     if (s.nodes) DATA.nodes = s.nodes
     if (s.usage) DATA.usage = s.usage
     if (s.diagnostics) DATA.diagnostics = s.diagnostics
+    /* F5：probing 位以服务端为准 —— 异步受理后，前端本地的乐观值只活到
+       下一次 /api/status 轮询（5s）；探测完成/失败也由这里复位按钮。 */
+    if (typeof s.probing === 'boolean') S.probing = s.probing
   }
   /* W18：轮询的时序保护。慢的旧响应回来时，新一轮可能已经落地 —— 不做保护
      会把 5 秒前的旧快照覆盖上去(显示回跳)。单调 seq：响应落地前比对发起时
@@ -1056,10 +1071,27 @@
   let statusSeq = 0, statusBusy = false
   let lastRenderSig = ''
   /* O18：内容没变就跳过整页重建。节点表是最大头(池上限 8000，每 5s 全量
-     innerHTML 重建开销可观)；sig 覆盖渲染会用到的全部可变数据 */
+     innerHTML 重建开销可观)。sig 原来是 JSON.stringify 整个 nodes/usage 数组
+     —— 每 5s 对几千节点做一次全量序列化，恰好是 O18 想省的那类开销。改成
+     对 **derive() 的聚合结果** 签名：refreshStatus 在比较前本来就跑完了
+     derive()，而聚合值(各级计数/延迟分位/用量行)正是渲染实际读的全部输入
+     —— 节点条目是原地更新的，只有聚合级签名才既便宜又不漏变更。 */
   function statusSig() {
-    return JSON.stringify([DATA.nodes, DATA.usage, DATA.singbox, DATA.limits,
-      DATA.models, DATA.regionModels, DATA.diagnostics, S.probing, S.routes])
+    const d = D
+    const bc = Object.keys(d.bucketCount || {})
+      .sort().map(k => { const b = d.bucketCount[k]; return k + ':' + b.total + '/' + b.alive + '/' + b.b }).join(',')
+    /* 节点行的可变字段只有 state/latencyMs（探测改写）；tag/country/tier 只随
+       整池重建变，那必然连长度都变。逐项拼这俩字段 —— 不做全对象序列化。 */
+    const nodesSig = d.nodes.map(n => (n.state && n.state[0]) + n.latencyMs).join('')
+    return [
+      d.nodes.length, nodesSig, d.alive.length, d.tierA, d.tierB, bc,
+      d.models.length, d.models.map(m => m.id + (m.gated ? '!' : '')).join(','),
+      JSON.stringify(d.usage.today || {}), d.usage.requests || 0,
+      d.rows.map(r => r.model + ':' + r.req + ':' + (r.in + r.out)).join(','),
+      JSON.stringify(DATA.singbox), JSON.stringify(DATA.limits),
+      JSON.stringify(DATA.diagnostics), S.probing ? 1 : 0,
+      S.routes.length + ':' + (S.routes.length ? JSON.stringify(S.routes[S.routes.length - 1]) : '')
+    ].join('|')
   }
   function refreshStatus() {
     if (statusBusy) return Promise.resolve()
@@ -1081,14 +1113,34 @@
   }
   function refreshLogs() {
     return j('/api/logs').then(function (d) {
-      DATA.logs = d.lines || []
-      if (S.view === 'logs' && !isEditing()) rerenderSoft()
+      const lines = d.lines || []
+      /* F7：日志页内层滚动器(#logbox)每 15s 被软重建重置 —— O18 的 sig 守卫
+         只盖住了 refreshStatus，logs/routes 轮询是无条件 rerenderSoft。内容
+         真没变就不重建；变了也先记下内层滚动位置，重建后恢复。 */
+      const unchanged = lines.length === (DATA.logs || []).length && lines.length > 0 &&
+        lines[lines.length - 1].msg === (DATA.logs[lines.length - 1] || {}).msg &&
+        lines[0].t === (DATA.logs[0] || {}).t
+      DATA.logs = lines
+      if (S.view !== 'logs' || isEditing()) return
+      if (unchanged) return
+      const lb = $('logbox')
+      const keep = lb ? lb.scrollTop : null
+      rerenderSoft()
+      if (lb) { /* rerenderSoft 已重建 DOM，重新取 */
+        const nb = $('logbox')
+        if (nb && keep != null && !S.logAuto) nb.scrollTop = keep
+      }
     }).catch(function () { /* 同上 */ })
   }
   function refreshRoutes() {
     return j('/api/routes?limit=20').then(function (d) {
-      S.routes = d.rows || []
-      if (S.view === 'logs' && !isEditing()) rerenderSoft()
+      const rows = d.rows || []
+      const unchanged = rows.length === S.routes.length && rows.length > 0 &&
+        JSON.stringify(rows[rows.length - 1]) === JSON.stringify(S.routes[rows.length - 1])
+      S.routes = rows
+      if (S.view !== 'logs' || isEditing()) return
+      if (unchanged) return
+      rerenderSoft()
     }).catch(function () { /* 静默：轨迹是增强信息 */ })
   }
 
@@ -1096,15 +1148,14 @@
     if (S.probing) return
     S.probing = true
     if (S.view === 'overview') rerenderSoft()
-    /* 10 分钟：池上限 8000、低并发的最坏探测时长；abort 后 catch 复位按钮 */
-    post('/api/probe', 600000)
+    /* F5：探测改异步受理 —— POST 立即返回（已在跑则回 409/错误），进度与
+       完成经 /api/status 的 probing 位呈现。旧阻塞式给 10 分钟超时，大池上
+       fetch 一掐、C2 取消守卫把整轮丢掉，白等且零结论。本地 S.probing 只是
+       乐观值：下一次 refreshStatus 会用服务端位纠正。 */
+    post('/api/probe', 15000)
       .then(function () { return refreshStatus() })
-      .then(function () { return refreshLogs() })
       .then(function () {
-        S.probing = false
-        if (S.view === 'overview') rerenderSoft()
-        const p = probeFromLogs()
-        toast(p ? '探测完成：' + p.alive + ' / ' + p.scanned + ' 存活' : '探测完成', 'ok')
+        toast('探测已受理，正在后台进行；按钮状态随 /api/status 的 probing 更新')
       })
       .catch(function (e) {
         S.probing = false

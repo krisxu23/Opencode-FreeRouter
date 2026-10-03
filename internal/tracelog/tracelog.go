@@ -165,7 +165,10 @@ func Record(r Route) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	mu.Lock()
-	if writeOff || dir != d {
+	// 跨天护栏:两次进 mu 之间若别的 Record 完成了日轮转(lastPruneDay 前进
+	// 到新的一天),本条的字节账会记到新一天的配额上、文件却写到旧一天 ——
+	// 直接丢弃这一行(本包 fail-silent by design),别让旧日文件超配额。
+	if writeOff || dir != d || lastPruneDay != day {
 		mu.Unlock()
 		return
 	}

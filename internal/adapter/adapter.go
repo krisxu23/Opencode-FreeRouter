@@ -448,7 +448,9 @@ func (a *Adapter) readJSON(raw []byte, status int, retryAfter int64, t *turn, s 
 		return errors.Failure{Code: check.CodeServer,
 			Message: "our-free-model: unexpected non-SSE response: " + snippet(raw)}
 	}
-	if _, has := p["error"]; has {
+	if e, has := p["error"]; has && e != nil {
+		// 显式 "error": null 的 2xx 体不是错误信封 —— 按它分类会把一次
+		// 正常响应记成一次上游失败。
 		return errors.Classify(status, raw, retryAfter)
 	}
 	if err := a.feed(t, raw, status, s); err != nil {

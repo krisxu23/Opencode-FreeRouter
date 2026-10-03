@@ -113,61 +113,76 @@ func top8(list []*ranked) []*ranked {
 
 func (h *Health) Pick(req PickRequest) *Picked {
 	now := time.Now().UnixMilli()
-	h.mu.Lock()
-	// 长期占用:每个出口 IP 被多少个活会话钉着(不含调用方自己那个)
-	busy := h.busyExitIpsLocked(req.StickyNode)
-	// 配额扩散:还在记号有效期内的出口 IP 集合
-	quotaIps := h.quotaMarkedExitIpsLocked(now)
 
-	// sticky 优先(src/health.js:1007-1019):命中时 Order 只有它一行 —— 粘性
-	// 压过排序是这个模块最容易被误判的行为(「为什么还在用那个慢出口」只能从
-	// 这行回答)。rank 为 nil(节点不可用/受限模型遇到非 B)则照常落回池内选路;
-	// StickyNode 不在池里同样跳过。
-	if req.StickyNode != "" {
-		for _, node := range req.Pool {
-			if node.Tag != req.StickyNode {
+	// 锁内阶段(占用账 + sticky + 全池 rank)。整个临界区包在闭包里用 defer
+	// 解锁:O2 把排序挪到了锁外之后,这里的显式 Unlock 失去了 panic 兜底 ——
+	// rank/分组途中任何一次 panic 都会让 h.mu 永久锁死,之后所有 Pick、
+	// NoteTtft、MarkProbe 全部挂死。defer 是唯一能同时保住「锁外排序」与
+	// 「异常安全」的形状。
+	stickyHit, want, byGroup, rankedAll := func() (*ranked, []string, map[string][]*ranked, []*ranked) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		// 长期占用:每个出口 IP 被多少个活会话钉着(不含调用方自己那个)
+		busy := h.busyExitIpsLocked(req.StickyNode)
+		// 配额扩散:还在记号有效期内的出口 IP 集合
+		quotaIps := h.quotaMarkedExitIpsLocked(now)
+
+		// sticky 优先(src/health.js:1007-1019):命中时 Order 只有它一行 —— 粘性
+		// 压过排序是这个模块最容易被误判的行为(「为什么还在用那个慢出口」只能从
+		// 这行回答)。rank 为 nil(节点不可用/受限模型遇到非 B)则照常落回池内选路;
+		// StickyNode 不在池里同样跳过。
+		if req.StickyNode != "" {
+			for _, node := range req.Pool {
+				if node.Tag != req.StickyNode {
+					continue
+				}
+				if r := h.rankLocked(node, req, busy, quotaIps, now); r != nil {
+					return r, nil, nil, nil
+				}
+				break
+			}
+		}
+
+		// countries 是固定分组(US/JP/HK/TW/KR/SG/EU/OTHER),节点的 tag 推断国与
+		// 出口 IP 实测国都归到分组后再匹配;byGroup 必须按分组 key,不能按原始国家码
+		// (否则 EU/OTHER 分组永远查不到,如 NL→EU、CA→OTHER,src/health.js:1026-1029)。
+		// want 保序去重:Set 的插入序就是回退序,不能排字典序。
+		want := make([]string, 0, len(req.Countries))
+		seen := map[string]bool{}
+		for _, g := range req.Countries {
+			group := strings.ToUpper(g)
+			if group == "" || seen[group] {
 				continue
 			}
-			if r := h.rankLocked(node, req, busy, quotaIps, now); r != nil {
-				h.mu.Unlock()
-				return pickRanked(r, []*ranked{r}, req.StickyNode)
-			}
-			break
+			seen[group] = true
+			want = append(want, group)
 		}
+		byGroup := map[string][]*ranked{}
+		// rankedAll 是为了不再排第二遍(O11):过去这里把整池 rank 一遍、按分组丢弃,
+		// 选定分组全落空时又把整池**重新 rank 一遍** —— 每次 Pick 白付约 2×池子次数的
+		// rank,而 rank 里还要查出口 IP 信任窗口、配额记号与 TTFT 中位数。第一趟的
+		// 结果就是第二趟要的结果:同一个纯函数、同一批 now/busy/quotaIps。
+		rankedAll := make([]*ranked, 0, len(req.Pool))
+		for _, node := range req.Pool {
+			r := h.rankLocked(node, req, busy, quotaIps, now)
+			if r == nil {
+				continue
+			}
+			rankedAll = append(rankedAll, r)
+			group := parse.BucketOf(r.country)
+			if !seen[group] {
+				continue
+			}
+			byGroup[group] = append(byGroup[group], r)
+		}
+		return nil, want, byGroup, rankedAll
+	}()
+
+	// sticky 命中:锁已由闭包释放,Order 只有它一行。
+	if stickyHit != nil {
+		return pickRanked(stickyHit, []*ranked{stickyHit}, req.StickyNode)
 	}
 
-	// countries 是固定分组(US/JP/HK/TW/KR/SG/EU/OTHER),节点的 tag 推断国与
-	// 出口 IP 实测国都归到分组后再匹配;byGroup 必须按分组 key,不能按原始国家码
-	// (否则 EU/OTHER 分组永远查不到,如 NL→EU、CA→OTHER,src/health.js:1026-1029)。
-	// want 保序去重:Set 的插入序就是回退序,不能排字典序。
-	want := make([]string, 0, len(req.Countries))
-	seen := map[string]bool{}
-	for _, g := range req.Countries {
-		group := strings.ToUpper(g)
-		if group == "" || seen[group] {
-			continue
-		}
-		seen[group] = true
-		want = append(want, group)
-	}
-	byGroup := map[string][]*ranked{}
-	// rankedAll 是为了不再排第二遍(O11):过去这里把整池 rank 一遍、按分组丢弃,
-	// 选定分组全落空时又把整池**重新 rank 一遍** —— 每次 Pick 白付约 2×池子次数的
-	// rank,而 rank 里还要查出口 IP 信任窗口、配额记号与 TTFT 中位数。第一趟的
-	// 结果就是第二趟要的结果:同一个纯函数、同一批 now/busy/quotaIps。
-	rankedAll := make([]*ranked, 0, len(req.Pool))
-	for _, node := range req.Pool {
-		r := h.rankLocked(node, req, busy, quotaIps, now)
-		if r == nil {
-			continue
-		}
-		rankedAll = append(rankedAll, r)
-		group := parse.BucketOf(r.country)
-		if !seen[group] {
-			continue
-		}
-		byGroup[group] = append(byGroup[group], r)
-	}
 	// (bucket, cost, tag) 三元组。第三项是 Go 版新增:JS 的 Array.prototype.sort
 	// 稳定性由引擎保证,sort.SliceStable 之下两个同 bucket 同 cost 的候选还得有
 	// 一个确定次序,否则「为什么选了它」在重放时无法复现。
@@ -182,11 +197,10 @@ func (h *Health) Pick(req PickRequest) *Picked {
 			return list[i].node.Tag < list[j].node.Tag
 		})
 	}
-	// O2:rank 之后的账目只读,锁在这里放掉 —— 排序(整池几千候选)是纯计算,
+	// O2:rank 之后的账目只读,排序在锁外做 —— 排序(整池几千候选)是纯计算,
 	// 留在 h.mu 里会把所有并发 Pick 串成一条队(engine 每个 attempt 都要 Pick
 	// 一次)。快照与选中瞬间之间状态再变的窗口本来就是 Pick 返回后同样存在的
 	// (engine 的 NoteExitBusy 在 Pick 返回后才落账),这里不引入新的竞争类。
-	h.mu.Unlock()
 	for _, group := range want {
 		list := byGroup[group]
 		if len(list) == 0 {

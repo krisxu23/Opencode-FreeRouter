@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"freerouter/internal/app"
 	"freerouter/internal/logger"
@@ -84,7 +85,18 @@ func run(ctx context.Context, stop context.CancelFunc, root string) error {
 	go func() {
 		<-ctx.Done()
 		_ = parts.Shutdown(context.Background())
-		tray.Quit()
+		// Quit 需要托盘已完成 systray.Register(tray.Quit 内部自会判),但
+		// 「还没就绪」有两种终局:托盘马上起来(等到 Ready 再 Quit),或者
+		// 信号来在 Load 完成之前、Run 根本还没被调到(等 30s 后自行退进程
+		// —— Shutdown 已经跑完,没有可丢的东西)。没有这个兜底,开机头几秒
+		// 的 Ctrl+C 会留下一个托盘永远起不来的进程。
+		select {
+		case <-tray.Ready():
+			tray.Quit()
+		case <-time.After(30 * time.Second):
+			logger.Warn("[main] 托盘 30s 内未就绪,信号路径直接退出")
+			os.Exit(0)
+		}
 	}()
 
 	// Run blocks until the tray quits. The callbacks are plain closures over

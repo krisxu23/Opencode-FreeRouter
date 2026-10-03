@@ -219,6 +219,5 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 		*firstContentSeen = true
 		acc.TTFTMS = time.Since(t0).Milliseconds()
 	}
-	_ = isContent
 	return isContent
 }

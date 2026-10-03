@@ -208,19 +208,36 @@ type responsesBody struct {
 	Status    string            `json:"status"`
 	Output    []responsesOutput `json:"output"`
 	Usage     responsesUsage    `json:"usage"`
+	// IncompleteDetails 只在 status:"incomplete" 时出现:镜像上游
+	// response.incomplete 事件的 max_output_tokens 截断形状,让流式客户端
+	// 与非流式(finish_reason:length)一样能区分「正常完成」和「被截断」。
+	IncompleteDetails *struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details,omitempty"`
 	// Error 只在「已出内容后断流」的非流式响应上出现(与 chat 线的顶层 error
 	// 标记同理):让半截回答与完整回答可区分。成功路径恒不出现。
 	Error *openAIErrorDetail `json:"error,omitempty"`
 }
 
-// responsesEvent 是 Responses SSE 的事件信封:一个结构体装全部事件形状,
-// 各事件只填自己用到的键(omitempty 保证不出现空壳字段)。
+// responsesEvent 是生命周期事件(created/in_progress/output_item.added/
+// output_item.done/failed/completed)的信封:要么带 response,要么带 item。
+// OutputIndex 带 omitempty —— 过去它恒出现,created/completed 这类不含
+// output_index 语义的事件里也挂着 "output_index":0 的噪音。
 type responsesEvent struct {
-	Type     string         `json:"type"`
-	Response *responsesBody `json:"response,omitempty"`
-	Item     *responsesItem `json:"item,omitempty"`
-	// 增量事件的定位与载荷。
-	ItemID       string            `json:"item_id,omitempty"`
+	Type        string         `json:"type"`
+	Response    *responsesBody `json:"response,omitempty"`
+	Item        *responsesItem `json:"item,omitempty"`
+	OutputIndex int            `json:"output_index,omitempty"`
+}
+
+// responsesDeltaEvent 是增量事件(output_text.delta / reasoning_summary_text.delta /
+// function_call_arguments.delta / content_part.added)的信封:item_id 与
+// output_index 是定位键,恒出现。content_index 只有正文增量语义上需要,而
+// 正文恒在 content_index=0 —— omit 后 function_call 增量不再挂多余的 0,
+// 正文增量按 item_id 定位、按 part 数组内序累积,不依赖这个键。
+type responsesDeltaEvent struct {
+	Type         string            `json:"type"`
+	ItemID       string            `json:"item_id"`
 	OutputIndex  int               `json:"output_index"`
 	ContentIndex int               `json:"content_index,omitempty"`
 	Delta        string            `json:"delta,omitempty"`
@@ -591,8 +608,12 @@ func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[strin
 		}
 	}
 	start()
+	// 与非流式分支同一套判定(差分一致):finish 看折进 Outcome 的 ToolCalls
+	// 而不是 seenToolStart —— 截断轮的残缺调用已被 engine 剪掉,流上却已发
+	// 过增量帧;拿 seenToolStart 判会把 finish_reason:tool_calls 发给一条
+	// 参数截在半截、无法执行的调用上(非流式同场景回的是 length)。
 	finish := "stop"
-	if len(out.ToolCalls) > 0 || len(seenToolStart) > 0 {
+	if len(out.ToolCalls) > 0 {
 		finish = "tool_calls"
 	} else if out.Truncated {
 		finish = "length"
@@ -763,7 +784,12 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 		}
 		return &rb
 	}
+	createdSent := false
 	sendCreated := func() {
+		if createdSent {
+			return
+		}
+		createdSent = true
 		empty := []responsesOutput{}
 		sse.sendEvent("response.created", responsesEvent{Type: "response.created", Response: skeleton("in_progress", empty, nil)})
 		sse.sendEvent("response.in_progress", responsesEvent{Type: "response.in_progress", Response: skeleton("in_progress", empty, nil)})
@@ -802,15 +828,15 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 			}
 			if it == nil {
 				it = openItem("message", "msg_"+itoa(nextItemIdx))
-				sse.sendEvent("response.content_part.added", responsesEvent{
-					ItemID: it.itemID, OutputIndex: it.outIdx, ContentIndex: 0,
+				sse.sendEvent("response.content_part.added", responsesDeltaEvent{
+					Type: "response.content_part.added", ItemID: it.itemID, OutputIndex: it.outIdx,
 					Part: &responsesContent{Type: "output_text", Text: ""},
 				})
 			}
 			it.text.WriteString(c.Text)
 			forwarded = true
-			sse.sendEvent("response.output_text.delta", responsesEvent{
-				ItemID: it.itemID, OutputIndex: it.outIdx, ContentIndex: 0, Delta: c.Text,
+			sse.sendEvent("response.output_text.delta", responsesDeltaEvent{
+				Type: "response.output_text.delta", ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.Text,
 			})
 		case engine.ChunkReasoning:
 			sendCreated()
@@ -826,8 +852,11 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 			}
 			it.text.WriteString(c.Text)
 			forwarded = true
-			sse.sendEvent("response.reasoning_text.delta", responsesEvent{
-				ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.Text,
+			// 公开 API 的推理增量事件名是 reasoning_summary_text(与 adapter
+			// 认上游两个名字的表一致);reasoning_text 不是公开事件,监听公开
+			// 事件名的客户端会把它当未知事件静默丢掉。
+			sse.sendEvent("response.reasoning_summary_text.delta", responsesDeltaEvent{
+				Type: "response.reasoning_summary_text.delta", ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.Text,
 			})
 		case engine.ChunkToolCallDelta:
 			sendCreated()
@@ -859,19 +888,23 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 				}
 				it.text.WriteString(c.ToolArguments)
 				forwarded = true
-				sse.sendEvent("response.function_call_arguments.delta", responsesEvent{
-					ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.ToolArguments,
+				sse.sendEvent("response.function_call_arguments.delta", responsesDeltaEvent{
+					Type: "response.function_call_arguments.delta", ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.ToolArguments,
 				})
 				return nil
 			}
 			if c.ToolDelta != "" {
 				it.text.WriteString(c.ToolDelta)
 				forwarded = true
-				sse.sendEvent("response.function_call_arguments.delta", responsesEvent{
-					ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.ToolDelta,
+				sse.sendEvent("response.function_call_arguments.delta", responsesDeltaEvent{
+					Type: "response.function_call_arguments.delta", ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.ToolDelta,
 				})
 			}
 		case engine.ChunkUsage:
+			// usage-only 轮次(finish=length/incomplete 且无内容块)也会走到
+			// completed:不先发 created 的话,客户端收到的第一个事件就是
+			// completed —— chat 线同场景有骨架帧兜底,这里同样要补生命周期头。
+			sendCreated()
 			finalUsage = c.Usage
 		}
 		return nil
@@ -888,8 +921,11 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 		sse.sendEvent("response.failed", responsesEvent{Type: "response.failed", Response: resp})
 		return
 	}
-	if out.Error != "" && !forwarded {
+	if out.Error != "" && !forwarded && !sse.started {
 		// 一个被拒的回合且一个事件都没发过:与非流式分支同样回 502。
+		// (started 是保险:头花掉之后再回 JSON 会产出 SSE 头+JSON 体的畸形
+		// 响应;usage-only 轮次会 started 而 forwarded——那只出现在成功路径,
+		// 与 out.Error 互斥,这里把不变量钉死。)
 		openAIError(w, http.StatusBadGateway, "server_error", out.Error)
 		return
 	}
@@ -900,33 +936,66 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 		return
 	}
 
-	// 收尾:按打开顺序逐个 item 发 done,再发 completed(带 usage 与最终 output)。
-	finalOutput, _ := responsesOutputOf(out)
+	// 收尾:按打开顺序逐个 item 发 done,再发 completed。completed 的 output
+	// 直接从**已流出的 items** 投影 —— 从 Outcome 重投影会丢掉 reasoning 项,
+	// 且 message/function_call 的固定排序与流上 output_index 的创建序矛盾。
+	finalOutput := make([]responsesOutput, 0, len(items))
 	for _, it := range items {
 		done := responsesItem{ID: it.itemID, Type: it.kind, Status: "completed"}
 		switch it.kind {
 		case "message":
+			text := it.text.String()
 			done.Role = "assistant"
-			done.Content = []responsesContent{{Type: "output_text", Text: it.text.String()}}
+			done.Content = []responsesContent{{Type: "output_text", Text: text}}
+			// 正文 item 的 part/text 收尾事件:严格的状态机客户端在等它们。
+			sse.sendEvent("response.content_part.done", responsesDeltaEvent{
+				Type: "response.content_part.done", ItemID: it.itemID, OutputIndex: it.outIdx,
+				Part: &responsesContent{Type: "output_text", Text: text},
+			})
+			sse.sendEvent("response.output_text.done", responsesDeltaEvent{
+				Type: "response.output_text.done", ItemID: it.itemID, OutputIndex: it.outIdx, Delta: text,
+			})
+			finalOutput = append(finalOutput, responsesOutput{
+				Type: "message", Role: "assistant",
+				Content: []responsesContent{{Type: "output_text", Text: text}},
+			})
 		case "reasoning":
 			done.Summary = []any{}
+			finalOutput = append(finalOutput, responsesOutput{Type: "reasoning", Summary: []any{}})
 		case "function_call":
-			done.CallID, done.Name = it.callID, it.name
 			args := it.text.String()
 			if args == "" {
 				args = "{}"
 			}
-			done.Arguments = args
+			done.CallID, done.Name, done.Arguments = it.callID, it.name, args
+			finalOutput = append(finalOutput, responsesOutput{
+				Type: "function_call", CallID: it.callID, Name: it.name, Arguments: args,
+			})
 		}
 		sse.sendEvent("response.output_item.done", responsesEvent{
 			Type: "response.output_item.done", OutputIndex: it.outIdx, Item: &done,
 		})
 	}
+	if len(finalOutput) == 0 {
+		finalOutput = []responsesOutput{}
+	}
 	u := responsesUsage{}
 	if tu, ok := openAIUsageOf(finalUsage); ok {
 		u = responsesUsage{InputTokens: tu.PromptTokens, OutputTokens: tu.CompletionTokens, TotalTokens: tu.TotalTokens}
 	}
-	sse.sendEvent("response.completed", responsesEvent{Type: "response.completed", Response: skeleton("completed", finalOutput, &u)})
+	// 截断轮镜像上游 response.incomplete 的形状:status=incomplete + 截断原因。
+	status, details := "completed", (*struct {
+		Reason string `json:"reason"`
+	})(nil)
+	if out.Truncated {
+		status = "incomplete"
+		details = &struct {
+			Reason string `json:"reason"`
+		}{Reason: "max_output_tokens"}
+	}
+	resp := skeleton(status, finalOutput, &u)
+	resp.IncompleteDetails = details
+	sse.sendEvent("response.completed", responsesEvent{Type: "response.completed", Response: resp})
 }
 
 // nowSeconds 照 js 的 `Math.floor(Date.now()/1000)`。

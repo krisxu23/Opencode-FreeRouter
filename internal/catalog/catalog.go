@@ -56,7 +56,10 @@ type Capabilities struct {
 // 「声明为否」;Go 的 bool 没有三态,加载时把 undefined 归一成 true,
 // 与 buildCatalog 的 `!== false` 行为完全一致。
 var capabilitiesTable = []Capabilities{
-	{Match: regexp.MustCompile(`^longcat`), Vision: true, Reasoning: true, ContextWindow: 1000000, MaxOutput: 131072, CanDisableThinking: true},
+	// longcat:2026-10-02 dsh-review 实测 longcat-2.5-preview-free 带图请求
+	// 返回 500 —— 本地表过去写 Vision:true,models.dev overlay 对见过的行
+	// 不覆盖 vision 位,错值永不自愈,按实测改掉(整个 ^longcat 前缀收口)。
+	{Match: regexp.MustCompile(`^longcat`), Vision: false, Reasoning: true, ContextWindow: 1000000, MaxOutput: 131072, CanDisableThinking: true},
 	{Match: regexp.MustCompile(`^space.?bunny`), Vision: true, Reasoning: true, ContextWindow: 1048576, MaxOutput: 524288, CanDisableThinking: true},
 	{Match: regexp.MustCompile(`^mimo.*v2\.6`), Vision: true, Reasoning: true, ContextWindow: 200000, MaxOutput: 32000, CanDisableThinking: false},
 	{Match: regexp.MustCompile(`^mimo.*v2\.5`), Vision: true, Reasoning: true, ContextWindow: 200000, MaxOutput: 32000, CanDisableThinking: false},
@@ -66,7 +69,9 @@ var capabilitiesTable = []Capabilities{
 	{Match: regexp.MustCompile(`^nemotron.*ultra`), Vision: false, Reasoning: true, ContextWindow: 1000000, MaxOutput: 128000, CanDisableThinking: true},
 	{Match: regexp.MustCompile(`^nemotron`), Vision: false, Reasoning: true, ContextWindow: 262144, MaxOutput: 128000, CanDisableThinking: true},
 	{Match: regexp.MustCompile(`^ling`), Vision: false, Reasoning: true, ContextWindow: 262144, MaxOutput: 32768, CanDisableThinking: true},
-	{Match: regexp.MustCompile(`^big.?pickle`), Vision: false, Reasoning: true, ContextWindow: 200000, MaxOutput: 32000, CanDisableThinking: true},
+	// big-pickle:2026-10-02 dsh-review 实测带图请求返回 200 —— models.dev
+	// 漏报、本地表过去写 Vision:false;实测优先(overlay 永远不会修正这一位)。
+	{Match: regexp.MustCompile(`^big.?pickle`), Vision: true, Reasoning: true, ContextWindow: 200000, MaxOutput: 32000, CanDisableThinking: true},
 	{Match: regexp.MustCompile(`^union`), Vision: true, Reasoning: false, ContextWindow: 262144, MaxOutput: 131072, CanDisableThinking: true},
 	{Match: regexp.MustCompile(`^deepseek`), Vision: false, Reasoning: true, ContextWindow: 200000, MaxOutput: 128000, CanDisableThinking: true},
 	{Match: regexp.MustCompile(`^kimi`), Vision: true, Reasoning: true, ContextWindow: 262144, MaxOutput: 262144, CanDisableThinking: true},
@@ -103,6 +108,22 @@ var regionSensitiveRe = regexp.MustCompile(`^muse.?spark`)
 // freeLaneRe 判定一个 base id 是否落在免密车道。网关的列表混着付费与免费
 // id,只有这些不用 per-user key 就能答。
 var freeLaneRe = regexp.MustCompile(`(?:^|[-_])free(?:$|[-_.])`)
+
+// measuredDead 是「实测不可达 denylist」:正则管**纳新**(上游新增的 -free id
+// 自动进目录),这张表管**摘除** —— 被实测判死的 id 不再发给用户。staticIDs
+// 里的条目若进了这张表同样被跳过(目录统一在 Build 入口过滤)。摘除要带
+// 日期与证据来源;上游恢复了就把行删掉,让它经正则/静态表自然回来。
+var measuredDead = map[string]string{
+	// 2026-10-02 实测(dsh harness 仓库,双通道):/v1/messages 对匿名与付费
+	// key 都 500、chat 端点 404 —— 上游已把这条车道整体摘除。
+	"ling-3.0-flash-fin-free": "2026-10-02 实测双通道皆死(messages 500 / chat 404)",
+}
+
+// IsMeasuredDead 报告一个 base id 是否在实测 denylist 里。
+func IsMeasuredDead(id string) bool {
+	_, ok := measuredDead[id]
+	return ok
+}
 
 // IsFreeLane 报告这个 id 是否免密车道:ALWAYS_FREE 固定免费,或 base id
 // 带 free 词元(前后必须是边界,「freemodel」不算)。
@@ -205,7 +226,7 @@ func Build(ids []string) []Model {
 	entries := make([]Model, 0, len(ids))
 	for _, raw := range ids {
 		id := strings.TrimSpace(raw)
-		if id == "" || !IsFreeLane(id) {
+		if id == "" || !IsFreeLane(id) || IsMeasuredDead(id) {
 			continue
 		}
 		base := upstream.BaseModelID(id)

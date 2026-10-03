@@ -150,6 +150,9 @@ type Parts struct {
 	rebuildQueued   bool
 	subFetchRetries int
 
+	// applyMu 串行化 ApplySettings(候选-落盘-回滚必须原子,见 status.go)。
+	applyMu sync.Mutex
+
 	rebuildStateMu sync.Mutex
 	lastAdded      int
 	lastRemoved    int
@@ -676,11 +679,24 @@ func Load(root string) (*Parts, error) {
 			// 定延时回调,而 handler goroutine 本身不在任何计数里 —— 不记的
 			// 话,关停的 timersWG.wait 与 handler 里的 add 构成
 			// 「计数归零后并发 Add」的 WaitGroup 使用违例(misuse panic)。
+			// F5:探测改**异步受理**。阻塞式有两个真实问题:一轮最坏 25 分钟
+			// (8000 节点/128 并发 x 2x12s),前端超时一掐,C2 的取消守卫就把
+			// 整轮丢掉 —— 大池上手动探测每次白等十分钟、零结论,还能无限
+			// 重复;且「用户关页面=探测作废」语义也不对。现在挂 lifeCtx 后台
+			// 跑,POST 立即返回;进度与完成经 /api/status 的 probing 位呈现。
+			// already-running 同步回错,按钮防连点。
 			ProbeNow: func(ctx context.Context, force bool) error {
+				if parts.probing.Load() {
+					return fmt.Errorf("probe already running")
+				}
 				parts.timersWG.add()
-				defer parts.timersWG.done()
-				_, err := parts.ProbeNow(ctx, force)
-				return err
+				go func() {
+					defer parts.timersWG.done()
+					if _, err := parts.ProbeNow(parts.ctx(), force); err != nil {
+						logger.Info(fmt.Sprintf("[app] 探测未开跑: %v", err))
+					}
+				}()
+				return nil
 			},
 			// Refresh/RefreshLimits 的签名没有 ctx:重建自带 180s 总预算,
 			// 限额刷新自带单次超时,都不需要外层取消。但根必须是 lifeCtx
@@ -748,11 +764,11 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 		if p.panelLn != nil {
 			_ = p.panelLn.Close()
 		}
-		if ctx != nil {
-			p.timersWG.wait(ctx)
-		} else {
-			p.timersWG.wait(context.Background())
-		}
+		// wait 带 60s 内部上限:托盘路径传入 Background(无限),未来某个
+		// 计数项若挂死,退出会被拖成僵尸 —— 上限之后照常 flush,有界保险。
+		waitCtx, waitCancel := context.WithTimeout(ctxOrBackground(ctx), 60*time.Second)
+		p.timersWG.wait(waitCtx)
+		waitCancel()
 		if p.Forward != nil {
 			_ = p.Forward.Close()
 		}
@@ -872,6 +888,15 @@ func probeWritable(dir string) error {
 	_ = f.Close()
 	_ = os.Remove(name)
 	return nil
+}
+
+// ctxOrBackground 是 Shutdown 的空值兜底:调用方传 nil ctx(零值 Parts 的
+// 测试路径)时给一个永不过期的背景 context,让 WithTimeout 仍有根。
+func ctxOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func listenAddr(port int) string {

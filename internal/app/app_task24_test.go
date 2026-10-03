@@ -287,6 +287,10 @@ func TestProbeSummaryLineMatchesFrontendRegex(t *testing.T) {
 }
 
 func TestProbeNowDoesNotEvictOnAccident(t *testing.T) {
+	// 场景 A（误报修复的回归钉）：上一轮 20 alive、这轮掉 70% 但存活仍有 6
+	// —— 真实池里「A 档抖动换血」的形状。旧单条件判据（比率>50% 即事故）
+	// 每轮都触发、淘汰被永久压制；新双条件判据要求比率超标 **且** 存活塌到
+	// 上一轮的 1/4 以下，6/20 不满足塌方，因此**不算事故、照常淘汰**。
 	p := newProbeParts(t, 20)
 	for i := 0; i < 20; i++ {
 		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
@@ -294,14 +298,35 @@ func TestProbeNowDoesNotEvictOnAccident(t *testing.T) {
 	fp := p.Prober.(*fakeProber)
 	fp.failedTags = map[string]bool{}
 	for i := 6; i < 20; i++ {
-		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 上一轮 20 alive,这轮掉 14(70%)
+		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 掉 14(70%),存活 6 > 20/4
+	}
+	sum, err := p.ProbeNow(context.Background(), true)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if sum.Accident {
+		t.Fatalf("accident = true, want false (掉 14/20 但存活 6 未塌到 1/4,双条件不满足)")
+	}
+}
+
+func TestProbeNowAccidentNeedsCollapseToo(t *testing.T) {
+	// 场景 B：同样的池子,这轮存活塌到 3/20(< 1/4)—— 比率超标且绝对值塌方,
+	// 两条同时成立,这才是事故轮:一个不淘汰。
+	p := newProbeParts(t, 20)
+	for i := 0; i < 20; i++ {
+		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
+	}
+	fp := p.Prober.(*fakeProber)
+	fp.failedTags = map[string]bool{}
+	for i := 3; i < 20; i++ {
+		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 掉 17(85%),存活 3 < 20/4
 	}
 	sum, err := p.ProbeNow(context.Background(), true)
 	if err != nil {
 		t.Fatalf("probe: %v", err)
 	}
 	if !sum.Accident {
-		t.Fatalf("accident = false, want true (掉了 14/20)")
+		t.Fatalf("accident = false, want true (存活塌到 3/20,比率与塌方双条件成立)")
 	}
 	if p.Registry.Len() != 20 {
 		t.Fatalf("registry len = %d, want 20 (事故轮一个都不淘汰)", p.Registry.Len())

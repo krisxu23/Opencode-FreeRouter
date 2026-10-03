@@ -144,7 +144,8 @@ func TestCapabilitiesTableHitsAllSeventeenRows(t *testing.T) {
 		want    Capabilities
 		inTable bool
 	}{
-		{"longcat-2.5-preview-free", Capabilities{Vision: true, Reasoning: true, ContextWindow: 1000000, MaxOutput: 131072, CanDisableThinking: true}, true},
+		// longcat:2026-10-02 dsh-review 实测 longcat-2.5 带图 500,Vision:false。
+		{"longcat-2.5-preview-free", Capabilities{Vision: false, Reasoning: true, ContextWindow: 1000000, MaxOutput: 131072, CanDisableThinking: true}, true},
 		{"space-bunny-free", Capabilities{Vision: true, Reasoning: true, ContextWindow: 1048576, MaxOutput: 524288, CanDisableThinking: true}, true},
 		{"mimo-v2.6-flash-free", Capabilities{Vision: true, Reasoning: true, ContextWindow: 200000, MaxOutput: 32000, CanDisableThinking: false}, true},
 		{"mimo-v2.5-free", Capabilities{Vision: true, Reasoning: true, ContextWindow: 200000, MaxOutput: 32000, CanDisableThinking: false}, true},
@@ -154,7 +155,8 @@ func TestCapabilitiesTableHitsAllSeventeenRows(t *testing.T) {
 		{"nemotron-3-ultra-free", Capabilities{Vision: false, Reasoning: true, ContextWindow: 1000000, MaxOutput: 128000, CanDisableThinking: true}, true},
 		{"nemotron-8-turbo-free", Capabilities{Vision: false, Reasoning: true, ContextWindow: 262144, MaxOutput: 128000, CanDisableThinking: true}, true},
 		{"ling-3.0-flash-fin-free", Capabilities{Vision: false, Reasoning: true, ContextWindow: 262144, MaxOutput: 32768, CanDisableThinking: true}, true},
-		{"big-pickle", Capabilities{Vision: false, Reasoning: true, ContextWindow: 200000, MaxOutput: 32000, CanDisableThinking: true}, true},
+		// big-pickle:2026-10-02 dsh-review 实测带图 200,models.dev 漏报,Vision:true。
+		{"big-pickle", Capabilities{Vision: true, Reasoning: true, ContextWindow: 200000, MaxOutput: 32000, CanDisableThinking: true}, true},
 		{"union-alpha", Capabilities{Vision: true, Reasoning: false, ContextWindow: 262144, MaxOutput: 131072, CanDisableThinking: true}, true},
 		{"deepseek-v4-flash-free", Capabilities{Vision: false, Reasoning: true, ContextWindow: 200000, MaxOutput: 128000, CanDisableThinking: true}, true},
 		{"kimi-k2.5-free", Capabilities{Vision: true, Reasoning: true, ContextWindow: 262144, MaxOutput: 262144, CanDisableThinking: true}, true},
@@ -231,7 +233,8 @@ func TestBuildCarriesZenLaneNumbers(t *testing.T) {
 		{"muse-spark-1.3-contributor-free", 1048576, 131072},
 		{"nemotron-3.5-lightning-free", 262144, 262144},
 		{"nemotron-3-ultra-free", 1000000, 128000},
-		{"ling-3.0-flash-fin-free", 262144, 32768},
+		// ling-3.0-flash-fin-free 在实测 denylist(measuredDead)里,Build 会把它
+		// 摘掉 —— denylist 生效后这里只剩 7 行;单独在下面的 denylist 测试里钉它。
 		{"space-bunny-free", 1048576, 524288},
 		{"big-pickle", 200000, 32000},
 		{"longcat-2.5-preview-free", 1000000, 131072},

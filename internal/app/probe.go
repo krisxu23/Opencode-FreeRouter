@@ -38,8 +38,10 @@ const (
 	tierGapMS   = 60 // src/index.js:750
 
 	probeAccidentRate = 0.5 // src/index.js:795
-	probeAccidentMin  = 8   // src/index.js:796 样本太小时不判事故
-	probeCacheRatio   = 0.5 // src/index.js:816
+	probeAccidentMin  = 20  // src/index.js:796 的 8 在真实池上太小:alive 集只有 50-93 个时,
+	// 固有抖动就能超过 50% 流失(2026-10-03 实测三轮连触发,淘汰被永久压制)——
+	// 样本下限提到 20,并配合 collapse 双条件,见 ProbeNow。
+	probeCacheRatio = 0.5 // src/index.js:816
 
 	// probeDirectTimeoutMS 是「本机到 liveness 源」这一跳的预算(src/nodeprobe.js:208)。
 	probeDirectTimeoutMS = 8000
@@ -335,8 +337,15 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 	}
 	ratioHit := len(prevAlive) >= probeAccidentMin &&
 		float64(lostAlive)/float64(len(prevAlive)) > probeAccidentRate
+	// collapse 是第二把闸:存活塌到上一轮的 1/4 以下才算「绝对值也塌方」。
+	// 真实数据(2026-10-03):alive 50-59 的池子每轮随机换血 60-80% 却仍是
+	// 同一个可服务规模 —— 只看比率,事故轮每轮都误触发,淘汰被永久压制
+	// (观察期涨到全池 97%,池子只增不减)。双条件后:随机换血(比率超 50%
+	// 但绝对值持平)不再误报;真正的探测源断供(alive 塌到 1/4 以下/0)
+	// 两条同时满足,保护仍在。
+	collapse := len(prevAlive) >= probeAccidentMin && len(aliveTags)*4 < len(prevAlive)
 	zeroAlive := summary.Tested > 0 && len(aliveTags) == 0
-	accident := ratioHit || zeroAlive
+	accident := (ratioHit && collapse) || zeroAlive
 	summary.Accident = accident
 	if ratioHit {
 		logger.Error(fmt.Sprintf("探测源疑似事故：上一轮存活的 %d 个节点本轮掉了 %d 个（%.0f%% > %.0f%%）— 本轮不淘汰任何节点，保留现有池子",

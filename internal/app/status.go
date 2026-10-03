@@ -524,6 +524,9 @@ func (p *Parts) Status() any {
 	}
 
 	return map[string]any{
+		// probing 供面板把「探测中」渲染成状态而不是本地布尔:探测改异步
+		// 受理后(F5),前端不再自己维护探测期。
+		"probing":      p.probing.Load(),
 		"singbox":      singbox,
 		"forward":      map[string]any{"running": true, "port": cur.ForwardPort, "key": cur.ForwardKey},
 		"models":       ids,
@@ -642,6 +645,12 @@ func (p *Parts) SettingsView() map[string]any {
 // 网关拒绝启动,只能手改文件。现在的顺序是「构造候选 → 逐键类型校验 → 候选能解
 // 成 Settings → 才 Update+Flush」,任一步失败都直接返回,一个字节都不写盘。
 func (p *Parts) ApplySettings(patch map[string]any) (Settings, error) {
+	// 串行化并发 PUT:「先取快照、失败再回滚」不是原子的 —— A/B 两个请求
+	// 交错时,A 的回滚会把 B 已落盘的补丁一起抹掉。面板是单用户场景,
+	// 一把互斥锁就是完整的正确性。
+	p.applyMu.Lock()
+	defer p.applyMu.Unlock()
+
 	if len(patch) == 0 {
 		return p.settingsSnapshot(), nil
 	}
@@ -781,8 +790,10 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 			case "probeWorkers":
 				// HTML 的 max=256 只是提示,过去后端只拒负数:填 99999 会被
 				// 照单全收并在下一轮探测全量并发,把自己出口 IP 打成上游 429。
-				if n > 256 {
-					return nil, fmt.Errorf("app: 设置 probeWorkers 不能超过 256")
+				// 上限与 probeWorkers() 的运行时硬顶(128)取齐:过去 UI/校验
+				// 收 256、运行时按 128 跑,设置页展示值与事实不符。
+				if n > 128 {
+					return nil, fmt.Errorf("app: 设置 probeWorkers 不能超过 128")
 				}
 			}
 			clean[key] = n

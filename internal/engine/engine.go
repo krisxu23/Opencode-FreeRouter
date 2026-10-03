@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -217,6 +218,10 @@ const maxAttemptsDefault = 20
 // 秒成功** —— 所以 EMPTY 是上游瞬态、不随出口变化,这正是 cooldownOn 不含它的
 // 依据,也让「多试几次」比「换个好出口」更贴切。6 次 = 最坏约 60s(6×10s),
 // 按观测到的单次成功率能把大部分失败捞回来,仍显著短于扫池的 20 次(~200s)。
+// freeTierShapeWarned 把「形状门禁疑变」的诊断行压到每进程一次(见 Complete
+// 里的调用点)。
+var freeTierShapeWarned sync.Once
+
 var attemptCapByCode = map[string]int{
 	check.CodeEmpty: 6,
 }
@@ -435,6 +440,16 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 		code := ""
 		if failure != nil {
 			code = failure.Code
+		}
+		if failure != nil && failure.Type == "FreeTierError" {
+			// 形状门禁疑变的诊断锚(dsh harness 仓库的教训:这一行能把排障从
+			// 「盲扫五回」缩到一次定位 —— FreeTierError 是会话形状被上游闸门
+			// 拒绝,不是配额、也不是这个出口坏了;闸门 2026-09-16/09-27 动过两次)。
+			// 每进程只打一次,避免扫池时刷屏。
+			freeTierShapeWarned.Do(func() {
+				e.logf("engine: 上游回 FreeTierError —— 会话形状门禁疑似收紧" +
+					"(session 形状 / 工具名 / stream 标志),若全池持续出现请核对上游闸门变化;本轮仍按可重试处理")
+			})
 		}
 		attemptMS := nowMS() - attemptStartedAt
 		if code == check.CodeRegion {

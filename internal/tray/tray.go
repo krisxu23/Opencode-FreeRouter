@@ -21,10 +21,34 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"fyne.io/systray"
 )
+
+// ready 在 systray 完成 Register/初始化之后闭合。信号桥(main.go)必须等到
+// 它之后才能调 Quit —— fyne.io/systray 的 Quit 在 Register 之前会解引用
+// 尚未创建的窗口(nil 函数 panic);开机头几秒收到 Ctrl+C 恰好命中这个窗口。
+var (
+	readyOnce sync.Once
+	ready     = make(chan struct{})
+	quitOnce  sync.Once
+)
+
+// Ready 在托盘完成初始化后闭合。Quit 之前先等它(或超时),见 main.go。
+func Ready() <-chan struct{} { return ready }
+
+// Quit 退出托盘消息循环。等 Ready 之后才真正调 systray.Quit:未就绪时的
+// 调用是 no-op(信号桥会超时兜底自行退出进程),就绪后幂等。
+func Quit() {
+	select {
+	case <-ready:
+	default:
+		return // 托盘还没起来:本次不可能是「退出一个活着的托盘」,交给调用方超时兜底
+	}
+	quitOnce.Do(func() { systray.Quit() })
+}
 
 // defaultPanelPort 与 src/store.js SETTINGS_INITIAL 的 panelPort、
 // app.defaultSettings 的 PanelPort 三处一致：设置文件缺席时，守卫探测的
@@ -115,14 +139,12 @@ type Options struct {
 // Shell_NotifyIcon + GDI 绘制，菜单项中文依赖系统里存在能画 CJK 的字体，
 // 缺字就是方块；不引入新依赖去修，改成 Open panel/Reload/Quit 并在 README
 // 说明。托盘标题与提示不受此限 —— SetTitle/SetTooltip 走 Unicode API
-// （由调用方传中文），只有菜单项受影响。
-// Quit 退出托盘消息循环(systray.Quit 的包内包装,systray 设计上允许跨线程
-// 调用)。由信号桥调用:ctx 取消(信号到达)时托盘必须跟着退场,否则 Run 永不
-// 返回、进程不退出(W11)。
-func Quit() { systray.Quit() }
+// （由调用方传中文），只有菜单项受影响。Quit 的就绪守卫见包首注释。
 
 func Run(o Options) {
 	systray.Run(func() {
+		// Register 已经完成:放开信号桥的 Quit 许可。
+		readyOnce.Do(func() { close(ready) })
 		if len(o.Icon) > 0 {
 			systray.SetIcon(o.Icon)
 		}
@@ -156,7 +178,7 @@ func Run(o Options) {
 					if o.Quit != nil {
 						o.Quit()
 					}
-					systray.Quit()
+					quitOnce.Do(func() { systray.Quit() })
 					return
 				}
 			}

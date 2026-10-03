@@ -363,7 +363,10 @@ func pruneDays(snap Snapshot, now int64) {
 	cutoff := time.UnixMilli(now).UTC().AddDate(0, 0, -daysRetention)
 	for k := range snap.Days {
 		d, err := time.Parse("2006-01-02", k)
-		if err != nil || d.Before(cutoff) {
+		if err != nil {
+			continue // 解析不了的键保留:宁可多留一行,也不误删数据(与注释承诺一致)
+		}
+		if d.Before(cutoff) {
 			delete(snap.Days, k)
 		}
 	}
