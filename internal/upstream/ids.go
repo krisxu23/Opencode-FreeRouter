@@ -31,7 +31,56 @@ var RequestRe = regexp.MustCompile(`^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 
 const base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-var lastStamp, seq atomic.Int64
+// idClock 把时间戳折叠进**单一原子计数器**:高 44 位毫秒 + 低 20 位毫秒内序。
+// 旧实现 (lastStamp, seq) 两个原子的 Store/Add 有一个真实的撞车窗口 —— 同一
+// 毫秒的第二个调用者把「换毫秒」误判到自己头上时,它的 Store(0) 会落在第一个
+// 调用者的 Add 之后,把别人刚加过的序号清掉,两个 id 的 48 位头部相同,唯一性
+// 只剩 14 字节随机熵兜底。单一 CAS 把「换毫秒」与「毫秒内递增」合成一个
+// 不可分割的加法(_unix ms 到 2582 年都在 44 位内;序号每毫秒 100 万个足够)。
+var idClock atomic.Int64
+
+// mintID mints a fresh id: a time prefix folded into 48 bits (so ids minted in
+// the same millisecond still order), then 14 random base62 characters for
+// entropy. Same wire layout as src/upstream.js:147-162 (内部计数器是 Go 侧的
+// 单原子实现,见 idClock)。
+func mintID(prefix string, timestamp int64) string {
+	var v uint64
+	for {
+		cur := idClock.Load()
+		curMilli := int64(uint64(cur) >> 20)
+		var next int64
+		switch {
+		case timestamp > curMilli:
+			// 新毫秒从 1 起。
+			next = timestamp<<20 | 1
+		case timestamp == curMilli && uint64(cur)&0xFFFFF < 0xFFFFF:
+			next = cur + 1
+		default:
+			// 时钟回拨(或本毫秒序号耗尽):沿现有时间线继续递增 —— 身份
+			// 仍然唯一、头部仍然有序,只是时间前缀不再精确等于当前毫秒。
+			next = cur + 1
+		}
+		if idClock.CompareAndSwap(cur, next) {
+			v = ^uint64(next)
+			break
+		}
+	}
+	var head strings.Builder
+	for i := 0; i < 6; i++ {
+		var b [1]byte
+		b[0] = byte((v >> (40 - 8*uint(i))) & 0xff)
+		head.WriteString(hex.EncodeToString(b[:]))
+	}
+	entropy := make([]byte, 14)
+	if _, err := rand.Read(entropy); err != nil {
+		// crypto/rand 在 Windows 上实际不会失败;真失败了,时间派生的 id
+		// 仍然形状合法,只是唯一性变弱 —— 比 panic 拖垮整个请求循环强。
+		for i := range entropy {
+			entropy[i] = byte(v >> (8 * uint(i%8)))
+		}
+	}
+	return prefix + head.String() + base62From(entropy)
+}
 
 func base62From(b []byte) string {
 	var sb strings.Builder
@@ -55,32 +104,6 @@ func digestID(prefix string, sum []byte, re *regexp.Regexp) string {
 		return id
 	}
 	return ""
-}
-
-// mintID mints a fresh id: a time prefix folded into 48 bits (so ids minted in
-// the same millisecond still order), then 14 random base62 characters for
-// entropy. Same layout as src/upstream.js:147-162.
-func mintID(prefix string, timestamp int64) string {
-	if lastStamp.Swap(timestamp) != timestamp {
-		seq.Store(0)
-	}
-	n := seq.Add(1)
-	v := ^(uint64(timestamp) * 0x1000 + uint64(n))
-	var head strings.Builder
-	for i := 0; i < 6; i++ {
-		var b [1]byte
-		b[0] = byte((v >> (40 - 8*uint(i))) & 0xff)
-		head.WriteString(hex.EncodeToString(b[:]))
-	}
-	entropy := make([]byte, 14)
-	if _, err := rand.Read(entropy); err != nil {
-		// crypto/rand 在 Windows 上实际不会失败;真失败了,时间派生的 id
-		// 仍然形状合法,只是唯一性变弱 —— 比 panic 拖垮整个请求循环强。
-		for i := range entropy {
-			entropy[i] = byte(v >> (8 * uint(i%8)))
-		}
-	}
-	return prefix + head.String() + base62From(entropy)
 }
 
 // SessionForConversation maps one downstream conversation onto one stable

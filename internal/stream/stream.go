@@ -116,14 +116,15 @@ type Usage struct {
 	HasUsage  bool
 }
 
-// ScanUsage folds one chunk into acc.
+// ScanUsage folds one chunk into acc and reports whether the chunk carried
+// content. (旧签名还返回文本增量的字节数 —— 生产调用方从来不读它,删掉。)
 //
 // firstContentSeen is a pointer so the caller owns the flag across chunks and
 // can also pass it to the rotation engine's trace rows. TTFT is frozen on the
 // first content delta: the first SSE event is usually a role skeleton, and
 // timing that instead of the first visible token would understate TTFT by the
 // whole time-to-first-byte of the protocol handshake.
-func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (delta int64, isContent bool) {
+func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (isContent bool) {
 	var env struct {
 		Type  string `json:"type"`
 		Delta struct {
@@ -134,24 +135,28 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
-		// 四个计数都用指针:js 的 `??` 判的是 undefined,而 Go 的 int64 零值
-		// 分不出「字段缺失」与「上游显式发了 0」。没有这层区分,B4 的两种拼写
-		// 就没法按 `prompt_tokens ?? input_tokens` 择一,只能相加。
+		// 四个计数都用指针 + float64:指针是因为 js 的 `??` 判的是 undefined,
+		// Go 的零值分不出「字段缺失」与「上游显式发了 0」,没有这层区分 B4 的
+		// 两种拼写就没法按 `prompt_tokens ?? input_tokens` 择一;float64 是因为
+		// 上游偶发以浮点形状发 token 数(`1234.0`、`1e3`)—— 旧 *int64 遇到会在
+		// Unmarshal 里报 saveError,整个结构体解码失败,**连同内容检测一起**把
+		// 这帧丢掉,chat 线的整轮 usage 就此蒸发。token 计数在 2^53 内,float64
+		// 无损。B4/R14 依赖的「缺席 vs 显式 0」区分由指针保留。
 		Usage *struct {
-			InputTokens         *int64 `json:"input_tokens"`
-			OutputTokens        *int64 `json:"output_tokens"`
-			PromptTokens        *int64 `json:"prompt_tokens"`
-			CompletionTokens    *int64 `json:"completion_tokens"`
+			InputTokens         *float64 `json:"input_tokens"`
+			OutputTokens        *float64 `json:"output_tokens"`
+			PromptTokens        *float64 `json:"prompt_tokens"`
+			CompletionTokens    *float64 `json:"completion_tokens"`
 			PromptTokensDetails *struct {
-				CachedTokens *int64 `json:"cached_tokens"`
+				CachedTokens *float64 `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
 			InputTokensDetails *struct {
-				CachedTokens *int64 `json:"cached_tokens"`
+				CachedTokens *float64 `json:"cached_tokens"`
 			} `json:"input_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(chunk, &env); err != nil {
-		return 0, false
+		return false
 	}
 	if env.Usage != nil {
 		// B4:prompt_tokens/input_tokens 与 completion_tokens/output_tokens 是
@@ -174,9 +179,9 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 			var cached int64
 			switch {
 			case env.Usage.PromptTokensDetails != nil && env.Usage.PromptTokensDetails.CachedTokens != nil:
-				cached = *env.Usage.PromptTokensDetails.CachedTokens
+				cached = int64(*env.Usage.PromptTokensDetails.CachedTokens)
 			case env.Usage.InputTokensDetails != nil && env.Usage.InputTokensDetails.CachedTokens != nil:
-				cached = *env.Usage.InputTokensDetails.CachedTokens
+				cached = int64(*env.Usage.InputTokensDetails.CachedTokens)
 			}
 			if prompt == nil {
 				// R14:只带输出侧的帧**并入**既有值,而不是整份覆盖
@@ -184,7 +189,7 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 				// 这个形状,整份覆盖会把 message_start 已给出的输入侧清零,
 				// 连带污染 sticky TTL(cacheRead/In 比例)与面板用量。
 				if completion != nil {
-					acc.Out = *completion
+					acc.Out = int64(*completion)
 				}
 			} else {
 				// 上游的输入总数是**毛值**(prompt_tokens/input_tokens 已含缓存命中),
@@ -192,12 +197,12 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 				// js stream.js:11-13 把这条规则写在模块注释里,mapUsage:122 用
 				// Math.max(0, prompt - cached) 落地。CacheRead 单独一个量。
 				acc.CacheRead = cached
-				acc.In = *prompt - cached
+				acc.In = int64(*prompt) - cached
 				if acc.In < 0 {
 					acc.In = 0
 				}
 				if completion != nil {
-					acc.Out = *completion
+					acc.Out = int64(*completion)
 				} else {
 					acc.Out = 0
 				}
@@ -214,8 +219,6 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 		*firstContentSeen = true
 		acc.TTFTMS = time.Since(t0).Milliseconds()
 	}
-	if env.Delta.Text != "" {
-		return int64(len(env.Delta.Text)), isContent
-	}
-	return 0, isContent
+	_ = isContent
+	return isContent
 }

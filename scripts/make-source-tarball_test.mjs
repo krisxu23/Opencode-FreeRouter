@@ -49,7 +49,8 @@ test('源码包里每个 .go 都在，且一个不多一个不少', async () => 
     // 根目录现在就是 Go 模块，所以要手动剔掉「不在模块里」的那几棵：archive/ 是
     // 冻结的 JS 版（它连自己的 Go 托盘壳 launcher/main.go 一起归档了）、
     // difftest-tmp/ 是工装临时产物、data/ 与 release/ 是运行时状态和产物。
-    .filter(f => !/^(node_modules|data|archive|release|difftest-tmp)\//.test(f))
+    .filter(f => !/^(node_modules|data|archive|release|difftest|difftest-tmp|docs)\//.test(f))
+    .filter(f => f !== 'scripts/diff-accept.mjs')
     .sort()
   const inPkg = walkFiles(root)
     .filter(f => f.endsWith('.go'))
@@ -59,11 +60,12 @@ test('源码包里每个 .go 都在，且一个不多一个不少', async () => 
   assert.deepEqual(missing, [], `包里缺这些 .go: ${missing.join(', ')}`)
 })
 
-test('包内没有 data/、没有 .exe/.zip、没有 node_modules/', async () => {
+test('包内没有 data/、没有 .exe/.zip、没有 node_modules/、没有 difftest 工装', async () => {
   const { entries } = await buildAndExtract()
   const bad = entries.filter(e =>
     /(^|\/)data\//.test(e) || /\.(exe|zip)$/i.test(e) || /(^|\/)node_modules\//.test(e) ||
-    /(^|\/)(archive|dist)\//.test(e))
+    /(^|\/)(archive|dist|difftest|difftest-tmp|docs)\//.test(e) ||
+    e === 'scripts/diff-accept.mjs')
   assert.deepEqual(bad, [], `包里出现了不该出现的条目: ${bad.join(', ')}`)
 })
 

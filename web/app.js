@@ -87,7 +87,11 @@
   function fmtTok(n) {
     if (!isFinite(n) || n <= 0) return '0'
     if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 === 0 ? 0 : 2) + 'M'
-    if (n >= 1e3) return Math.round(n / 1e3) + 'K'
+    if (n >= 1e3) {
+      /* 999500 起就切 M：否则 999999 会显示成「1000K」—— K 的下一个刻度越过了 M */
+      if (n / 1e3 >= 999.5) return (n / 1e6).toFixed(2) + 'M'
+      return Math.round(n / 1e3) + 'K'
+    }
     return String(n)
   }
   function fmtLat(ms) {
@@ -116,7 +120,7 @@
   const DATA = Object.assign(
     { singbox:{}, forward:{}, models:[], modelCaps:{}, limits:null, regionModels:[],
       nodes:[], usage:{ today:{ req:0, in:0, out:0 }, requests:0, byModel:{} },
-      settings:{}, logs:[] },
+      diagnostics:{}, settings:{}, logs:[] },
     window.__BOOT__ || {}
   )
 
@@ -125,7 +129,8 @@
     nodeQ: '', nodeState: 'all', nodeBucket: 'all', nodeSort: 'latency', nodeSortDir: 1,
     logLevel: 'all', logQ: '', logDedupe: true, logFoldNoise: true, logAuto: true,
     order: [], form: {}, baseline: null,
-    probing: false, busy: false
+    probing: false, busy: false,
+    routes: []  /* 请求轨迹(/api/routes),日志页展示 —— README 承诺的「每次请求走了哪个出口」 */
   }
 
   function readSettings() {
@@ -138,6 +143,7 @@
       defaultMaxTokens: s.defaultMaxTokens == null ? '' : String(s.defaultMaxTokens),
       probeWorkers: String(s.probeWorkers == null ? 24 : s.probeWorkers),
       probeIntervalMin: String(s.probeIntervalMin == null ? 30 : s.probeIntervalMin),
+      maxWallClockMs: String(s.maxWallClockMs == null ? 0 : s.maxWallClockMs),
     }
     S.baseline = JSON.parse(JSON.stringify({ order: S.order, form: S.form }))
   }
@@ -164,7 +170,7 @@
       { id: id }, DATA.modelCaps && DATA.modelCaps[id] ? DATA.modelCaps[id] : {},
       { gated: (DATA.regionModels || []).indexOf(id) >= 0 }
     ))
-    const usage = DATA.usage || { today:{ req:0, in:0, out:0 }, requests:0, byModel:{} }
+    const usage = DATA.usage || { today:{ req:0, in:0, out:0 }, requests:0, byModel:{}, byExit:{} }
     const rows = Object.keys(usage.byModel || {})
       .map(m => Object.assign({ model: m }, usage.byModel[m]))
       .sort((a, b) => b.req - a.req)
@@ -255,9 +261,13 @@
       ta.style.opacity = '0'
       document.body.appendChild(ta)
       ta.select()
-      try { document.execCommand('copy') } catch (e) { /* 忽略 */ }
+      let ok = false
+      try { ok = document.execCommand('copy') } catch (e) { /* 忽略 */ }
       ta.remove()
-      done()
+      /* execCommand 失败返回 false 而不是抛异常——旧实现吞掉返回值,失败也弹
+         「已复制」,而复制失败恰恰发生在复制 forwardKey 这些核心操作上 */
+      if (ok) done()
+      else toast('复制失败，请手动复制', 'bad')
     }
   }
 
@@ -318,9 +328,14 @@
     const fw = DATA.forward || {}
     const up = sb.running === true
     const badge = checkBadge(sb)
+    /* R7+O9 的另一半：diagnostics.stats.lastError 由后端备好，这里消费 ——
+       写盘持续失败时面板不能再「看起来一切正常」 */
+    const dg = DATA.diagnostics || {}
+    const diskErr = (dg.stats && dg.stats.lastError) || ''
     $('statusbar').innerHTML =
       '<span class="sb-item"><span class="dot ' + (up ? 'ok live' : 'bad') + '"></span>'
         + (up ? 'sing-box 运行中' : 'sing-box 未运行') + '</span>'
+      + (diskErr ? '<span class="sb-item" style="color:var(--warn)" title="用量统计写盘失败：' + esc(diskErr) + '">写盘失败</span>' : '')
       + (badge ? '<span class="sb-item" style="color:var(--warn)">' + esc(badge) + '</span>' : '')
       + '<span class="sb-item">出口 ' + D.alive.length + '/' + D.nodes.length + '</span>'
       + '<span class="sb-item">今日 ' + D.usage.today.req + ' 次</span>'
@@ -464,18 +479,20 @@
       list = list.filter(function (n) {
         return String(n.tag).toLowerCase().indexOf(q) >= 0
           || String(n.exitIp || '').toLowerCase().indexOf(q) >= 0
-          || String(n.port || '').indexOf(q) >= 0
           || (CC_NAME[n.country] || '').indexOf(q) >= 0
       })
     }
     const dir = S.nodeSortDir, key = S.nodeSort
     list.sort(function (a, b) {
       if (key === 'latency') {
-        const av = a.latencyMs < 0 ? Infinity : a.latencyMs
-        const bv = b.latencyMs < 0 ? Infinity : b.latencyMs
-        return (av - bv) * dir
+        /* I23：三分支比较。旧实现两个未知值(Infinity)相减得 NaN，comparator
+           返回 NaN 属实现定义行为；且 dir 反转时未知节点会排到最前面。
+           语义：未知永远沉底，已知之间按方向排。 */
+        const aKnown = a.latencyMs >= 0, bKnown = b.latencyMs >= 0
+        if (aKnown !== bKnown) return aKnown ? -1 : 1
+        if (!aKnown) return 0
+        return (a.latencyMs - b.latencyMs) * dir
       }
-      if (key === 'port') return ((a.port || 0) - (b.port || 0)) * dir
       if (key === 'country') return String(a.country).localeCompare(String(b.country)) * dir
       return String(a.tag).localeCompare(String(b.tag), 'zh') * dir
     })
@@ -499,7 +516,7 @@
     + '  <div class="card">'
     + '    <div class="toolbar">'
     + '      <span class="search">' + I.search
-    + '        <input type="search" id="nodeQ" placeholder="搜索节点名 / 出口 IP / 端口" value="' + esc(S.nodeQ) + '"></span>'
+    + '        <input type="search" id="nodeQ" placeholder="搜索节点名 / 出口 IP" value="' + esc(S.nodeQ) + '"></span>'
     + '      <span class="seg" id="stateSeg">'
     + '        <button data-st="all" class="' + (S.nodeState === 'all' ? 'on acc' : '') + '">全部 ' + D.nodes.length + '</button>'
     + '        <button data-st="alive" class="' + (S.nodeState === 'alive' ? 'on acc' : '') + '">存活 ' + D.alive.length + '</button>'
@@ -526,7 +543,7 @@
 
     + '    <div class="tbl-wrap"><table><thead><tr>'
     + th('tag', '节点') + th('country', '地区')
-    + '<th>层级</th>' + th('port', '端口') + '<th>健康</th>' + th('latency', '延迟')
+    + '<th>层级</th><th>健康</th>' + th('latency', '延迟')
     + '<th>出口 IP</th><th>最后探测</th>'
     + '</tr></thead><tbody>'
     + (list.length
@@ -537,7 +554,6 @@
           + '<td>' + ccChip(n.country) + ' ' + esc(CC_NAME[n.country] || n.country || '—') + '</td>'
           + '<td>' + (n.tier === 'B' ? '<span class="badge badge-tier badge-ok">B</span>'
               : n.tier === 'A' ? '<span class="badge badge-tier badge-neutral">A</span>' : '<span class="dim">—</span>') + '</td>'
-          + '<td class="num">' + (n.port == null ? '—' : n.port) + '</td>'
           + '<td>' + (n.state === 'alive' ? '<span class="badge badge-ok">存活</span>'
               : '<span class="badge badge-bad">不可用</span>') + '</td>'
           + '<td><span class="lat-cell" title="' + (lat >= 0 ? fmtLat(lat) + '（刻度 √ 压缩，封顶 10s）' : '未测得') + '">'
@@ -547,7 +563,7 @@
           + '<td class="num dim">' + fmtTime(n.lastProbeAt) + '</td>'
           + '</tr>'
       }).join('')
-      : '<tr><td colspan="8"><div class="empty">' + I.empty + '<div>没有匹配的节点</div>'
+      : '<tr><td colspan="7"><div class="empty">' + I.empty + '<div>没有匹配的节点</div>'
         + '<div style="font-size:12px;margin-top:6px">试试清空搜索词，或切换地区筛选</div></div></td></tr>')
     + '</tbody></table></div>'
     + '  </div>'
@@ -627,10 +643,10 @@
         const isToday = h.date === D.todayKey
         const px = h.req === 0 ? 3 : Math.max(3, Math.round(h.req / D.historyMax * 120))
         const cls = 'chart-col' + (isToday ? ' today' : h.req === 0 ? ' dim' : '')
-        return '<div class="' + cls + '" title="' + h.date + '：' + h.req + ' 次 · 输入 ' + fmtTok(h.in) + ' · 输出 ' + fmtTok(h.out) + '">'
+        return '<div class="' + cls + '" title="' + esc(h.date) + '：' + h.req + ' 次 · 输入 ' + fmtTok(h.in) + ' · 输出 ' + fmtTok(h.out) + '">'
           + '<span class="chart-v">' + (h.req || '–') + '</span>'
           + '<span class="chart-barwrap"><span class="chart-bar" style="height:' + px + 'px"></span></span>'
-          + '<span class="chart-x">' + h.date.slice(5) + '</span>'
+          + '<span class="chart-x">' + esc(h.date.slice(5)) + '</span>'
           + '</div>'
       }).join('') + '</div>'
       : '<div class="empty">' + I.empty + '<div>还没有跨日数据</div></div>')
@@ -671,10 +687,40 @@
       : '<tr><td colspan="5"><div class="empty">暂无记录</div></td></tr>')
     + '      </tbody></table></div></div>'
 
+    + exitRows()
+
     + '  <div class="note note-info">' + I.info
     + '    <div>用量全部留在本机（<code>data/stats.json</code>）。趋势按 UTC 日切分；'
     + '请求级采样保留最近 24 小时、最多 2000 条，用于后续的分位统计。</div></div>'
     + '</div>'
+  }
+
+  /* 按出口分列的用量(README 承诺的「模型 × 出口」维度;后端 stats.Exits 聚合) */
+  function shortTag(tag) {
+    return stripRI(tag).slice(0, 28)
+  }
+  function exitRows() {
+    const byExit = (D.usage && D.usage.byExit) || {}
+    const rows = Object.keys(byExit)
+      .map(function (e) { return Object.assign({ exit: e }, byExit[e]) })
+      .sort(function (a, b) { return b.req - a.req })
+      .slice(0, 20)
+    return ''
+    + '  <div class="card sec"><div class="card-head"><h2>按出口</h2>'
+    + '    <span class="sub">请求实际走的出口 · 前 20 行</span></div>'
+    + '    <div class="tbl-wrap" style="max-height:none"><table>'
+    + '      <thead><tr><th>出口</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>合计</th></tr></thead>'
+    + '      <tbody>'
+    + (rows.length
+      ? rows.map(function (r) {
+        return '<tr><td class="node-name" style="max-width:340px" title="' + esc(r.exit) + '">' + esc(shortTag(r.exit)) + '</td>'
+          + '<td class="num">' + r.req + '</td>'
+          + '<td class="num">' + (r.in || 0).toLocaleString() + '</td>'
+          + '<td class="num">' + (r.out || 0).toLocaleString() + '</td>'
+          + '<td class="num">' + ((r.in || 0) + (r.out || 0)).toLocaleString() + '</td></tr>'
+      }).join('')
+      : '<tr><td colspan="5"><div class="empty">暂无出口数据</div></td></tr>')
+    + '      </tbody></table></div></div>'
   }
 
   /* ═══════════════════════════════════════════════════════════════════
@@ -736,10 +782,38 @@
       : '<div class="empty">' + I.empty + '<div>没有匹配的日志</div></div>')
     + '    </div>'
     + '  </div>'
+    + routesCard()
     + '  <div class="note note-info" style="margin-top:14px">' + I.info
     + '    <div>显示 ' + r.rows.length + ' 行（原始 ' + total + ' 行）。完整日志在 <code>data/gateway.log</code>，'
-    + '超 5MB 自动轮转为 <code>gateway.old.log</code>。</div></div>'
+    + '超 5MB 自动轮转为 <code>gateway.old.log</code>。请求轨迹在 <code>data/route/</code>（保留 30 天）。</div></div>'
     + '</div>'
+  }
+
+  /* 请求轨迹：每次路由决策的候选顺序与逐次尝试结果(/api/routes，README
+     承诺的「每次请求走了哪个出口，面板可查」) */
+  function routesCard() {
+    const rows = S.routes || []
+    return ''
+    + '  <div class="card sec" style="margin-top:14px"><div class="card-head"><h2>请求轨迹</h2>'
+    + '    <span class="sub">最近 ' + rows.length + ' 次路由决策</span></div>'
+    + '    <div class="tbl-wrap" style="max-height:320px"><table>'
+    + '      <thead><tr><th>时间</th><th>模型</th><th>结果</th><th>尝试链（出口 · 码 · 耗时）</th><th>总耗时</th></tr></thead>'
+    + '      <tbody>'
+    + (rows.length
+      ? rows.map(function (r) {
+        const tries = (r.tries || []).map(function (t) {
+          return esc(shortTag(t.tag)) + ' <span class="dim">(' + esc(t.code || 'ok') + ' ' + t.ms + 'ms)</span>'
+        }).join(' → ')
+        return '<tr>'
+          + '<td class="num dim">' + fmtTime(r.at) + '</td>'
+          + '<td class="node-name" style="max-width:220px">' + esc(r.model) + '</td>'
+          + '<td>' + esc(r.result || '') + '</td>'
+          + '<td style="font-size:12px">' + (tries || '<span class="dim">—</span>') + '</td>'
+          + '<td class="num">' + r.ms + 'ms</td>'
+          + '</tr>'
+      }).join('')
+      : '<tr><td colspan="5"><div class="empty">还没有路由记录</div></td></tr>')
+    + '      </tbody></table></div></div>'
   }
 
   /* ═══════════════════════════════════════════════════════════════════
@@ -789,9 +863,11 @@
       ? S.order.map(function (id, i) {
         const b = BUCKETS.filter(function (x) { return x.id === id })[0] || { name: id }
         const c = cnt(id)
-        return '<div class="order-item" draggable="true" data-idx="' + i + '" data-id="' + id + '">'
+        /* esc(id)：countries 数组元素会回流到 data-id 与展示文本里 —— 后端已
+           白名单 8 个分组 id，这里是防御纵深（写盘的手工编辑不受后端管） */
+        return '<div class="order-item" draggable="true" data-idx="' + i + '" data-id="' + esc(id) + '">'
           + '<span class="idx">' + (i + 1) + '</span><span class="grip">' + I.grip + '</span>'
-          + '<span class="cc">' + id + '</span><span class="nm">' + b.name + '</span>'
+          + '<span class="cc">' + esc(id) + '</span><span class="nm">' + esc(b.name) + '</span>'
           + '<span class="cnt">' + (c === 0 ? '<span style="color:var(--warn)">0 个</span>' : c + ' 个') + '</span>'
           + '<button class="btn btn-sm btn-ghost" data-move="' + i + '" data-dir="-1" title="上移"' + (i === 0 ? ' disabled' : '') + '>' + I.up + '</button>'
           + '<button class="btn btn-sm btn-ghost" data-move="' + i + '" data-dir="1" title="下移"' + (i === S.order.length - 1 ? ' disabled' : '') + '>' + I.down + '</button>'
@@ -838,6 +914,10 @@
     + '      <div class="field"><label class="lbl" for="f-defaultMaxTokens">默认输出上限</label>'
     + '        <input type="number" id="f-defaultMaxTokens" value="' + esc(S.form.defaultMaxTokens) + '" placeholder="留空 = 用各模型自己的上限" style="max-width:320px">'
     + '        <div class="help">留空表示不额外设限，每个模型用自己车道的上限；填数字则在此之上再压一道刹车。</div></div>'
+    + '      <div class="field"><label class="lbl" for="f-maxWallClockMs">单轮墙钟上限（毫秒）</label>'
+    + '        <input type="number" id="f-maxWallClockMs" value="' + esc(S.form.maxWallClockMs) + '" placeholder="0" style="max-width:320px" min="0">'
+    + '        <div class="help">一轮请求的总耗时上限，0 = 不限（默认）。不设上限时，连续命中慢超时节点的'
+    + '请求最坏可挂到小时级（20 次尝试 × 300s 超时）；设一个宽松值（如 600000 = 10 分钟）可以兜住它。</div></div>'
     + '    </div></div>'
 
     + '  <div class="card sec"><div class="card-head"><h2>危险操作</h2></div>'
@@ -858,6 +938,7 @@
 
   function render() {
     derive()
+    lastRenderSig = statusSig()
     renderNav()
     renderStatusbar()
     $('pageTitle').textContent = TITLES[S.view] || ''
@@ -877,6 +958,7 @@
     const activeId = document.activeElement && document.activeElement.id
     const selStart = document.activeElement && document.activeElement.selectionStart
     derive()
+    lastRenderSig = statusSig()
     renderNav()
     c.innerHTML = VIEWS[S.view]()
     c.scrollTop = top
@@ -920,6 +1002,7 @@
   const FIELD_LABEL = {
     subUrls:'订阅链接', probeEnabled:'自动探测', effortLevel:'思考强度',
     defaultMaxTokens:'输出上限', probeWorkers:'探测并发', probeIntervalMin:'探测周期',
+    maxWallClockMs:'墙钟上限',
   }
   function dirtyKeys() {
     const keys = []
@@ -944,6 +1027,16 @@
       return r.json()
     })
   }
+  /* W22：阻塞型动作请求(探测一轮可达数分钟)必须有超时 —— fetch 不设超时的
+     话，一个半死的连接会把 S.probing 永久卡在 true，两个探测按钮从此禁用，
+     只能整页刷新。探测给 10 分钟(大池 + 低并发的最坏值)，其余动作更短。 */
+  function post(url, timeoutMs) {
+    const opt = { method: 'POST' }
+    if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+      opt.signal = AbortSignal.timeout(timeoutMs || 180000)
+    }
+    return j(url, opt)
+  }
   function absorbStatus(s) {
     if (!s) return
     if (s.singbox) DATA.singbox = s.singbox
@@ -954,15 +1047,37 @@
     if (s.regionModels) DATA.regionModels = s.regionModels
     if (s.nodes) DATA.nodes = s.nodes
     if (s.usage) DATA.usage = s.usage
+    if (s.diagnostics) DATA.diagnostics = s.diagnostics
+  }
+  /* W18：轮询的时序保护。慢的旧响应回来时，新一轮可能已经落地 —— 不做保护
+     会把 5 秒前的旧快照覆盖上去(显示回跳)。单调 seq：响应落地前比对发起时
+     的序号，不是最新就丢弃；statusBusy 让上一轮没回来时跳过本轮 tick，避免
+     请求堆积。 */
+  let statusSeq = 0, statusBusy = false
+  let lastRenderSig = ''
+  /* O18：内容没变就跳过整页重建。节点表是最大头(池上限 8000，每 5s 全量
+     innerHTML 重建开销可观)；sig 覆盖渲染会用到的全部可变数据 */
+  function statusSig() {
+    return JSON.stringify([DATA.nodes, DATA.usage, DATA.singbox, DATA.limits,
+      DATA.models, DATA.regionModels, DATA.diagnostics, S.probing, S.routes])
   }
   function refreshStatus() {
+    if (statusBusy) return Promise.resolve()
+    statusBusy = true
+    const seq = ++statusSeq
     return j('/api/status').then(function (s) {
+      statusBusy = false
+      if (seq !== statusSeq) return
       absorbStatus(s)
       derive()
       renderStatusbar()
       /* 设置页是表单：自动刷新只更新顶栏，不重建内容区 */
-      if (S.view !== 'settings' && !isEditing()) rerenderSoft()
-    }).catch(function () { /* 轮询失败静默，下一轮再试 */ })
+      if (S.view === 'settings' || isEditing()) return
+      const sig = statusSig()
+      if (sig === lastRenderSig) return  /* O18：什么都没变，不重建 DOM */
+      lastRenderSig = sig
+      rerenderSoft()
+    }).catch(function () { statusBusy = false /* 轮询失败静默，下一轮再试 */ })
   }
   function refreshLogs() {
     return j('/api/logs').then(function (d) {
@@ -970,13 +1085,19 @@
       if (S.view === 'logs' && !isEditing()) rerenderSoft()
     }).catch(function () { /* 同上 */ })
   }
-  function post(url) { return j(url, { method: 'POST' }) }
+  function refreshRoutes() {
+    return j('/api/routes?limit=20').then(function (d) {
+      S.routes = d.rows || []
+      if (S.view === 'logs' && !isEditing()) rerenderSoft()
+    }).catch(function () { /* 静默：轨迹是增强信息 */ })
+  }
 
   function runProbe() {
     if (S.probing) return
     S.probing = true
     if (S.view === 'overview') rerenderSoft()
-    post('/api/probe')
+    /* 10 分钟：池上限 8000、低并发的最坏探测时长；abort 后 catch 复位按钮 */
+    post('/api/probe', 600000)
       .then(function () { return refreshStatus() })
       .then(function () { return refreshLogs() })
       .then(function () {
@@ -997,8 +1118,11 @@
       subUrls: S.form.subUrls.split('\n').map(function (x) { return x.trim() }).filter(Boolean),
       countries: S.order.slice(),
       probeEnabled: S.form.probeEnabled,
-      probeWorkers: Number(S.form.probeWorkers) || 24,
+      /* I26：后端硬上限 256，HTML 的 max 只是提示。前端 clamp 而不是放行 400 */
+      probeWorkers: Math.min(256, Math.max(1, Number(S.form.probeWorkers) || 24)),
       probeIntervalMin: Number(S.form.probeIntervalMin) || 30,
+      /* 0 = 不限(默认)；负数按 0 归一 */
+      maxWallClockMs: Math.max(0, Math.round(Number(S.form.maxWallClockMs) || 0)),
       effortLevel: S.form.effortLevel || 'balanced',
       /* 空值 = 不额外设限（每个模型用自己车道的上限）。必须发 null 而不是 undefined
          —— JSON.stringify 会丢掉 undefined，旧值就会活过整个往返，字段永远清不掉。 */
@@ -1120,18 +1244,25 @@
 
     if (t.closest('#btnProbe') || t.closest('#btnProbe2') || t.closest('#btnResetProbe')) { runProbe(); return }
     if (t.closest('#btnRefresh')) {
+      /* I28：防重入 —— 连点会并发多个 POST /api/refresh，后端按 rebuildMu
+         排队但前端 toast 会乱套 */
+      if (S.busy) return
+      S.busy = true
       toast('已触发订阅刷新，正在重建节点池…')
-      post('/api/refresh').then(function () { return refreshStatus() })
-        .then(function () { toast('订阅已刷新，节点池已重建', 'ok') })
-        .catch(function (e) { toast('刷新失败：' + (e && e.message ? e.message : e), 'bad') })
+      post('/api/refresh', 300000).then(function () { return refreshStatus() })
+        .then(function () { S.busy = false; toast('订阅已刷新，节点池已重建', 'ok') })
+        .catch(function (e) { S.busy = false; toast('刷新失败：' + (e && e.message ? e.message : e), 'bad') })
       return
     }
     if (t.closest('#btnLimits') || t.closest('#btnLimits2')) {
+      if (S.busy) return
+      S.busy = true
       toast('正在强制刷新限额表…')
-      post('/api/limits').then(function (r) {
+      post('/api/limits', 120000).then(function (r) {
+        S.busy = false
         toast('限额表已更新：' + (r && r.rows != null ? r.rows : '?') + ' 行', 'ok')
         return refreshStatus()
-      }).catch(function (e) { toast('刷新失败：' + (e && e.message ? e.message : e), 'bad') })
+      }).catch(function (e) { S.busy = false; toast('刷新失败：' + (e && e.message ? e.message : e), 'bad') })
       return
     }
     if (t.closest('#btnDiscard')) {
@@ -1150,7 +1281,7 @@
     if (t.id === 'logQ') { S.logQ = t.value; rerenderSoft(); return }
     const fmap = {
       'f-subUrls':'subUrls', 'f-probeWorkers':'probeWorkers', 'f-probeIntervalMin':'probeIntervalMin',
-      'f-effortLevel':'effortLevel', 'f-defaultMaxTokens':'defaultMaxTokens',
+      'f-effortLevel':'effortLevel', 'f-defaultMaxTokens':'defaultMaxTokens', 'f-maxWallClockMs':'maxWallClockMs',
     }
     if (fmap[t.id]) { S.form[fmap[t.id]] = t.value; checkDirty() }
   })
@@ -1230,5 +1361,5 @@
 
   go(location.hash.slice(1) || 'overview', true)
   setInterval(refreshStatus, 5000)
-  setInterval(refreshLogs, 15000)
+  setInterval(function () { refreshLogs(); refreshRoutes() }, 15000)
 })()

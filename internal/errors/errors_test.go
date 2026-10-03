@@ -105,6 +105,9 @@ func TestRetryAfterParsesSecondsOnly(t *testing.T) {
 		{"0", 0},
 		{"-5", 0},
 		{"", 0},
+		{"120", 120000},  // 封顶线以下(2 分钟)原样放行
+		{"700", 600000},  // 700s > 10 分钟:钳到封顶值
+		{"1e18", 600000}, // 浮点天文数字同样封顶(旧实现会算出 1e21ms ≈ 3 万年)
 	}
 	for _, c := range cases {
 		if got := RetryAfter(c.header); got != c.want {

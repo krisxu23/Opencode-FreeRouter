@@ -79,6 +79,11 @@ var (
 	writeOff     bool
 	lastPruneDay string
 	dayBytes     int64
+	// writeMu 把磁盘 I/O 挪出 mu:Record 曾全程持 mu 做 open/write/close,
+	// Recent(面板轮询)与所有 Record 在同一把锁上排队 —— 轮询高峰时路由
+	// 记录要等 I/O。mu 只保护内存状态与配额账,写按到达序在 writeMu 下
+	// 落盘;锁序恒为 writeMu → mu,无环。
+	writeMu sync.Mutex
 )
 
 // Init points the tracer at a directory, creating it when possible. A directory
@@ -101,12 +106,17 @@ func Init(d string) {
 		return
 	}
 	dir = d
+	// dayBytes 只计本进程写入 —— 重启后同一天的文件还能再写满 32MB,
+	// 跨重启合计超配额。按当天文件的实际大小初始化计数。
+	today := time.Now().UTC().Format("2006-01-02")
+	if fi, err := os.Stat(filepath.Join(d, today+".jsonl")); err == nil {
+		dayBytes = fi.Size()
+	}
 }
 
 // Record appends one decision. It has no error return on purpose.
 func Record(r Route) {
 	mu.Lock()
-	defer mu.Unlock()
 	// JS：at = record.at ?? Date.now()。At 缺省（0）时取当前时刻。
 	if r.At == 0 {
 		r.At = time.Now().UnixMilli()
@@ -138,7 +148,10 @@ func Record(r Route) {
 		dayBytes = 0
 		writeOff = false
 	}
-	if dir == "" || writeOff {
+	d := dir
+	off := writeOff
+	mu.Unlock()
+	if d == "" || off {
 		return
 	}
 	b, err := json.Marshal(r)
@@ -146,25 +159,41 @@ func Record(r Route) {
 		return
 	}
 	b = append(b, '\n')
-	path := filepath.Join(dir, day+".jsonl")
+
+	// I21:配额判定与扣账在 mu 的短临界区里完成,写本身在 writeMu 下按
+	// 到达序落盘(见 writeMu 注释)。
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	mu.Lock()
+	if writeOff || dir != d {
+		mu.Unlock()
+		return
+	}
 	if dayBytes+int64(len(b)) > maxBytesPerDay {
 		// Stop writing for the rest of the day rather than truncating: the
 		// existing lines are the evidence for whatever went wrong.
 		writeOff = true
+		mu.Unlock()
 		return
 	}
+	dayBytes += int64(len(b))
+	mu.Unlock()
+
+	path := filepath.Join(d, day+".jsonl")
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
+		mu.Lock()
 		writeOff = true
+		mu.Unlock()
 		return
 	}
-	n, err := f.Write(b)
+	_, err = f.Write(b)
 	_ = f.Close()
 	if err != nil {
+		mu.Lock()
 		writeOff = true
-		return
+		mu.Unlock()
 	}
-	dayBytes += int64(n)
 }
 
 // pruneLocked deletes jsonl files older than the retention window. Only

@@ -40,9 +40,9 @@ type OverlayRow struct {
 
 // overlayCache 是 data/modelsdev.json 的落盘形状(JS saveLimitsCache 的 data)。
 type overlayCache struct {
-	FetchedAt int64                  `json:"fetchedAt"`
-	ByID      map[string]OverlayRow  `json:"byId"`
-	Source    string                 `json:"source"`
+	FetchedAt int64                 `json:"fetchedAt"`
+	ByID      map[string]OverlayRow `json:"byId"`
+	Source    string                `json:"source"`
 }
 
 // fallbackContext / fallbackOutput 是 catalog 通用回退值 —— 它们的组合是
@@ -56,7 +56,10 @@ const fallbackOutput = int64(32768)
 // 的「收下并截成 131072」会让同一行覆盖层在一侧生效、另一侧静默丢弃(任务 27
 // A7 差分钉住的实错)。+Inf 超出 int64 且 JS 侧 Number.isFinite 也不收,一并排除。
 func positiveInt(v float64) (int64, bool) {
-	if v > 0 && !math.IsInf(v, 1) {
+	// 上界 1<<62:int64(v) 对超过 MaxInt64 的有限大数(1e30)是
+	// implementation-defined 的转换,结果会进 contextWindow/maxOutput 的
+	// 预算算术。NaN/±Inf 已挡,这里补最后一个角。
+	if v > 0 && v < 1<<62 && !math.IsInf(v, 1) {
 		return int64(v), true
 	}
 	return 0, false

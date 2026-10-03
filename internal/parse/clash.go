@@ -123,7 +123,7 @@ func ParseClashProxy(tag string, p map[string]any) (Outbound, bool) {
 		// skip-cert-verify 为 false 时写 false）—— 指针三态保住这个形状。
 		sv, _ := p["skip-cert-verify"].(bool)
 		t := TLS{
-			Enabled:  BoolPtr(true),
+			Enabled:    BoolPtr(true),
 			ServerName: firstNonEmpty(str(p["servername"]), str(p["sni"]), o.Server),
 			Insecure:   BoolPtr(sv),
 		}
@@ -258,9 +258,9 @@ func outboundFromMap(m map[string]any) (Outbound, bool) {
 		if b, ok := t["enabled"].(bool); ok {
 			tls.Enabled = BoolPtr(b) // 键存在才写 —— 透传块没有 enabled 时 JS 原样保留
 		}
-	if b, ok := t["insecure"].(bool); ok {
-		tls.Insecure = BoolPtr(b) // 透传路径：键存在才写（JS 原样保留无 insecure 的块）
-	}
+		if b, ok := t["insecure"].(bool); ok {
+			tls.Insecure = BoolPtr(b) // 透传路径：键存在才写（JS 原样保留无 insecure 的块）
+		}
 		tls.ALPN = strSlice(t["alpn"])
 		if u, ok := t["utls"].(map[string]any); ok {
 			ut := UTLS{Fingerprint: str(u["fingerprint"])}

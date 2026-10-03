@@ -121,8 +121,12 @@ type PanelDeps struct {
 // identical to what the client builds after a poll, so a single render path
 // serves both the first paint and every update.
 type Boot struct {
-	Version      string         `json:"version"`
-	Singbox      any            `json:"singbox"`
+	Version string `json:"version"`
+	Singbox any    `json:"singbox"`
+	// Forward 原样携带 app.Status() 的 forward.key 全文(概览页一键复制依赖
+	// 它,README 记载了这一行为):控制台只绑 127.0.0.1、Host 白名单挡住
+	// rebinding,本机进程本可直读 data/settings.json —— 披露面与本地威胁
+	// 模型一致,这是有意取舍,不是遗漏。
 	Forward      any            `json:"forward"`
 	Models       []any          `json:"models"`
 	ModelCaps    map[string]any `json:"modelCaps"`
@@ -146,6 +150,7 @@ type settingsView struct {
 	ProbeIntervalMin any `json:"probeIntervalMin"`
 	EffortLevel      any `json:"effortLevel"`
 	DefaultMaxTokens any `json:"defaultMaxTokens"`
+	MaxWallClockMS   any `json:"maxWallClockMs"`
 	ForwardPort      any `json:"forwardPort"`
 	PanelPort        any `json:"panelPort"`
 }
@@ -243,7 +248,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 				msg = err.Error()
 			}
 			s.logf("panel request failed: %s", msg)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": msg})
+			// panic 详情只进日志:它可能携带请求内容或注入回调的内部状态,
+			// 客户端拿到固定文案即可(与 forward 的顶层 recover 同纪律)。
+			writeText(w, http.StatusInternalServerError, "panel request failed")
 		}
 	}()
 	if !s.localRequest(w, r) {
@@ -261,8 +268,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 // TestNoStateCanDistinguishAuthorizedFromNot 要防的「用状态码推断内部状态」
 // 依旧成立:那个 403 与面板内部状态无关,且在任何 Host 合法的请求上都不会出现。
 //
-// 只认主机名、不比对端口:面板端口可配置,而攻击者伪造 Host 时同样可以写上
-// 正确端口;真正拦住 rebinding 的是「主机名必须是回环名」这一条。
+// Origin/Referer 比旧实现多一道端口闸:过去只判主机名,本机任意端口上被攻陷
+// 的本地服务(Origin=http://localhost:7777)同样通过校验、能驱动 POST
+// /api/probe 与 PUT /api/settings。现在 Origin/Referer 的端口必须等于面板
+// 自己实际监听的端口 —— 同源浏览器永远满足,跨端口的本机服务被挡在外面。
 func (s *Server) localRequest(w http.ResponseWriter, r *http.Request) bool {
 	if !panelLoopbackHosts[hostOnly(r.Host)] {
 		s.logf("panel: 拒绝非本机 Host 的请求: %q", r.Host)
@@ -270,15 +279,15 @@ func (s *Server) localRequest(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	// 浏览器对跨源的非简单请求才会带上 Origin;同源 PUT 也会带(值同源)。
-	// 因此「有 Origin 就必须是回环」,没有 Origin 说明不是浏览器发的 ——
-	// curl/托盘/测试都走这条路,不能拒。
+	// 因此「有 Origin 就必须是本机控制台的同源」,没有 Origin 说明不是浏览器
+	// 发的 —— curl/托盘/测试都走这条路,不能拒。
 	if isWriteMethod(r.Method) {
-		if origin := r.Header.Get("Origin"); origin != "" && !loopbackURLHost(origin) {
+		if origin := r.Header.Get("Origin"); origin != "" && !s.loopbackConsoleURL(origin) {
 			s.logf("panel: 拒绝非本机 Origin 的写请求: %q", origin)
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "panel: origin is not the local console"})
 			return false
 		}
-		if ref := r.Header.Get("Referer"); ref != "" && !loopbackURLHost(ref) {
+		if ref := r.Header.Get("Referer"); ref != "" && !s.loopbackConsoleURL(ref) {
 			s.logf("panel: 拒绝非本机 Referer 的写请求: %q", ref)
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "panel: referer is not the local console"})
 			return false
@@ -308,10 +317,12 @@ func isWriteMethod(method string) bool {
 	}
 }
 
-// loopbackURLHost 判一个 Origin/Referer 值的主机是不是回环。
-// Origin 只有 scheme://host[:port] 三段,Referer 是完整 URL;同一个解析
-// 都能吃下。解析失败一律按「不是回环」处理。
-func loopbackURLHost(raw string) bool {
+// loopbackConsoleURL 判一个 Origin/Referer 值是不是「发给这台控制台」:
+// 主机必须是回环名,且端口必须等于面板自己实际监听的端口。Origin 只有
+// scheme://host[:port] 三段,Referer 是完整 URL;同一个解析都能吃下。
+// 解析失败一律按「不是本机」处理。面板尚未监听(port==0,测试直呼 handler)
+// 时只判主机名。
+func (s *Server) loopbackConsoleURL(raw string) bool {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return false
@@ -321,7 +332,16 @@ func loopbackURLHost(raw string) bool {
 	default:
 		return false
 	}
-	return panelLoopbackHosts[strings.ToLower(u.Hostname())]
+	if !panelLoopbackHosts[strings.ToLower(u.Hostname())] {
+		return false
+	}
+	if s.port > 0 {
+		p, perr := strconv.Atoi(u.Port())
+		if perr != nil || p != s.port {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
@@ -341,7 +361,15 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	case method == http.MethodPut && path == "/api/settings":
 		patch, err := readBodyJSON(w, r)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			// 400/413,不是 500:请求体本身就是补丁的一部分,畸形输入是调用
+			// 方自己的问题(文件头注释承诺「the client must see it」)。纯文本
+			// 是因为 web/app.js 把非 2xx 的 body 原样塞进 toast —— JSON 会
+			// 显示成一坨。
+			status := http.StatusBadRequest
+			if errors.Is(err, errBodyTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			}
+			writeText(w, status, err.Error())
 			return
 		}
 		var out any
@@ -385,7 +413,9 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 			// the result cache. Without it a click right after an automatic
 			// round would be a no-op.
 			if err := s.deps.Actions.ProbeNow(r.Context(), true); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				// 动作失败走纯文本:前端把非 2xx body 原样塞进 toast,JSON
+				// 会显示成一坨(与 PUT /api/settings 的 400 同理)。
+				writeText(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
@@ -394,7 +424,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	case method == http.MethodPost && path == "/api/refresh":
 		if s.deps.Actions.Refresh != nil {
 			if err := s.deps.Actions.Refresh(); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				writeText(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
@@ -403,7 +433,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	case method == http.MethodPost && path == "/api/limits":
 		if s.deps.Actions.RefreshLimits != nil {
 			if err := s.deps.Actions.RefreshLimits(); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				writeText(w, http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
@@ -455,6 +485,9 @@ func (s *Server) serveClientJS(w http.ResponseWriter) {
 	}
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
+	// 与全站 no-store 策略一致(shell 与所有 API 都设,唯独这里漏了):exe 更新
+	// 后浏览器可能沿用会话内缓存的旧 app.js 搭配新 __BOOT__ 快照,形状错配。
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(raw)
 }
@@ -503,6 +536,7 @@ func (s *Server) bootstrap() Boot {
 			ProbeIntervalMin: cfg["probeIntervalMin"],
 			EffortLevel:      cfg["effortLevel"],
 			DefaultMaxTokens: cfg["defaultMaxTokens"],
+			MaxWallClockMS:   cfg["maxWallClockMs"],
 			ForwardPort:      cfg["forwardPort"],
 			PanelPort:        cfg["panelPort"],
 		},
@@ -556,24 +590,31 @@ func clampRoutesLimit(raw string) int {
 	return n
 }
 
+// errBodyTooLarge 是 readBodyJSON 的哨兵:调用方据此回 413 而不是 400。
+var errBodyTooLarge = errors.New("request body too large")
+
 // readBodyJSON reads the request body with the 1MB ceiling. An empty body is
 // an empty object rather than nil, matching `applySettings(patch ?? {})`; a nil
 // map would panic the first time app assigns a key into it.
+//
+// 错误文案一律固定短语,不透传底层细节:调用方把它**原样**回给前端 —— json
+// 语法偏移、io 错误原文都属于内部信息(过去 err.Error() 连同 500 一起出去,
+// 而这明明是调用方自己的畸形输入)。
 func readBodyJSON(w http.ResponseWriter, r *http.Request) (map[string]any, error) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return nil, errors.New("request body too large")
+			return nil, errBodyTooLarge
 		}
-		return nil, err
+		return nil, errors.New("could not read request body")
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
 		return map[string]any{}, nil
 	}
 	var out map[string]any
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, err
+		return nil, errors.New("request body is not valid JSON")
 	}
 	if out == nil {
 		return map[string]any{}, nil

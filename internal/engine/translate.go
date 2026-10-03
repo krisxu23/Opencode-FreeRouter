@@ -344,33 +344,24 @@ func toolParamsOf(v any) (map[string]any, bool) {
 
 // ---- chunk 折叠 ----
 
-// toolPayload 是 KindToolCallDelta 的 Chunk.Text 载荷。Chunk 的字段块是计划
-// 定死的(五种 Kind 共用 Text 一个通道),而 JS 的 tool-call 增量本携带
-// {index, id, name, argumentsDelta} 四元信息 —— 所以 engine 把它打包成 JSON
-// 信封塞进 Text;ToolCallDeltaChunk / ToolCallBlockEndChunk 是两个构造器,
-// 转发层(from engine 的 Chunk 渲染 OpenAI SSE)用同一对构造器/信封解码,
-// 不必再发明形状。
+// tool-call 增量的载荷是结构化字段(Chunk.ToolID/ToolName/ToolDelta/ToolArguments),
+// 不再打包成 JSON 塞进 Chunk.Text(旧 toolPayload 信封的做法):热路径上每个
+// 增量帧要在 engine 折一遍、在转发层再解一遍,两次 JSON 编解码是纯浪费。
+// JS 的 tool-call 增量本携带 {index, id, name, argumentsDelta} 四元信息,
+// 结构化字段与之/foldChunks 的归并语义一一对应:
 //
-//	Delta 非空     → 增量帧:按 Chunk.Index 归并 arguments(js tool-call-delta)
-//	Arguments 非空 → 完整帧:按 ID 匹配已有条目,匹配不到才追加(js block-end)
-type toolPayload struct {
-	ID        string `json:"id,omitempty"`
-	Name      string `json:"name,omitempty"`
-	Delta     string `json:"delta,omitempty"`
-	Arguments string `json:"arguments,omitempty"`
-}
+//	ToolArguments 非空 → 完整帧:按 ID 匹配已有条目,匹配不到才追加(js block-end)
+//	否则               → 增量帧:按 Chunk.Index 归并 arguments(js tool-call-delta)
 
 // ToolCallDeltaChunk 构造一个 tool-call 增量 Chunk。
 func ToolCallDeltaChunk(index int, id, name, delta string) Chunk {
-	b, _ := json.Marshal(toolPayload{ID: id, Name: name, Delta: delta})
-	return Chunk{Kind: ChunkToolCallDelta, Index: index, Text: string(b)}
+	return Chunk{Kind: ChunkToolCallDelta, Index: index, ToolID: id, ToolName: name, ToolDelta: delta}
 }
 
 // ToolCallBlockEndChunk 构造一个「块结束」的完整 tool-call Chunk:载荷是
 // 完整 arguments,foldChunks 按 ID 匹配。
 func ToolCallBlockEndChunk(index int, id, name, arguments string) Chunk {
-	b, _ := json.Marshal(toolPayload{ID: id, Name: name, Arguments: arguments})
-	return Chunk{Kind: ChunkToolCallDelta, Index: index, Text: string(b)}
+	return Chunk{Kind: ChunkToolCallDelta, Index: index, ToolID: id, ToolName: name, ToolArguments: arguments}
 }
 
 // foldChunks 把一个 Chunk 折进 Outcome(js foldForwardOutcome :523-548)。
@@ -378,48 +369,47 @@ func ToolCallBlockEndChunk(index int, id, name, arguments string) Chunk {
 // (JS 对它无分支 —— 它是给转发层的内容,不进答案文本)、tool-call 增量按
 // Index 归并 arguments、block-end 的 tool-call 用 ID 匹配已有条目(不是
 // Index),匹配不到才追加。
+//
+// 正文增量**不**在这里拼进 Outcome.Text:`out.Text += c.Text` 在长答案上是
+// O(n²)(十万字符 × 上千个增量 = 上百次整串拷贝)。拼接权在调用方(attempt
+// 用 strings.Builder 一次攒完、返回前回填),这里只负责「出了内容」的判定。
 func foldChunks(c Chunk, into *Outcome) (FinishReason, bool) {
 	switch c.Kind {
 	case ChunkText:
-		into.Text += c.Text
 		return FinishStop, true
 	case ChunkReasoning:
 		// reasoning 不折进 Text(它不是答案的一部分),但算「出了内容」:
 		// 推理增量一样意味着这个出口开始吐 token 了。
 		return FinishStop, true
 	case ChunkToolCallDelta:
-		var p toolPayload
-		if err := json.Unmarshal([]byte(c.Text), &p); err != nil {
-			return FinishStop, true // 畸形信封按「有内容」处理,不影响轮换账
-		}
-		if p.Arguments != "" {
-			// block-end 完整帧(Arguments 字段是它的判别符,见 toolPayload):
-			// 按 **ID** 匹配已有条目(js :535-538),不是 Index。命中即保持
-			// 原条目(增量已把 arguments 拼齐,JS 的命中分支什么都不做);
-			// 不命中才追加。
+		if c.ToolArguments != "" {
+			// block-end 完整帧:按 **ID** 匹配已有条目(js :535-538),不是
+			// Index。命中即保持原条目(增量已把 arguments 拼齐,JS 的命中
+			// 分支什么都不做);不命中才追加 —— 零参数调用的唯一上行事件就
+			// 是它,追加分支因此也是它的正式通道,不只是兜底。
 			for i := range into.ToolCalls {
-				if p.ID != "" && into.ToolCalls[i].ID == p.ID {
+				if c.ToolID != "" && into.ToolCalls[i].ID == c.ToolID {
 					return FinishStop, true
 				}
 			}
-			into.ToolCalls = append(into.ToolCalls, ToolCall{ID: p.ID, Name: p.Name, Arguments: p.Arguments, slot: c.Index})
+			into.ToolCalls = append(into.ToolCalls, ToolCall{ID: c.ToolID, Name: c.ToolName, Arguments: c.ToolArguments, slot: c.Index})
 			return FinishStop, true
 		}
 		// 增量帧:按 Index 找条目(js :527-531)。
 		for i := range into.ToolCalls {
 			call := &into.ToolCalls[i]
 			if call.slot == c.Index {
-				call.Arguments += p.Delta
-				if p.Name != "" {
-					call.Name = p.Name
+				call.Arguments += c.ToolDelta
+				if c.ToolName != "" {
+					call.Name = c.ToolName
 				}
-				if p.ID != "" {
-					call.ID = p.ID
+				if c.ToolID != "" {
+					call.ID = c.ToolID
 				}
 				return FinishStop, true
 			}
 		}
-		into.ToolCalls = append(into.ToolCalls, ToolCall{ID: p.ID, Name: p.Name, Arguments: p.Delta, slot: c.Index})
+		into.ToolCalls = append(into.ToolCalls, ToolCall{ID: c.ToolID, Name: c.ToolName, Arguments: c.ToolDelta, slot: c.Index})
 		return FinishStop, true
 	case ChunkUsage:
 		into.Usage = c.Usage // JS 是整体替换(:540),adapter 交来的是终值
@@ -452,23 +442,43 @@ func dropBrokenToolCalls(out *Outcome) {
 	out.ToolCalls = kept
 }
 
-// OpenAIUsage 把 harness usage 形状换算成 OpenAI 形状(js :419-428)。非流式
-// 响应与 /v1/responses 的 usage 都直接透传换算结果,OpenAI 客户端只认
-// prompt_tokens/completion_tokens:
+// OpenAIUsageTotals 是 usage 换算的单一事实来源:转发层的线形状结构体直接按它
+// 逐字段抄,不必经 map[string]any 往返(旧路径:OpenAIUsage 造 map → 转发层
+// 再按字符串键逐个抄回结构体,热路径上每响应多一轮分配)。
+type OpenAIUsageTotals struct {
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+	CachedTokens     int64
+}
+
+// OpenAIUsageTotalsOf 把 harness usage 形状换算成 OpenAI 口径(js :419-428):
 //
 //	prompt_tokens = inputTokens + cacheReadTokens(上游把缓存读也算进 prompt)
 //	prompt_tokens_details.cached_tokens = cacheReadTokens
 //
 // Go 的 stream.Usage 不携带 totalTokens/reasoningTokens 两个可选量(JS 的 ??
 // 缺省分支):total 恒按三项之和,reasoning 恒 0。
-func OpenAIUsage(u stream.Usage) map[string]any {
+func OpenAIUsageTotalsOf(u stream.Usage) OpenAIUsageTotals {
 	prompt := u.In + u.CacheRead
+	return OpenAIUsageTotals{
+		PromptTokens:     prompt,
+		CompletionTokens: u.Out,
+		TotalTokens:      prompt + u.Out,
+		CachedTokens:     u.CacheRead,
+	}
+}
+
+// OpenAIUsage 把 harness usage 形状换算成 OpenAI 形状的 map 版(与
+// OpenAIUsageTotalsOf 同一算术,保留给差分测试与需要 map 的调用方)。
+func OpenAIUsage(u stream.Usage) map[string]any {
+	t := OpenAIUsageTotalsOf(u)
 	return map[string]any{
-		"prompt_tokens":     prompt,
-		"completion_tokens": u.Out,
-		"total_tokens":      prompt + u.Out,
+		"prompt_tokens":     t.PromptTokens,
+		"completion_tokens": t.CompletionTokens,
+		"total_tokens":      t.TotalTokens,
 		"prompt_tokens_details": map[string]any{
-			"cached_tokens": u.CacheRead,
+			"cached_tokens": t.CachedTokens,
 		},
 		"completion_tokens_details": map[string]any{
 			"reasoning_tokens": int64(0),

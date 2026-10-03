@@ -145,9 +145,13 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	// 出站集合没变就不刷新目录:目录刷新会打一次上游,而「什么都没变」
 	// 是稳态下最常见的情况(每 6 小时一次重建)。
 	added, removed, syncErr := p.Host.SyncOutbounds(p.Registry.All())
-	if syncErr == nil {
+	if syncErr == nil && (added != 0 || removed != 0) {
 		// 出站集合被换掉:旧代 client 里绑的拨号闭包指向的是已经被撤下的出站
-		// (O3)。失败的 sync 什么都没换,不能白丢一整批连接池。
+		// (O3)。失败的 sync 什么都没换,零增删的 sync 同样什么都没换
+		// (SyncOutbounds 对已存在的 tag 是纯 no-op,旧 client 的拨号闭包依然
+		// 有效)—— 两种情形都不该白丢一整批温热连接池。6 小时一次的周期重建
+		// 在稳态下(订阅没变)正是零增删,旧实现每次都把最多 32 个出口的
+		// 空闲连接清零,之后的请求全部重新 TCP+TLS 握手。
 		p.noteEgressChanged()
 	}
 	// B11:两路失败都要冒泡 —— 订阅拉不到、出站热插失败。注册表本身已经
@@ -588,11 +592,16 @@ func (p *Parts) catalogCacheFile() string {
 }
 
 // PanelURL 是托盘「打开面板」与单实例守卫共用的唯一 URL 来源。
-// 端口从已解析的 Settings 取,不重读 settings.json —— 重读会与
-// ApplySettings 的写入产生竞态,且用户可能刚在面板上改过端口。
+// 端口优先取**实际绑定**的监听地址:报告「正在服务」的那个端口,而不是设置
+// 里声称的端口 —— 运行中改端口已被 ApplySettings 拒收,但两者曾经过一轮
+// 「设置已写、监听未动」的分裂期,以 listener 为准永远不会再错。没有 listener
+// (Load 未走完/测试夹具)时回落设置值。
 func (p *Parts) PanelURL() string {
 	if p == nil || !p.hasSettings() {
 		return ""
+	}
+	if p.panelLn != nil {
+		return fmt.Sprintf("http://127.0.0.1:%d/", portOf(p.panelLn))
 	}
 	return fmt.Sprintf("http://127.0.0.1:%d/", p.settingsSnapshot().PanelPort)
 }

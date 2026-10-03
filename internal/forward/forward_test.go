@@ -166,8 +166,12 @@ func TestGenerateKeyRoundTripsConstantTime(t *testing.T) {
 	if KeyMatches("", k) {
 		t.Fatal("the empty string must not match a real key")
 	}
-	if !KeyMatches("", "") {
-		t.Fatal("two empty strings are equal (js: byteLength 0 === 0)")
+	if KeyMatches("", "") {
+		// 对 JS 的**有意偏离**(js 的 byteLength 0 === 0 为真):空密钥不
+		// 匹配任何呈现,包括空呈现 —— GenerateKey 坏熵源时返回空串,这里的
+		// 语义必须与 authorized() 的「空串拒绝一切」同向,否则它会成为一个
+		// 「拿空 expected 比较就全放行」的陷阱默认。
+		t.Fatal("two empty strings must not match: an empty key grants nothing")
 	}
 }
 
@@ -423,8 +427,8 @@ func TestNonStreamingSuccessShape(t *testing.T) {
 	st := newStub()
 	st.complete = func(context.Context, engine.Request, func(engine.Chunk) error) (engine.Outcome, error) {
 		return engine.Outcome{
-			Text:    "hi",
-			Usage:   stream.Usage{In: 10, Out: 5, CacheRead: 3, HasUsage: true},
+			Text:  "hi",
+			Usage: stream.Usage{In: 10, Out: 5, CacheRead: 3, HasUsage: true},
 			ToolCalls: []engine.ToolCall{
 				{ID: "call_1", Name: "search", Arguments: `{"q":"x"}`},
 				{Name: "echo", Arguments: `{}`}, // 没有 id 时用 call_<i> 兜底
@@ -892,9 +896,11 @@ func TestNotWiredCompleteIs500NotPanic(t *testing.T) {
 // TestServerTimeoutsAreBounded 是 R1 的钉子:Go 的 http.Server 零值等于无限,
 // 一个连上不发头的 slowloris 连接会一直占着 goroutine 和 fd。
 //
-// 同时钉住 ReadTimeout/WriteTimeout **必须保持 0**:转发端口吐 SSE,一个正常
-// 回复可以吐几十秒,整请求死线会把它腰斩 —— 那不是疏忽,是刻意的(空闲截止
-// 由 httpclient.NewStreamClient 在响应体上实现)。谁把这两项设上,这个测试红。
+// 钉住读死线的两段式与 WriteTimeout=0:ReadTimeout 只覆盖读体阶段(slowloris
+// 的第三个洞:发头之后无限慢速喂 body),readBody 读完解除;WriteTimeout 必
+// 须保持 0 —— 转发端口吐 SSE,一个正常回复可以吐几十秒,写方向的整请求死线
+// 会把它腰斩(空闲截止由 httpclient.NewStreamClient 在响应体上实现)。谁把
+// WriteTimeout 设上、或把 ReadTimeout 的解除逻辑删了,这个测试与流式测试都会红。
 func TestServerTimeoutsAreBounded(t *testing.T) {
 	srv := New(Config{})
 	if srv.http.ReadHeaderTimeout != serverReadHeaderTimeout {
@@ -906,8 +912,77 @@ func TestServerTimeoutsAreBounded(t *testing.T) {
 	if srv.http.ReadHeaderTimeout <= 0 || srv.http.IdleTimeout <= 0 {
 		t.Fatal("两个超时都必须为正:零值就是无限,slowloris 能一直占着连接")
 	}
-	if srv.http.ReadTimeout != 0 || srv.http.WriteTimeout != 0 {
-		t.Fatalf("ReadTimeout=%v WriteTimeout=%v,必须为 0 —— SSE 回复会被整请求死线腰斩",
-			srv.http.ReadTimeout, srv.http.WriteTimeout)
+	// ReadTimeout 是两段式的第一段:只管读体阶段(防无限慢速喂 body),
+	// readBody 读完即用 ResponseController 解除读死线 —— 不解除的话,
+	// net/http 的后台读会在死线到期时取消请求 context,长回答的 SSE 照样
+	// 被腰斩。WriteTimeout 必须保持 0:写方向的整请求死线没有解除手段。
+	if srv.http.ReadTimeout != serverReadTimeout {
+		t.Fatalf("ReadTimeout=%v, want %v(读体阶段的上限)", srv.http.ReadTimeout, serverReadTimeout)
+	}
+	if srv.http.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout=%v,必须为 0 —— SSE 回复会被整请求死线腰斩", srv.http.WriteTimeout)
+	}
+}
+
+func TestZeroArgumentToolCallIsForwardedAsStream(t *testing.T) {
+	// C1:零参数调用的唯一上行事件是 block-end 完整帧(参数增量为空、
+	// toolStart 不发帧)。旧实现无条件丢弃 block-end,客户端收不到任何
+	// tool_calls delta 却在收尾看到 finish_reason:"tool_calls" —— SDK
+	// 组装出的 assistant 消息没有任何调用,下一轮回放即错。
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		if err := onChunk(engine.ToolCallBlockEndChunk(0, "call_1", "get_time", "{}")); err != nil {
+			return engine.Outcome{}, err
+		}
+		return engine.Outcome{ToolCalls: []engine.ToolCall{{ID: "call_1", Name: "get_time", Arguments: "{}"}}}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m","stream":true}`)
+
+	var sawCall bool
+	var args, id, name string
+	for _, f := range sseFrames(t, body) {
+		ch, ok := f["choices"].([]any)
+		if !ok || len(ch) == 0 {
+			continue
+		}
+		c := ch[0].(map[string]any)
+		d, _ := c["delta"].(map[string]any)
+		if d == nil {
+			continue
+		}
+		tc, ok := d["tool_calls"].([]any)
+		if !ok || len(tc) == 0 {
+			continue
+		}
+		call := tc[0].(map[string]any)
+		sawCall = true
+		id, _ = call["id"].(string)
+		fn, _ := call["function"].(map[string]any)
+		if fn != nil {
+			name, _ = fn["name"].(string)
+			args, _ = fn["arguments"].(string)
+		}
+	}
+	if !sawCall {
+		t.Fatalf("零参数调用必须以 tool_calls delta 帧出现在流上: %s", body)
+	}
+	if id != "call_1" || name != "get_time" || args != "{}" {
+		t.Fatalf("合成首帧应一次带齐 id/name/完整参数: id=%q name=%q args=%q", id, name, args)
+	}
+}
+
+func TestUnknownModelMapsTo400(t *testing.T) {
+	// I2:Failure.Status=400 的请求错误不该回 500 —— 客户端把「模型名写错」
+	// 当服务端故障去重试是纯浪费。400 之外的 Status 不透传(JS 差分 B7 的
+	// 500/502 约定不动)。
+	st := newStub()
+	st.complete = func(context.Context, engine.Request, func(engine.Chunk) error) (engine.Outcome, error) {
+		return engine.Outcome{}, frerrors.Failure{Code: check.CodeServer, Status: 400, Message: `unknown model "m"`}
+	}
+	ts := st.serve(t)
+	res, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m"}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %s", res.StatusCode, body)
 	}
 }

@@ -170,7 +170,7 @@ func tlsParams(params map[string]string, host string) *TLS {
 			return nil // reality 缺 pbk 无法测（freesub 同规则）：不给 tls 块，节点仍在
 		}
 		return &TLS{
-			Enabled:  BoolPtr(true),
+			Enabled:    BoolPtr(true),
 			ServerName: sni,
 			UTLS:       &UTLS{Enabled: true, Fingerprint: firstNonEmpty(params["fp"], "chrome")},
 			Reality:    &Reality{Enabled: true, PublicKey: pbk, ShortID: params["sid"]},
@@ -191,7 +191,7 @@ func tlsParams(params map[string]string, host string) *TLS {
 		return nil
 	}
 	t := &TLS{
-		Enabled:  BoolPtr(true),
+		Enabled:    BoolPtr(true),
 		ServerName: sni,
 		Insecure:   BoolPtr(params["insecure"] == "1" || params["allowInsecure"] == "1"),
 	}
@@ -286,11 +286,11 @@ func parseVmess(uri string) *Outbound {
 	switch t := data["tls"].(type) {
 	case string:
 		if t == "tls" || t == "1" {
-			ob.TLS = &TLS{Enabled:  BoolPtr(true), ServerName: strings.TrimSpace(firstNonEmpty(str(data["sni"]), str(data["host"]), server))}
+			ob.TLS = &TLS{Enabled: BoolPtr(true), ServerName: strings.TrimSpace(firstNonEmpty(str(data["sni"]), str(data["host"]), server))}
 		}
 	case bool:
 		if t {
-			ob.TLS = &TLS{Enabled:  BoolPtr(true), ServerName: strings.TrimSpace(firstNonEmpty(str(data["sni"]), str(data["host"]), server))}
+			ob.TLS = &TLS{Enabled: BoolPtr(true), ServerName: strings.TrimSpace(firstNonEmpty(str(data["sni"]), str(data["host"]), server))}
 		}
 	}
 	params := map[string]string{
@@ -320,7 +320,7 @@ func parseTrojan(uri string) *Outbound {
 		ServerPort: atoi(m[3]),
 		Password:   decodeSafe(m[1]),
 		TLS: &TLS{
-			Enabled:  BoolPtr(true),
+			Enabled:    BoolPtr(true),
 			ServerName: firstNonEmpty(params["sni"], server),
 			Insecure:   BoolPtr(params["insecure"] == "1" || params["allowInsecure"] == "1"),
 		},
@@ -421,7 +421,7 @@ func parseHysteria2(uri string) *Outbound {
 		Type: "hysteria2", Server: server, ServerPort: atoi(m[2]),
 		Password: decodeSafe(auth),
 		TLS: &TLS{
-			Enabled:  BoolPtr(true),
+			Enabled:    BoolPtr(true),
 			ServerName: firstNonEmpty(params["sni"], params["peer"], server),
 			Insecure:   BoolPtr(params["insecure"] == "1" || params["allowInsecure"] == "1"),
 		},
@@ -477,7 +477,7 @@ func parseTuic(uri string) *Outbound {
 		UUID:     decodeSafe(parts[0]),
 		Password: decodeSafe(parts[1]),
 		TLS: &TLS{
-			Enabled:  BoolPtr(true),
+			Enabled:    BoolPtr(true),
 			ServerName: firstNonEmpty(params["sni"], server),
 			Insecure:   BoolPtr(params["allow_insecure"] == "1" || params["insecure"] == "1"),
 			ALPN:       splitFilterEmpty(firstNonEmpty(params["alpn"], "h3"), ","),
@@ -512,7 +512,7 @@ func parseAnytls(uri string) *Outbound {
 		Type: "anytls", Server: server, ServerPort: atoi(m[3]),
 		Password: decodeSafe(m[1]),
 		TLS: &TLS{
-			Enabled:  BoolPtr(true),
+			Enabled:    BoolPtr(true),
 			ServerName: firstNonEmpty(params["sni"], server),
 			// JS parseAnytls 读的是 allowInsecure（驼峰，src/parse-links.js:438），
 			// 不是 tuic 那条车道的 allow_insecure —— 拼错一个字母,同一个链接在

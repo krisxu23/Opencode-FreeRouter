@@ -13,8 +13,11 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
+	"freerouter/internal/check"
 	"freerouter/internal/health"
 	"freerouter/internal/logger"
 	"freerouter/internal/panel"
@@ -56,6 +59,58 @@ func (p *Parts) now() time.Time {
 
 func (p *Parts) nowMS() int64 { return p.now().UnixMilli() }
 
+// pendingWG 是一个**任何时刻 add 都安全**的 WaitGroup 替身。sync.WaitGroup 的
+// 铁律是「计数为 0 时 Add 不得与 Wait 并发」,而面板动作 goroutine 不经任何
+// 排队就能 add —— 关停的 wait 与 handler 里的 add 构成 misuse(panic 或漏等,
+// W13)。这里用 mutex + 计数 + zero 通道实现:add 永远合法,wait 只认
+// 「计数归零」这一事件,done 的 close 让等待者醒来重查。
+type pendingWG struct {
+	mu   sync.Mutex
+	n    int
+	zero chan struct{}
+}
+
+func (w *pendingWG) add() {
+	w.mu.Lock()
+	w.n++
+	w.mu.Unlock()
+}
+
+func (w *pendingWG) done() {
+	w.mu.Lock()
+	w.n--
+	if w.n == 0 && w.zero != nil {
+		close(w.zero)
+		w.zero = nil
+	}
+	w.mu.Unlock()
+}
+
+// wait 等计数归零;ctx 取消时提前返回(不保证已归零 —— 与旧 Shutdown 的
+// 「带超时 Wait」同语义)。
+func (w *pendingWG) wait(ctx context.Context) {
+	for {
+		w.mu.Lock()
+		if w.n == 0 {
+			w.mu.Unlock()
+			return
+		}
+		if w.zero == nil {
+			w.zero = make(chan struct{})
+		}
+		z := w.zero
+		w.mu.Unlock()
+		select {
+		case <-z:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// Wait 保留 sync.WaitGroup 的方法形状,测试的裸 Wait() 因此零改动。
+func (w *pendingWG) Wait() { w.wait(context.Background()) }
+
 // timerSlot 是 p.timers 的一格。所有字段只在 p.timersMu 下读写。
 //
 // 三个位而不是一个 *time.Timer,是因为「谁负责归还 timersWG 计数」有三种终局:
@@ -87,7 +142,7 @@ type timerSlot struct {
 // slot 在排程之前就进表,回调按格摘除,attach 时若发现这一格已被摘掉(回调跑过
 // 或已被关停停掉)就不再登记;关停之后排程的一律当场 Stop,绝不留悬格。
 func (p *Parts) afterFunc(d time.Duration, fn func()) *time.Timer {
-	p.timersWG.Add(1)
+	p.timersWG.add()
 	slot := &timerSlot{}
 	p.timersMu.Lock()
 	p.timers = append(p.timers, slot)
@@ -95,7 +150,7 @@ func (p *Parts) afterFunc(d time.Duration, fn func()) *time.Timer {
 	p.timersMu.Unlock()
 
 	wrapped := func() {
-		defer p.timersWG.Done()
+		defer p.timersWG.done()
 		p.timersMu.Lock()
 		slot.fired = true
 		p.dropTimerLocked(slot)
@@ -106,7 +161,7 @@ func (p *Parts) afterFunc(d time.Duration, fn func()) *time.Timer {
 	var t *time.Timer
 	if closed {
 		// 关停已经收过表:这一发排下去也没人再停它,直接判为不再跑。
-		p.timersWG.Done()
+		p.timersWG.done()
 		p.timersMu.Lock()
 		p.dropTimerLocked(slot)
 		p.timersMu.Unlock()
@@ -179,13 +234,11 @@ func (p *Parts) stopPendingTimers() {
 		}
 		if slot.t.Stop() {
 			// Stop 抢到在回调之前:这一格的 Done 由这里归还。
-			p.timersWG.Done()
+			p.timersWG.done()
 		}
 	}
 }
 
-// wait 返回一个在 d 后闭合的通道。probeTicker 间隔每轮重读
-// (面板改 probeIntervalMin 立即生效),所以是逐轮 wait 而不是固定 Ticker。
 // wait 返回一个在 d 后闭合的通道。probeTicker 间隔每轮重读
 // (面板改 probeIntervalMin 立即生效),所以是逐轮 wait 而不是固定 Ticker。
 // waitFn 是测试接缝:注入后三个循环的节拍完全由测试驱动。
@@ -238,9 +291,9 @@ func (p *Parts) StartTimers(ctx context.Context) {
 	life := p.lifeCtx
 
 	if p.firstFetch != nil {
-		p.timersWG.Add(1)
+		p.timersWG.add()
 		go func() {
-			defer p.timersWG.Done()
+			defer p.timersWG.done()
 			select {
 			case <-life.Done():
 				return
@@ -250,9 +303,9 @@ func (p *Parts) StartTimers(ctx context.Context) {
 			p.probeLoop(life)
 		}()
 
-		p.timersWG.Add(1)
+		p.timersWG.add()
 		go func() {
-			defer p.timersWG.Done()
+			defer p.timersWG.done()
 			select {
 			case <-life.Done():
 				return
@@ -261,12 +314,13 @@ func (p *Parts) StartTimers(ctx context.Context) {
 			p.rebuildLoop(life)
 		}()
 	} else {
-		p.timersWG.Add(2)
-		go func() { defer p.timersWG.Done(); p.probeLoop(life) }()
-		go func() { defer p.timersWG.Done(); p.rebuildLoop(life) }()
+		p.timersWG.add()
+		go func() { defer p.timersWG.done(); p.probeLoop(life) }()
+		p.timersWG.add()
+		go func() { defer p.timersWG.done(); p.rebuildLoop(life) }()
 	}
-	p.timersWG.Add(1)
-	go func() { defer p.timersWG.Done(); p.limitsLoop(life) }()
+	p.timersWG.add()
+	go func() { defer p.timersWG.done(); p.limitsLoop(life) }()
 }
 
 // warmUp 是开场订阅落定与周期循环之间的那段:刷新模型目录,并在 firstProbeDelay
@@ -282,9 +336,9 @@ func (p *Parts) warmUp(ctx context.Context) {
 	// 首探的定时器先挂上,再刷目录。原先 refreshCatalog 同步跑在定时器之前,而它
 	// 最坏要等 3 个节点出口各 20s 再加直连 12s(约 72s),期间 StartTimers 里紧跟
 	// 其后的 probeLoop 也被一并挡住 —— 面板因此在开机后一分多钟里什么都不显示。
-	p.timersWG.Add(1)
+	p.timersWG.add()
 	go func() {
-		defer p.timersWG.Done()
+		defer p.timersWG.done()
 		select {
 		case <-ctx.Done():
 			return
@@ -294,9 +348,9 @@ func (p *Parts) warmUp(ctx context.Context) {
 		// —— 首探是尽力而为,排队只会让它变成紧接着的第二轮全量实测。
 		_, _ = p.ProbeNow(ctx, false)
 	}()
-	p.timersWG.Add(1)
+	p.timersWG.add()
 	go func() {
-		defer p.timersWG.Done()
+		defer p.timersWG.done()
 		p.refreshCatalog(ctx)
 	}()
 }
@@ -385,14 +439,15 @@ func (p *Parts) Status() any {
 		okValue = lastOK
 	}
 
+	outs := p.Registry.All()
 	singbox := map[string]any{
 		"running": true, // 零端口架构:sing-box 与本进程同生死,进程在即 running
 		"pid":     os.Getpid(),
 		"lastCheck": map[string]any{
 			"ok":        okValue,
 			"dropped":   dropped,
-			"nodes":     p.Registry.Len(), // 前端 checkAlert 的「N 个节点正常启用」读它
-			"probation": p.probationCount(),
+			"nodes":     len(outs), // 前端 checkAlert 的「N 个节点正常启用」读它
+			"probation": p.Registry.ProbationCount(),
 			"at":        lastRebuildAt,
 			"mode":      mode,
 			"error":     lastErr,
@@ -435,8 +490,8 @@ func (p *Parts) Status() any {
 	// 架构没有 per-node 端口,NodeRow 不带 port(节点表的 port 列恒显示 —,
 	// 这是任务 23 登记过的已知差异)。
 	snap := p.Health.NodeSnapshot()
-	nodes := make([]any, 0, p.Registry.Len())
-	for _, o := range p.Registry.All() {
+	nodes := make([]any, 0, len(outs))
+	for _, o := range outs {
 		row := map[string]any{
 			"tag":       o.Tag,
 			"country":   parse.CountryOf(o.Tag),
@@ -500,10 +555,15 @@ func (p *Parts) usageView() map[string]any {
 	if !ok {
 		todayBucket = stats.Bucket{}
 	}
+	byExit := snap.Exits
+	if byExit == nil {
+		byExit = map[string]stats.Bucket{}
+	}
 	return map[string]any{
 		"today":    todayBucket,
 		"requests": snap.Requests,
 		"byModel":  snap.Models,
+		"byExit":   byExit,
 		"history":  history,
 	}
 }
@@ -564,6 +624,7 @@ func (p *Parts) SettingsView() map[string]any {
 		"defaultMaxTokens": s.DefaultMaxTokens,
 		"forwardPort":      s.ForwardPort,
 		"panelPort":        s.PanelPort,
+		"maxWallClockMs":   s.MaxWallClockMS,
 	}
 }
 
@@ -587,6 +648,18 @@ func (p *Parts) ApplySettings(patch map[string]any) (Settings, error) {
 	clean, err := validateSettingsPatch(patch)
 	if err != nil {
 		return p.settingsSnapshot(), err
+	}
+	// 端口字段的改动要重启后生效(转发端口已绑定,运行中重绑会断在途连接),
+	// 而状态与 PanelURL 会立即报告新值、监听还留在旧端口上 —— 报告与事实
+	// 分裂:托盘「打开面板」连接拒绝,双开守卫误判「没在跑」。运行中直接
+	// 拒收端口补丁(值没变的重复保存不受影响),让设置页明确收到「改端口要
+	// 重启」的反馈。
+	cur := p.settingsSnapshot()
+	if v, ok := clean["forwardPort"]; ok && v.(int) != cur.ForwardPort {
+		return p.settingsSnapshot(), fmt.Errorf("app: 转发端口改动需重启进程后生效,本次未写入(当前 %d)", cur.ForwardPort)
+	}
+	if v, ok := clean["panelPort"]; ok && v.(int) != cur.PanelPort {
+		return p.settingsSnapshot(), fmt.Errorf("app: 面板端口改动需重启进程后生效,本次未写入(当前 %d)", cur.PanelPort)
 	}
 	// 候选校验:补丁 merge 进当前快照,先确认结果能被解成 Settings。类型
 	// 断言挡不住的组合(例如超大整数)在这里落网。
@@ -619,7 +692,7 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 	clean := map[string]any{}
 	for _, key := range []string{
 		"subUrls", "countries", "probeEnabled", "probeWorkers", "probeIntervalMin",
-		"effortLevel", "defaultMaxTokens", "forwardPort", "panelPort",
+		"effortLevel", "defaultMaxTokens", "forwardPort", "panelPort", "maxWallClockMs",
 	} {
 		v, ok := patch[key]
 		if !ok {
@@ -637,7 +710,26 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 				if !ok {
 					return nil, fmt.Errorf("app: 设置 %s 的元素必须是字符串", key)
 				}
+				if key == "countries" {
+					s = strings.ToUpper(strings.TrimSpace(s))
+				}
 				out = append(out, s)
+			}
+			if key == "countries" {
+				// countries 的取值域白名单:过去任意字符串都落盘进
+				// settings.json 并回流 __BOOT__ 与 GET /api/settings,而
+				// 设置页(旧版)对数组元素零转义 —— 后端白名单是那条注入面
+				// 的第二道闸。合法值就是 RegionGroups 的 8 个分组 id;未知
+				// 值报 400 而不是静默丢弃(B10 的纪律)。
+				valid := map[string]bool{}
+				for _, g := range check.RegionGroups {
+					valid[g] = true
+				}
+				for _, g := range out {
+					if !valid[g] {
+						return nil, fmt.Errorf("app: 设置 countries 含未知地区 %q(合法值:%s)", g, strings.Join(check.RegionGroups, "/"))
+					}
+				}
 			}
 			clean[key] = trimAll(out)
 		case "probeEnabled":
@@ -676,10 +768,34 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 			if n < 0 {
 				return nil, fmt.Errorf("app: 设置 %s 不能是负数", key)
 			}
-			if key == "forwardPort" || key == "panelPort" {
+			switch key {
+			case "forwardPort", "panelPort":
+				// 0 也不是合法值:listenAddr(0) 会绑一个随机端口,所有按
+				// 3457/3458 配置的客户端全部失联。
+				if n == 0 {
+					return nil, fmt.Errorf("app: 设置 %s 不能是 0", key)
+				}
 				if n > 65535 {
 					return nil, fmt.Errorf("app: 设置 %s 超出端口范围", key)
 				}
+			case "probeWorkers":
+				// HTML 的 max=256 只是提示,过去后端只拒负数:填 99999 会被
+				// 照单全收并在下一轮探测全量并发,把自己出口 IP 打成上游 429。
+				if n > 256 {
+					return nil, fmt.Errorf("app: 设置 probeWorkers 不能超过 256")
+				}
+			}
+			clean[key] = n
+		case "maxWallClockMs":
+			// 单轮请求的墙钟预算(毫秒),0 = 不限。这个字段一直存在
+			// (Settings.MaxWallClockMS)但面板进不去,「0 是什么意思」没有
+			// 任何地方可见 —— 现在暴露出来;负数按 0(不限)归一。
+			n, ok := settingsInt(v)
+			if !ok {
+				return nil, fmt.Errorf("app: 设置 maxWallClockMs 必须是整数")
+			}
+			if n < 0 {
+				n = 0
 			}
 			clean[key] = n
 		}

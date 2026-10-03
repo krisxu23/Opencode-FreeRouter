@@ -17,7 +17,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { ROOT, runGo, goEnv } from './go-build.mjs'
+import { TAGS, ROOT, runGo, goEnv } from './go-build.mjs'
 
 /** Layer -> package names. A package at layer n may import layer <= n. */
 // 修正案（docs/superpowers/plans/2026-10-01-plan-corrections.md §1）：
@@ -156,7 +156,10 @@ export async function checkGo() {
   for (const e of checkWebAssets()) errors.push(e)
 
   let vet = ''
-  try { vet = (await runGo(['vet', './...'], { env: goEnv() })).stdout } catch (e) { vet = String(e.stdout ?? e.message ?? e) }
+  // O19:vet 带上与构建/测试同一组 TAGS —— with_* 标签决定 include 注册哪些
+  // 协议代码,不带标签的 vet 从未编译过那些文件(与 go-test.mjs 头注释的
+  // 「测试必须同代码形状」同一理由)。
+  try { vet = (await runGo(['vet', '-tags', TAGS, './...'], { env: goEnv() })).stdout } catch (e) { vet = String(e.stdout ?? e.message ?? e) }
   for (const line of String(vet).split('\n')) if (line.trim()) errors.push(`go vet: ${line.trim()}`)
 
   return { errors: errors.length, warns: 0, lines: errors }

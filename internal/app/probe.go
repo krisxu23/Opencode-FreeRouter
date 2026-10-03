@@ -215,13 +215,22 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 	windowMS := p.cacheWindowMS()
 	aliveTags := make(map[string]bool, len(pool))
 	toProbe := make([]parse.Outbound, 0, len(pool))
+	// O32:窗口判定过去对每个节点各拿两次锁(ProbedWithin + HealthOf);一次
+	// 快照拿全,判据逐字等价(state 必须 alive/dead 才算「量过」,LastProbeAt
+	// 在窗口内)。
+	snap := p.Health.NodeSnapshot()
+	nowMS := p.nowMS()
 	for _, o := range pool {
-		if !force && p.Health.ProbedWithin(o.Tag, windowMS) {
-			summary.Cached++
-			if p.Health.HealthOf(o.Tag) == health.StateAlive {
-				aliveTags[o.Tag] = true
+		if view, ok := snap[o.Tag]; ok &&
+			(view.State == health.StateAlive || view.State == health.StateDead) &&
+			view.LastProbeAt > 0 && nowMS-view.LastProbeAt <= windowMS {
+			if !force {
+				summary.Cached++
+				if view.State == health.StateAlive {
+					aliveTags[o.Tag] = true
+				}
+				continue
 			}
-			continue
 		}
 		toProbe = append(toProbe, o)
 	}
@@ -269,12 +278,32 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 		items = append(items, nodeprobe.Item{Tag: o.Tag, Dial: d, Options: opts})
 	}
 
+	if len(items) == 0 {
+		// 所有候选的拨号器都构建失败:这一轮其实什么都没测。旧判据
+		// (Scanned>0 && alive==0) 会把这当成「探测源事故」打一行误导排障的
+		// 日志 —— 直连门通过说明本机没断网,但真相是本轮零测量。
+		logger.Warn(fmt.Sprintf("[app] 本轮没有可测节点：%d 个候选的拨号器全部构建失败 — 不淘汰、不判事故", len(toProbe)))
+		summary.MS = p.nowMS() - started
+		return summary, nil
+	}
 	summary.Tested = len(items)
 	probedTags := make(map[string]bool, len(items))
 	for _, it := range items {
 		probedTags[it.Tag] = true
 	}
 	results := p.Prober.ProbeAll(ctx, items, p.probeWorkers(len(items)))
+	if ctx.Err() != nil {
+		// C2(关键):取消发生在探测途中 —— 面板「立即探测」一轮要跑数分钟,
+		// 期间刷新/关页、或关停掐断了请求 ctx。此后的每个 shot 都会立刻失败、
+		// samples 恒为空,而 nodeprobe 的「量不到 = dead」判决加上下面无条件的
+		// MarkProbe 会把**整个池子**写成 dead 并落盘:pick 排除全部 dead,每个
+		// 请求 503,而且这些 dead 行在缓存窗口内被当「新鲜结论」跳过不重测,
+		// 故障持续到窗口过期。取消的一轮不产生任何结论:结果整体丢弃,
+		// 健康表与淘汰账原样保留。
+		logger.Info("probe round: 已取消（请求方离开或关停）— 整轮结果丢弃，健康表原样保留")
+		summary.MS = p.nowMS() - started
+		return summary, nil
+	}
 	// unknownTags 是 backstop 兜底点火的节点(本轮没量出来)。nodeprobe 的契约
 	// (nodeprobe.go:440-452)与 health.MarkProbe 都写着「拿到 unknown 应当跳过它
 	// 这一轮」:它既不是通关也不是判决。跳过在两个地方都要兑现 —— 记连败会
@@ -306,7 +335,7 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 	}
 	ratioHit := len(prevAlive) >= probeAccidentMin &&
 		float64(lostAlive)/float64(len(prevAlive)) > probeAccidentRate
-	zeroAlive := summary.Scanned > 0 && len(aliveTags) == 0
+	zeroAlive := summary.Tested > 0 && len(aliveTags) == 0
 	accident := ratioHit || zeroAlive
 	summary.Accident = accident
 	if ratioHit {
@@ -314,8 +343,8 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 			len(prevAlive), lostAlive,
 			float64(lostAlive)/float64(len(prevAlive))*100, probeAccidentRate*100))
 	} else if zeroAlive {
-		logger.Error(fmt.Sprintf("探测源疑似事故：本轮 %d 个节点 0 个通关（直连门已通过，说明不是本机断网）— 本轮不淘汰任何节点，保留现有池子",
-			summary.Scanned))
+		logger.Error(fmt.Sprintf("探测源疑似事故：本轮实测 %d 个节点 0 个通关（直连门已通过，说明不是本机断网）— 本轮不淘汰任何节点，保留现有池子",
+			summary.Tested))
 	}
 
 	// 计败:本轮真的测出结论、又没通关的节点各记一次。缓存跳过的不在此列 ——
@@ -431,7 +460,9 @@ func (p *Parts) runTierPipeline(ctx context.Context, items []nodeprobe.Item, res
 	var wg sync.WaitGroup
 	for _, tag := range alive {
 		if p.Health.TierOf(tag) == health.TierB {
-			gated.Add(1) // 已证 B:计入本轮新验数,但不重测
+			// 已证 B:不重测(稳态成本跟新增节点走),也**不计入**返回值 ——
+			// 日志字段是「本轮新验 B」,把存量也算进去会让面板数字虚高,
+			// 观察不到 B 档增长是否真的发生了。
 			continue
 		}
 		wg.Add(1)

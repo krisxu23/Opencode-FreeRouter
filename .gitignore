@@ -1,13 +1,18 @@
-node_modules/
-bin/
-data/
-runtime/
+# I30:锚定到仓库根。无锚定的 `data/`/`*.log` 会把「任何层级叫 data 的目录、
+# 任何 .log 文件」静默忽略掉 —— 未来某个 internal/*/testdata/ 下的夹具目录
+# 或测试日志会无声地进不了 git。
+/node_modules/
+/bin/
+/data/
+/runtime/
 *.exe
-*.log
-release/
+/release/
 
 # scratch of the differential harness (regenerable Go test binaries)
-difftest-tmp/
+/difftest-tmp/
+
+# 运行日志只出现在 data/ 里(锚定后通配 .log 不再安全,单列这一条)
+/data/*.log
 
 # 内部工作底稿与差分固件：只留本机，不公开。
 # scripts/diff-accept.mjs 是它们的唯一入口，所以同样不上库；

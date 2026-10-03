@@ -13,11 +13,13 @@ package main
 import (
 	"context"
 	_ "embed"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"freerouter/internal/app"
+	"freerouter/internal/logger"
 	"freerouter/internal/tray"
 )
 
@@ -72,6 +74,19 @@ func run(ctx context.Context, stop context.CancelFunc, root string) error {
 	}
 	parts.StartTimers(ctx)
 
+	// W11:信号桥。signal.NotifyContext 的 ctx 此前只被定时器与托盘回调消费
+	// —— tray.Run 完全不看 ctx,Ctrl+C/SIGTERM 之后探测/重建/限额三个循环
+	// 退场,但托盘、两个 HTTP server 与 sing-box 全部存活,Shutdown 永远不
+	// 执行:进程变成「维护冻结」的僵尸(转发还通,池子却无人补充,关停路径
+	// 的落盘与关 sing-box 一概不做)。桥回托盘的退出路径:先 Shutdown(与
+	// 托盘「退出」同一收尾,自身幂等,与并发点击 Quit 亦安全),再 Quit 让
+	// Run 返回、main 正常收场。
+	go func() {
+		<-ctx.Done()
+		_ = parts.Shutdown(context.Background())
+		tray.Quit()
+	}()
+
 	// Run blocks until the tray quits. The callbacks are plain closures over
 	// `parts` and `ctx` so that every one of them stays assertable in a test
 	// without an interactive desktop (see internal/tray.Options).
@@ -116,7 +131,17 @@ func buildOptions(icon []byte, gw gateway, ctx context.Context, stop context.Can
 		Tooltip:   "FreeRouter — 免费模型网关",
 		PanelURL:  gw.PanelURL,
 		OpenPanel: func() { openBrowser(gw.PanelURL()) },
-		Reload:    func() { _ = gw.Reload(ctx) },
+		// O15:Reload 最坏 72s+(3 出口×20s+直连 12s,还有补偿重试链),同步
+		// 跑在菜单回调 goroutine 里会把托盘菜单卡死一整段。后台跑 + 日志
+		// 反馈;Rebuild 自带重建互斥,连点安全。ctx 取消(正在退出)时的
+		// 失败静默 —— 那是退出,不是故障。
+		Reload: func() {
+			go func() {
+				if err := gw.Reload(ctx); err != nil && ctx.Err() == nil {
+					logger.Warn(fmt.Sprintf("[tray] 重启网关失败: %v", err))
+				}
+			}()
+		},
 		Quit: func() {
 			stop()
 			_ = gw.Shutdown(context.Background())

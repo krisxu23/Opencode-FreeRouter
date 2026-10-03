@@ -506,8 +506,11 @@ func TestPutSettingsRejectsOversizedBody(t *testing.T) {
 
 	huge := `{"subUrls":["` + strings.Repeat("a", 2<<20) + `"]}`
 	status, _, body := do(t, http.MethodPut, base+"/api/settings", huge)
-	if status != http.StatusInternalServerError {
-		t.Fatalf("PUT 2MB body = %d %s, want 500（与 src/panel.js 的顶层 catch 一致）", status, body)
+	// 413,不是 500:超限 body 是调用方自己的输入问题(JS 那边走顶层 catch
+	// 变 500 是 JS 的缺陷形状);500 会诱导调用方去重试同一个必然再超限的
+	// 请求。文案固定,不透传底层细节。
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("PUT 2MB body = %d %s, want 413", status, body)
 	}
 	if called != 0 {
 		t.Errorf("超限 body 仍然调了 ApplySettings %d 次", called)
@@ -553,8 +556,10 @@ func TestHandlerRecoversFromPanic(t *testing.T) {
 	if status != http.StatusInternalServerError {
 		t.Fatalf("panic 后 GET /api/status = %d %s, want 500", status, body)
 	}
-	if !strings.Contains(body, "boom-status") {
-		t.Errorf("500 的 body 应带上 panic 信息: %s", body)
+	// panic 详情只进日志,客户端拿固定文案:它可能携带请求内容或注入回调的
+	// 内部状态,回显给调用方是一次信息泄漏(与 forward 的顶层 recover 同纪律)。
+	if !strings.Contains(body, "panel request failed") || strings.Contains(body, "boom-status") {
+		t.Errorf("500 的 body 应是固定文案且不泄漏 panic 详情: %s", body)
 	}
 
 	// 服务必须继续收下一个请求。

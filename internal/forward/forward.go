@@ -26,9 +26,9 @@ import (
 	"strings"
 	"time"
 
-	frerrors "freerouter/internal/errors"
 	"freerouter/internal/check"
 	"freerouter/internal/engine"
+	frerrors "freerouter/internal/errors"
 	"freerouter/internal/logger"
 	"freerouter/internal/upstream"
 )
@@ -99,26 +99,38 @@ type Server struct {
 	http *http.Server
 }
 
-// serverReadHeaderTimeout / serverIdleTimeout 是两个服务器共用的收紧值(R1)。
+// serverReadHeaderTimeout / serverIdleTimeout / serverReadTimeout 是两个服务器
+// 共用的收紧值(R1 + 慢速 body 加固)。
 //
-// 只收紧这两项,不碰 ReadTimeout/WriteTimeout:转发端口要吐 SSE,一个正常
-// 回复可以吐几十秒,整请求死线会把它腰斩(那正是 httpclient.NewStreamClient
-// 存在的理由)。剩下的两个洞正好是 slowloris 的形状 —— 连上来不发头、或者
-// 发完一个请求就挂着不关 —— 这两项各堵一个。
+// ReadHeaderTimeout/IdleTimeout 堵的是 slowloris 的两个洞:连上来不发头、
+// 发完一个请求就挂着不关。这里补第三个洞:发头之后**无限慢速地喂 body** ——
+// maxBodyBytes 只限体积不限时间,io.ReadAll 没有时间约束,旧实现里一条连接
+// 可以被任意慢的 body 无限期占住。5 分钟对合法请求(8MB 上限)绰绰有余;
+// SSE 是写方向,不受读死线影响。
+//
+// 不设 WriteTimeout:转发端口要吐 SSE,整请求死线会把它腰斩(那正是
+// httpclient.NewStreamClient 存在的理由)。
 //
 // 与 JS 同源(forward.js:100 同样没设),但 JS 那边是 Node 默认值,Go 这边是
 // 零值即无限;修起来零成本,所以修。
 const (
 	serverReadHeaderTimeout = 10 * time.Second
 	serverIdleTimeout       = 60 * time.Second
+	serverReadTimeout       = 5 * time.Minute
 )
 
 // New 组装一个转发服务,此时还没有监听任何端口。
+//
+// ReadTimeout 是**两段式**的第一段:它只管「读体阶段」(防慢速喂 body 占住
+// 连接),readBody 读完就解除读死线再进入可能长时间写 SSE 的处理阶段 ——
+// 不解除的话,net/http 的后台读会在死线到期时取消请求 context,长回答的
+// SSE 一样会被腰斩(这正是 ReadTimeout 曾被钉死为 0 的原因)。
 func New(cfg Config) *Server {
 	s := &Server{cfg: cfg}
 	s.http = &http.Server{
 		Handler:           http.HandlerFunc(s.handle),
 		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
 		IdleTimeout:       serverIdleTimeout,
 	}
 	return s
@@ -178,6 +190,10 @@ func (w *writer) Flush() {
 	}
 }
 
+// Unwrap 让 http.NewResponseController 穿透包装、操作底层连接的读写死线
+// (readBody 在读体结束后用它解除 ReadTimeout,长流 SSE 因此不被腰斩)。
+func (w *writer) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // handle 是路由链本身。顺序即优先级,照 src/forward.js:108-146 逐条搬。
 //
 // 这里没用 http.ServeMux 的 Go 1.22 方法与通配符模式(计划步骤 3 的写法):
@@ -189,11 +205,12 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	rw := &writer{ResponseWriter: w}
 	defer func() {
 		// 顶层安全网(js :101-105):一个请求炸掉不该带走进程,也不该让
-		// 调用方收到一个裸断的连接。
+		// 调用方收到一个裸断的连接。panic 详情只进日志 —— 它可能携带请求
+		// 内容或内部状态,回给客户端的必须是固定文案。
 		if p := recover(); p != nil {
 			s.logf(fmt.Sprintf("request failed: %v", p))
 			if !rw.wrote {
-				openAIError(rw, http.StatusInternalServerError, "server_error", fmt.Sprint(p))
+				openAIError(rw, http.StatusInternalServerError, "server_error", "internal error")
 			}
 		}
 	}()
@@ -256,7 +273,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	openAIError(rw, http.StatusNotFound, "not_found_error", "no route for "+r.Method+" "+path)
 }
 
-// normalizePath 照 js :110 的 `pathname.replace(/\/+$/,'') || '/'`。
+// normalizePath 照 js :110 的 `pathname.replace(/\/+$/,”) || '/'`。
 func normalizePath(p string) string {
 	p = strings.TrimRight(p, "/")
 	if p == "" {
@@ -310,6 +327,10 @@ func GenerateKey() string {
 // 先比长度是必须的:长度不等本身就是答案,而 crypto/subtle 在长度不等时
 // 立刻返回 0 —— 那个提前返回会把「密钥有多长」变成可测的时序侧信道。所以
 // 这里先在 max(len) 长的填充副本上走完一次常数时间比较,再合并长度判据。
+//
+// 双方都为空返回 **false**(空密钥不匹配任何呈现,包括空呈现):GenerateKey
+// 坏熵源时返回空串并靠 authorized() 拒绝一切,这里的语义必须与之同向 ——
+// 返回 true 会成为一个陷阱默认,任何未来调用方拿空 expected 来比较都会全放行。
 func KeyMatches(presented, expected string) bool {
 	a, b := []byte(presented), []byte(expected)
 	n := len(a)
@@ -317,7 +338,7 @@ func KeyMatches(presented, expected string) bool {
 		n = len(b)
 	}
 	if n == 0 {
-		return true
+		return false
 	}
 	x := make([]byte, n)
 	y := make([]byte, n)
@@ -330,6 +351,9 @@ func KeyMatches(presented, expected string) bool {
 // readBody 读并解析请求体(js :66-76)。超限返回 413 —— JS 那边这条抛出的
 // Error 会走顶层 catch 变成 500,Go 版按计划改成 413:这是客户端错误,报 500
 // 会让调用方以为网关坏了而去重试同一个超大请求。
+//
+// 读取失败与 JSON 语法错误同为**客户端可修的** 4xx,错误文案用固定短语:
+// 底层错误原文(io 错误、语法偏移)属于内部细节,不回给调用方。
 func (s *Server) readBody(w *writer, r *http.Request) (map[string]any, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	raw, err := io.ReadAll(r.Body)
@@ -339,16 +363,20 @@ func (s *Server) readBody(w *writer, r *http.Request) (map[string]any, bool) {
 			openAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
 			return nil, false
 		}
-		openAIError(w, http.StatusInternalServerError, "server_error", err.Error())
+		openAIError(w, http.StatusBadRequest, "invalid_request_error", "could not read request body")
 		return nil, false
 	}
+	// 读体阶段到此结束:解除 ReadTimeout 设下的读死线,再进入可能长时间
+	// 写 SSE 的处理阶段(见 New 的两段式注释)。
+	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
 	if len(raw) == 0 {
 		return map[string]any{}, true
 	}
 	var parsed any
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		// JS 的 JSON.parse 抛错同样走顶层 catch → 500。
-		openAIError(w, http.StatusInternalServerError, "server_error", err.Error())
+		// JS 的 JSON.parse 抛错同样走顶层 catch → 500;客户端错误按 4xx 回,
+		// 调用方才不会把语法错误当成服务端故障去重试。
+		openAIError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
 		return nil, false
 	}
 	body, _ := parsed.(map[string]any)
@@ -376,6 +404,18 @@ func messageOf(err error) string {
 		return f.Message
 	}
 	return err.Error()
+}
+
+// statusOf 把错误映射成响应状态码。只采纳 400:unknown model 这类「调用方改
+// 一下模型名就能修好」的请求错误,回 500 会诱导它去重试。其余一律走 fallback
+// —— JS 差分 B7 的约定是 throw 路径恒 500/502,Failure.Status 携带的上游状态
+// (401 凭证、429 配额…)不改变这个映射:那是上游的事,不是调用方修得了的。
+func statusOf(err error, fallback int) int {
+	var f frerrors.Failure
+	if errors.As(err, &f) && f.Status == http.StatusBadRequest {
+		return f.Status
+	}
+	return fallback
 }
 
 func applyCORS(h http.Header) {
@@ -429,7 +469,7 @@ func marshalNoEscape(v any) ([]byte, error) {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
 
-// stringField 是 JS 的 `String(body.model ?? '')`:非字符串值也要能变成字符串。
+// stringField 是 JS 的 `String(body.model ?? ”)`:非字符串值也要能变成字符串。
 func stringField(body map[string]any, key string) string {
 	v, ok := body[key]
 	if !ok || v == nil {

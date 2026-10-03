@@ -16,6 +16,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -158,7 +159,7 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, s *sink) (Result, error
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, rerr := readAllCapped(resp.Body, maxBodyBytes)
+		raw, rerr := readAllPrefix(resp.Body, maxBodyBytes)
 		// A 400 naming a reasoning item the server no longer knows is not a
 		// client error: drop the server-issued references and replay once.
 		// Replaying unconditionally would double every genuine 400, and a
@@ -250,7 +251,7 @@ func (a *Adapter) replay(ctx context.Context, t *turn, s *sink, status int, raw 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		replayRaw, replayRErr := readAllCapped(resp.Body, maxBodyBytes)
+		replayRaw, replayRErr := readAllPrefix(resp.Body, maxBodyBytes)
 		return s.result(), classifyErrorBody(resp.StatusCode, replayRaw, replayRErr,
 			errors.RetryAfter(resp.Header.Get("Retry-After")))
 	}
@@ -410,7 +411,7 @@ func (a *Adapter) readReply(resp *http.Response, t *turn, s *sink) error {
 	if headSSERe.Match(head) || (!headJSONRe.Match(head) && strings.Contains(resp.Header.Get("Content-Type"), "event-stream")) {
 		return a.readSSE(body, t, s)
 	}
-	raw, readErr := readAllCapped(body, maxBodyBytes)
+	raw, readErr := readAllPrefix(body, maxBodyBytes)
 	if readErr != nil {
 		return bodyReadFailure(readErr)
 	}
@@ -461,9 +462,100 @@ func (a *Adapter) readJSON(raw []byte, status int, retryAfter int64, t *turn, s 
 		}
 		// 走 sink 而不是直接回调:正文增量也得进 SawText 的账,否则一条合法的
 		// 非流式回复会被上层判成「空响应」。
-		return s.text("t", text)
+		if err := s.text("t", text); err != nil {
+			return err
+		}
+	}
+	// 非流式整包里的工具调用同样要补齐(过去只补了正文):feed 只处理 delta
+	// 形状,整包回复里的 message.tool_calls / tool_use / function_call 会被
+	// 丢光 —— 调用方拿到一条带 finish 的回复却没有任何可执行的调用。经 sink
+	// 投影,start 记 SawToolCall 的账、closeAll 的 block-end 帧把参数交出去。
+	for i, call := range fullToolCallsOf(p, a.deps.Wire) {
+		key := "j" + strconv.Itoa(i)
+		s.toolStart(key, call.ID, upstream.RestoreToolName(call.Name, s.renames))
+		if call.Arguments != "" {
+			if err := s.toolArgs(key, call.Arguments); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// fullToolCall 是从非流式 JSON 里取出的一个完整工具调用。
+type fullToolCall struct{ ID, Name, Arguments string }
+
+// fullToolCallsOf 从非流式 JSON 里取出全部工具调用(逐线形状;feed 只处理
+// delta 形状,这是它的非流式补集)。Arguments 统一成 JSON 文本:chat/responses
+// 线上本来就是字符串,claude 的 input 是对象,序列化一次。没有 id 也没有名字
+// 的条目是畸形数据,跳过。
+func fullToolCallsOf(p map[string]any, wire upstream.Wire) []fullToolCall {
+	var calls []fullToolCall
+	appendCall := func(id, name, args string) {
+		if name == "" && id == "" {
+			return
+		}
+		calls = append(calls, fullToolCall{ID: id, Name: name, Arguments: args})
+	}
+	switch wire {
+	case upstream.WireChat:
+		choices, _ := p["choices"].([]any)
+		for _, choice := range choices {
+			cm, ok := choice.(map[string]any)
+			if !ok {
+				continue
+			}
+			msg, _ := cm["message"].(map[string]any)
+			if msg == nil {
+				continue
+			}
+			list, _ := msg["tool_calls"].([]any)
+			for _, raw := range list {
+				call, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				fn, _ := call["function"].(map[string]any)
+				id, _ := call["id"].(string)
+				name, _ := fn["name"].(string)
+				args, _ := fn["arguments"].(string)
+				appendCall(id, name, args)
+			}
+		}
+	case upstream.WireMessages:
+		blocks, _ := p["content"].([]any)
+		for _, block := range blocks {
+			bm, ok := block.(map[string]any)
+			if !ok || bm["type"] != "tool_use" {
+				continue
+			}
+			id, _ := bm["id"].(string)
+			name, _ := bm["name"].(string)
+			args := "{}"
+			if input, has := bm["input"]; has && input != nil {
+				if b, err := json.Marshal(input); err == nil {
+					args = string(b)
+				}
+			}
+			appendCall(id, name, args)
+		}
+	default: // responses
+		items, _ := p["output"].([]any)
+		for _, item := range items {
+			im, ok := item.(map[string]any)
+			if !ok || im["type"] != "function_call" {
+				continue
+			}
+			id, _ := im["call_id"].(string)
+			if id == "" {
+				id, _ = im["id"].(string)
+			}
+			name, _ := im["name"].(string)
+			args, _ := im["arguments"].(string)
+			appendCall(id, name, args)
+		}
+	}
+	return calls
 }
 
 // feed 是三条线共用的逐帧投影入口:认错误帧、锚 TTFT、折 usage,然后把这一帧
@@ -750,7 +842,11 @@ func snippet(raw []byte) string {
 	return string(raw)
 }
 
-// readAllCapped 读至多 limit 字节(计划:非 2xx 响应体封顶 1MB)。
-func readAllCapped(r io.Reader, limit int64) ([]byte, error) {
+// readAllPrefix 读**前缀**:至多 limit 字节,超出的部分静默丢弃、不报错
+// (非 2xx 响应体封顶 1MB —— 失败路径要的是错误信封,不是整个响应体)。
+// 与 httpclient.ReadCapped(严格模式:超限一个字节就报错)语义不同、名字相近
+// 曾是误用陷阱,改名以示区分:前缀用于「只需要开头就能分类」的场合,严格版
+// 用于「多读一个字节都算违约」的场合。
+func readAllPrefix(r io.Reader, limit int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, limit))
 }

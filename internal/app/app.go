@@ -181,7 +181,10 @@ type Parts struct {
 	clockFn     func() time.Time
 	afterFuncFn func(time.Duration, func()) *time.Timer
 	waitFn      func(time.Duration) <-chan time.Time
-	timersWG    sync.WaitGroup
+	// timersWG 是待触发定时器与面板动作的计数。必须是 pendingWG 而不是
+	// sync.WaitGroup:面板 handler 不经 Stop 也能 add,「计数归零后的并发
+	// Add」对 WaitGroup 是 panic 级的 misuse(B9 审计 W13)。
+	timersWG pendingWG
 }
 
 // egressGeneration 是当前出站代数。bump 点只有两处:rebuild.go 的周期重建与开场
@@ -274,6 +277,10 @@ func Load(root string) (*Parts, error) {
 	if err := probeWritable(dataDir); err != nil {
 		return nil, err
 	}
+	// 顺手清掉上次进程崩溃遗留的原子写临时文件(写入中途被杀没有任何清理
+	// 路径,长期会慢慢攒出一堆 *.tmp)。超过一天的才删:它们不可能是任何
+	// 一笔还在进行的写入。
+	persistence.RemoveStaleTemp(dataDir, 24*time.Hour)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var closers []func() error
@@ -447,10 +454,11 @@ func Load(root string) (*Parts, error) {
 		},
 		// RecordUsage:base id 由引擎给到(stream.Usage 是 harness 形状,
 		// In 已是未缓存净输入 —— 任务 21 的 a471bcf 裁决)。
-		RecordUsage: func(model string, u stream.Usage) {
+		RecordUsage: func(model, exit string, u stream.Usage) {
 			statStore.Record(stats.Record{
 				At:     time.Now().UnixMilli(),
 				Model:  model,
+				Exit:   exit,
 				OK:     true,
 				Input:  u.In,
 				Output: u.Out,
@@ -587,8 +595,11 @@ func Load(root string) (*Parts, error) {
 			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
 		}
 		syncAdded, syncRemoved, serr := host.SyncOutbounds(reg.All())
-		if serr == nil {
-			// 出站换了代:旧代 client 里绑的是上一代的拨号闭包(O3)。
+		if serr == nil && (syncAdded != 0 || syncRemoved != 0) {
+			// 出站换了代:旧代 client 里绑的是上一代的拨号闭包(O3)。零增删
+			// 的 sync 是纯 no-op(SyncOutbounds 对已存在的 tag 不 Remove 不
+			// 重建,旧 client 的拨号闭包依然有效),换代只会白扔全部出口的
+			// 温热连接池 —— 与 noteEgressChanged 注释声明的语义一致。
 			parts.noteEgressChanged()
 		}
 		if dropped > 0 {
@@ -661,7 +672,13 @@ func Load(root string) (*Parts, error) {
 			return parts.SettingsView(), nil
 		},
 		Actions: panel.PanelActions{
+			// 三个动作都先在 pending 计数上记一笔:它们内部会经 afterFunc 排
+			// 定延时回调,而 handler goroutine 本身不在任何计数里 —— 不记的
+			// 话,关停的 timersWG.wait 与 handler 里的 add 构成
+			// 「计数归零后并发 Add」的 WaitGroup 使用违例(misuse panic)。
 			ProbeNow: func(ctx context.Context, force bool) error {
+				parts.timersWG.add()
+				defer parts.timersWG.done()
 				_, err := parts.ProbeNow(ctx, force)
 				return err
 			},
@@ -669,8 +686,16 @@ func Load(root string) (*Parts, error) {
 			// 限额刷新自带单次超时,都不需要外层取消。但根必须是 lifeCtx
 			// 而不是 context.Background()(B9):面板上的手动刷新一旦发生在
 			// 关停之后,不能再以全新 context 重入重建、继续写注册表。
-			Refresh:       func() error { return parts.Rebuild(parts.ctx()) },
-			RefreshLimits: func() error { return parts.refreshLimitsOverlay(parts.ctx()) },
+			Refresh: func() error {
+				parts.timersWG.add()
+				defer parts.timersWG.done()
+				return parts.Rebuild(parts.ctx())
+			},
+			RefreshLimits: func() error {
+				parts.timersWG.add()
+				defer parts.timersWG.done()
+				return parts.refreshLimitsOverlay(parts.ctx())
+			},
 		},
 		Logs:        logger.Recent,
 		RouteRecent: tracelog.Recent,
@@ -713,30 +738,26 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 			p.cancel()
 		}
 		p.stopPendingTimers()
+		// 面板服务先关:面板动作(探测/刷新)以请求 ctx 运行,不掐断连接它们
+		// 会跑完整轮(数分钟)才返回,下面的 wait 就要把退出拖住那么久。Close
+		// 会取消在途 handler 的 ctx,探测轮随即中止(probe.go 的取消守卫整轮
+		// 丢弃,健康表原样保留)。
+		if p.Panel != nil {
+			_ = p.Panel.Close()
+		}
+		if p.panelLn != nil {
+			_ = p.panelLn.Close()
+		}
 		if ctx != nil {
-			done := make(chan struct{})
-			go func() {
-				p.timersWG.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-ctx.Done():
-			}
+			p.timersWG.wait(ctx)
 		} else {
-			p.timersWG.Wait()
+			p.timersWG.wait(context.Background())
 		}
 		if p.Forward != nil {
 			_ = p.Forward.Close()
 		}
 		if p.forwardLn != nil {
 			_ = p.forwardLn.Close()
-		}
-		if p.Panel != nil {
-			_ = p.Panel.Close()
-		}
-		if p.panelLn != nil {
-			_ = p.panelLn.Close()
 		}
 		// Flush before closing the host: an exit that is still in the registry
 		// must survive the restart even though its socket just went away.

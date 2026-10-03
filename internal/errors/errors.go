@@ -121,10 +121,23 @@ func Classify(status int, body []byte, retryAfterMS int64) Failure {
 
 // RetryAfter 把 Retry-After 头解析成毫秒。只认数字形式 —— 这家供应商从不发
 // HTTP-date 形式。非正数返回 0(不是 -1),所有调用方统一用 "> 0" 判断。
+//
+// 提示值封顶在 retryAfterMaxMS:NoteCooldown 对 hinted 退避不做二次截断,一个
+// 行为异常(或被劫持)的出口回 `Retry-After: 1e18` 就能把该出口冷却到
+// 「实质永久」且永不自愈。10 分钟与一次探测窗口同量级,足够让上游的退避意图
+// 生效,又保证出口总有机会被重新实测。
+const (
+	retryAfterMaxSecs = 600
+	retryAfterMaxMS   = retryAfterMaxSecs * 1000
+)
+
 func RetryAfter(h string) int64 {
 	secs, err := strconv.ParseFloat(h, 64)
 	if err != nil || secs <= 0 {
 		return 0
+	}
+	if secs >= retryAfterMaxSecs {
+		return retryAfterMaxMS
 	}
 	return int64(secs * 1000)
 }

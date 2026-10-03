@@ -105,7 +105,7 @@ func Fetch(ctx context.Context, sources []string, exits []Exit) (Result, error) 
 		return Result{}, errors.New("no subscription sources configured")
 	}
 
-	direct := httpclient.NewClient(nil, attemptTimeout)
+	direct := subHTTPClient(nil)
 	raw := make([][]parse.Outbound, len(list)) // nil = 该源还没成功
 	details := make([]Detail, len(list))
 
@@ -146,7 +146,7 @@ func Fetch(ctx context.Context, sources []string, exits []Exit) (Result, error) 
 				if ex.Dial == nil {
 					continue
 				}
-				exitClients[j] = httpclient.NewClient(ex.Dial, attemptTimeout)
+				exitClients[j] = subHTTPClient(ex.Dial)
 			}
 		}
 		for j := range exits {
@@ -211,6 +211,29 @@ func Fetch(ctx context.Context, sources []string, exits []Exit) (Result, error) 
 // fetchOne 拉一个源并解析。extra 是出口身份头（仅第二轮复拉时携带）。
 // 对 2xx 之外的状态码、以及"一个节点都没认出来"的响应体，都按源失败处理
 // （JS: `if (!r.ok) throw` / `if (!outbounds.length) throw`），不中断其它源。
+// subHTTPClient 是订阅拉取专用 client:重定向策略收紧到同 scheme、不落
+// 本机/私网地址,最多 3 跳。Go 默认策略是 10 跳跟随到任意 http/https 主机
+// (含 127.0.0.1 与内网) —— 一个不可信的订阅服务器回 302 就能把拉取器变成
+// 内网触探器,Detail.Error 的文案差异("HTTP 404" vs 「没有识别出任何节点」)
+// 还能当内网端口/服务存在性的侧信道。nodeprobe 的 client 早就这么设了,
+// 订阅这条车道是漏网之鱼。
+func subHTTPClient(dial httpclient.Dialer) *http.Client {
+	c := httpclient.NewClient(dial, attemptTimeout)
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("重定向超过 3 跳")
+		}
+		if len(via) > 0 && req.URL.Scheme != via[0].URL.Scheme {
+			return fmt.Errorf("重定向跨 scheme(%s → %s)", via[0].URL.Scheme, req.URL.Scheme)
+		}
+		if parse.IsUnroutableServer(req.URL.Hostname()) {
+			return fmt.Errorf("重定向指向不可路由地址 %s", req.URL.Host)
+		}
+		return nil
+	}
+	return c
+}
+
 func fetchOne(ctx context.Context, c *http.Client, url string, extra map[string]string) ([]parse.Outbound, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // pathLockShards is the number of mutexes guarding atomic replacement, hashed
@@ -96,6 +97,14 @@ func WriteJSONFile(file string, v any, indent bool) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("persistence: 写临时文件 %s: %w", tmp, err)
 	}
+	// rename 前落盘页缓存:Windows 的 rename 元数据可以比数据先持久,掉电
+	// 时会出现「目标已被替换、内容却是空/截断」的文件 —— Store.Load 读到
+	// 损坏 JSON 会让网关拒绝启动。Sync 把数据先钉到盘上,再 rename。
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("persistence: 落盘 %s: %w", tmp, err)
+	}
 	// 先 Close 再 Rename：Windows 不允许改名一个仍被打开的句柄。
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
@@ -110,6 +119,31 @@ func WriteJSONFile(file string, v any, indent bool) error {
 		return fmt.Errorf("persistence: 替换 %s: %w", file, err)
 	}
 	return nil
+}
+
+// RemoveStaleTemp 清掉目录里超过 age 的 *.tmp(WriteJSONFile 崩溃现场的
+// 遗留)。写入中途被杀的进程没有任何清理路径,长期运行的实例会慢慢攒出一堆
+// 临时文件。返回删除的个数;只删 .tmp 后缀,绝不碰别的文件。启动路径调用。
+func RemoveStaleTemp(dir string, age time.Duration) int {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-age)
+	removed := 0
+	for _, e := range ents {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".tmp" {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil || fi.ModTime().After(cutoff) {
+			continue
+		}
+		if os.Remove(filepath.Join(dir, e.Name())) == nil {
+			removed++
+		}
+	}
+	return removed
 }
 
 // ReadJSONFile decodes file into out. A missing file reports fs.ErrNotExist so

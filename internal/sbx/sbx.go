@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -56,8 +57,8 @@ type Dialer = func(ctx context.Context, network, addr string) (net.Conn, error)
 // handed out, and a dialer that outlives its outbound is fine (the interface
 // value is copied out), but a torn tag map is not.
 type Host struct {
-	mu        sync.RWMutex
-	box       *boxpkg.Box
+	mu  sync.RWMutex
+	box *boxpkg.Box
 	// ctx 是 Start 时装饰过的 context：box.New 会在它身上注册 log factory、
 	// network manager 等服务，事后 Manager.Create 构建新出站时必须拿到同一个
 	// 实例——裸 context.Background() 会让 dialer.NewWithOptions 解引用空指针。
@@ -137,6 +138,10 @@ func (h *Host) Start(ctx context.Context, outs []parse.Outbound) error {
 		b, err := boxpkg.New(boxpkg.Options{Context: boxCtx, Options: opts})
 		if err == nil {
 			if err := b.Start(); err != nil {
+				// New 已在 ctx 上注册 log factory、network manager 等服务,
+				// Start 半途失败会把已启动的那部分服务留在进程里 —— Close
+				// 收掉,别让测试/嵌入场景泄漏 goroutine 与 fd。
+				_ = b.Close()
 				return fmt.Errorf("sbx: 启动: %w", err)
 			}
 			h.box = b
@@ -305,30 +310,44 @@ func (h *Host) DirectTag() string {
 // 单个出站构建失败只跳过并记日志（与 Start 同一语义）；Remove 失败说明
 // box 内部状态已经与账本不一致，这必须升级为 error。
 func (h *Host) SyncOutbounds(outs []parse.Outbound) (added, removed int, err error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.box == nil {
+	// O3:出站构建(JSON marshal + sing 上下文解码,数千节点是纯 CPU)在
+	// **锁外**做。过去整段坐在 h.mu 写锁里,热插期间所有 Dialer(tag) 的
+	// RLock 都被挡住、在途请求的拨号全部排队。锁内只做 Remove/Create 与
+	// 账目变更 —— 两段式快照 + 落锁复核,保证与并发的 Start/Close/其他
+	// Sync 不重复记账。
+	h.mu.RLock()
+	box := h.box
+	directTag := h.directTag
+	existing := make(map[string]struct{}, len(h.tags))
+	for tag := range h.tags {
+		existing[tag] = struct{}{}
+	}
+	h.mu.RUnlock()
+	if box == nil {
 		return 0, 0, fmt.Errorf("sbx: 尚未启动")
 	}
-	b := h.box
+
 	want := map[string]parse.Outbound{}
 	for _, o := range outs {
-		if o.Tag == "" || o.Tag == h.directTag {
+		if o.Tag == "" || o.Tag == directTag {
 			continue
 		}
 		want[o.Tag] = o
 	}
-	for tag := range h.tags {
+	var toRemove []string
+	for tag := range existing {
 		if _, keep := want[tag]; keep {
 			delete(want, tag)
 			continue
 		}
-		if err := b.Outbound().Remove(tag); err != nil {
-			return added, removed, fmt.Errorf("sbx: 移除 %s: %w", tag, err)
-		}
-		delete(h.tags, tag)
-		removed++
+		toRemove = append(toRemove, tag)
 	}
+	sort.Strings(toRemove) // map 无序:固定顺序让 Remove 的日志可复现
+	type pendingAdd struct {
+		tag string
+		ob  option.Outbound
+	}
+	var toAdd []pendingAdd
 	for tag, o := range want {
 		ob, err := makeOutbound(tag, o)
 		if err != nil {
@@ -337,13 +356,37 @@ func (h *Host) SyncOutbounds(outs []parse.Outbound) (added, removed int, err err
 			}
 			continue
 		}
-		if err := h.create(b, ob); err != nil {
+		toAdd = append(toAdd, pendingAdd{tag: tag, ob: ob})
+	}
+	sort.Slice(toAdd, func(i, j int) bool { return toAdd[i].tag < toAdd[j].tag })
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.box == nil {
+		return added, removed, fmt.Errorf("sbx: 尚未启动")
+	}
+	b := h.box
+	for _, tag := range toRemove {
+		if _, still := h.tags[tag]; !still {
+			continue // 快照之后已被并发路径摘掉:不重复记账
+		}
+		if err := b.Outbound().Remove(tag); err != nil {
+			return added, removed, fmt.Errorf("sbx: 移除 %s: %w", tag, err)
+		}
+		delete(h.tags, tag)
+		removed++
+	}
+	for _, it := range toAdd {
+		if _, exists := h.tags[it.tag]; exists {
+			continue // 快照之后已被并发路径装上:不重复 Create
+		}
+		if err := h.create(b, it.ob); err != nil {
 			if h.logf != nil {
-				h.logf("warn", fmt.Sprintf("sbx: 新增出站 %s 失败: %v", tag, err))
+				h.logf("warn", fmt.Sprintf("sbx: 新增出站 %s 失败: %v", it.tag, err))
 			}
 			continue
 		}
-		h.tags[tag] = struct{}{}
+		h.tags[it.tag] = struct{}{}
 		added++
 	}
 	return added, removed, nil

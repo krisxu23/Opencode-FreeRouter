@@ -29,14 +29,14 @@ var ErrIdleTimeout = stderrors.New("httpclient: stream idle past its deadline")
 // transport 建出两个客户端共用的手工 Transport。手工而不是克隆
 // http.DefaultTransport 的理由见 NewClient 的注释。
 func transport(d Dialer) *http.Transport {
+	// 每出口的空闲连接池。32 = 单请求 attemptCap(20)+ 并发余量:8 的旧值意味着
+	// 高并发打同一出口时第 9 条起新建、用完即弃,TCP+TLS 握手成本按请求数累加。
+	// transport 本来就是按出口建的(一个 client 一个池),所以每主机的上限与
+	// 总量取同一个数才是这里的语义(主机数恒为 1,Go 默认 2 的坑见 O3)。
 	tr := &http.Transport{
-		DialContext:  d,
-		MaxIdleConns: 8,
-		// 每主机的空闲上限必须显式给(Go 默认 2,O3):一个出口背后就是同一个
-		// host,2 条意味着高并发下第三条起新建、用完即弃,握手成本按请求数累加。
-		// transport 本来就是按出口建的(一个 client 一个池),所以每主机的上限
-		// 与总量取同一个数才是这里的语义。
-		MaxIdleConnsPerHost:   8,
+		DialContext:           d,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
@@ -64,6 +64,16 @@ func transport(d Dialer) *http.Transport {
 // a 40-second answer is normal there, and a whole-request deadline kills it.
 func NewClient(d Dialer, timeout time.Duration) *http.Client {
 	return &http.Client{Transport: transport(d), Timeout: timeout}
+}
+
+// NewOneShotClient 是 NewClient 的单发变体:DisableKeepAlives 让连接在响应
+// 结束后立刻关闭,不留空闲连接慢慢等 IdleConnTimeout。给探测这类「每发一个
+// 全新 client」的调用方用 —— 一轮数千个 shot 各自留下 ≤1 条空闲连接,就是
+// 探测期的瞬时 fd 尖峰(O4)。
+func NewOneShotClient(d Dialer, timeout time.Duration) *http.Client {
+	c := NewClient(d, timeout)
+	c.Transport.(*http.Transport).DisableKeepAlives = true
+	return c
 }
 
 // NewStreamClient returns a client for streaming upstream turns. It differs
@@ -169,14 +179,27 @@ func (r *idleReader) Read(p []byte) (int, error) {
 	n, err := r.body.Read(p)
 	r.mu.Lock()
 	expired := r.done
-	if !expired && r.t != nil && err == nil {
-		// 收到数据就续期（js http.js:235 的 deadline = Date.now() + timeoutMs）。
-		r.t.Reset(r.idle)
+	if !expired && r.t != nil {
+		switch {
+		case err == nil:
+			// 收到数据就续期（js http.js:235 的 deadline = Date.now() + timeoutMs）。
+			r.t.Reset(r.idle)
+		case stderrors.Is(err, io.EOF):
+			// 读完了:停表。旧实现让计时器以剩余时间继续跑满整个 idle 窗口,
+			// 期间 expire() 会对已读完的 body 再做一次 Close、把 r 钉在
+			// timer 里 —— 无功能损害,但生命周期不对称,Close 路径有的
+			// 收尾 EOF 路径没有。
+			r.t.Stop()
+		}
 	}
 	r.mu.Unlock()
-	if err != nil && expired {
-		// 底层是「读到一半被关掉」的形状，对调用方要的是「空闲超时」这个语义。
-		return n, ErrIdleTimeout
+	if expired && err != nil && n == 0 {
+		// 底层是「读到一半被关掉」的形状,对调用方要的是「空闲超时」这个语义。
+		// 只覆盖**没有数据**的读:transport 缓冲里最后一块数据与 EOF 同帧返回
+		// 时(err != nil 且 n > 0),一条已完整读完的流若恰逢计时器先到,会被
+		// 误报成 TIMEOUT —— adapter 把它翻译成可重试可冷却的 TIMEOUT,换出口
+		// 重放整轮并错误冷却一个好出口。有数据的最后一次读必须先把数据交出去。
+		return 0, ErrIdleTimeout
 	}
 	return n, err
 }

@@ -130,6 +130,22 @@ func TestUnroutableCatchesLoopbackAndPrivate(t *testing.T) {
 	}
 }
 
+func TestUnroutableCatchesMappedIPv6LinkLocalAndThisNet(t *testing.T) {
+	// W15:过去只堵了 ::ffff:127. 一条 —— 映射写法的 RFC1918/云元数据、
+	// IPv6 link-local(fe80::/10)与 0.0.0.0/8 全部穿透到 nodeprobe 的拨号器。
+	bad := []string{
+		"::ffff:10.0.0.5", "::ffff:192.168.1.10", "::ffff:172.16.0.9",
+		"::ffff:169.254.169.254", "::ffff:0.1.2.3",
+		"fe80::1", "febf::a",
+		"0.1.2.3",
+	}
+	for _, s := range bad {
+		if !IsUnroutableServer(s) {
+			t.Errorf("%q should be unroutable (mapped/link-local/this-net)", s)
+		}
+	}
+}
+
 func TestUnroutableSparesRealHosts(t *testing.T) {
 	// 这一组是被误杀过的真实地址：128.x 是公网，172.15/172.32 在私网段外，
 	// localhost.example.com 是真实域名。

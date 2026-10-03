@@ -116,6 +116,11 @@ type Options struct {
 // 缺字就是方块；不引入新依赖去修，改成 Open panel/Reload/Quit 并在 README
 // 说明。托盘标题与提示不受此限 —— SetTitle/SetTooltip 走 Unicode API
 // （由调用方传中文），只有菜单项受影响。
+// Quit 退出托盘消息循环(systray.Quit 的包内包装,systray 设计上允许跨线程
+// 调用)。由信号桥调用:ctx 取消(信号到达)时托盘必须跟着退场,否则 Run 永不
+// 返回、进程不退出(W11)。
+func Quit() { systray.Quit() }
+
 func Run(o Options) {
 	systray.Run(func() {
 		if len(o.Icon) > 0 {

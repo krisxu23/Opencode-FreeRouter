@@ -10,6 +10,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1417,5 +1418,37 @@ func TestSettingsEffortLevelDrivesTheBudget(t *testing.T) {
 	got, _ := body["max_tokens"].(float64)
 	if int64(got) != 2048 {
 		t.Fatalf("max_tokens = %v, want 2048(settings.effortLevel=low 的档位上限)", got)
+	}
+}
+
+func TestUnavailableModelFailsFastWithoutScanningThePool(t *testing.T) {
+	// W7:Unavailable 位必须把门 —— 上游明确说「模型不再服务」时,换出口
+	// 解决不了(errors 包注释的承诺在 Complete 的分支 A 兑现)。过去这个位
+	// 没有消费者,每个请求都白扫满池子,还向调用方报告「可重试」。
+	script := func(n int) (int, string, string) {
+		return 404, "application/json", `{"error":{"message":"Model is unavailable","type":"ModelError"}}`
+	}
+	f := newFixture(t, script)
+	_, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"), nil)
+	if err == nil {
+		t.Fatal("Unavailable 的失败应当直接返回错误")
+	}
+	var fail errors.Failure
+	if !stderrors.As(err, &fail) || !fail.Unavailable {
+		t.Fatalf("错误应携带 Unavailable 位: %v", err)
+	}
+	if got := f.up.count(); got != 1 {
+		t.Fatalf("死模型应当 1 次尝试就放弃,实际 %d 次(扫池 = 分支 A 接走了它)", got)
+	}
+}
+
+func TestAttemptCapCodesAreAllRetryable(t *testing.T) {
+	// O11:三张重试码表(forward 的 retryableCodes / 本包 retryOn /
+	// attemptCapByCode)声明「不要求一致」,但 attemptCapByCode 的键必须是
+	// retryOn 的键 —— 给一个不可重试的码配尝试额度,那笔账永远用不上。
+	for code := range attemptCapByCode {
+		if !retryOn[code] {
+			t.Fatalf("attemptCapByCode 里的 %q 不在 retryOn 里:额度永远用不上", code)
+		}
 	}
 }

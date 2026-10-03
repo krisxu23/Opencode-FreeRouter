@@ -49,8 +49,12 @@ var flushDelay = 300 * time.Millisecond
 // Record is one finished turn, in the shape the engine can hand over without
 // knowing anything about this package.
 type Record struct {
-	At     int64
-	Model  string
+	At    int64
+	Model string
+	// Exit 是这次调用实际走的出口 tag。按出口分列是 README 承诺过的面板能力
+	// (「记用量(模型 × 出口的调用与失败)」)—— 过去 stats 只有 model 维度,
+	// 「哪个出口在失败」在面板上无处可看。空串(测试/未知)不建行。
+	Exit   string
 	OK     bool
 	Input  int64
 	Output int64
@@ -73,6 +77,7 @@ type Bucket struct {
 type Sample struct {
 	T      int64  `json:"t"`
 	Model  string `json:"model"`
+	Exit   string `json:"exit,omitempty"`
 	OK     bool   `json:"ok"`
 	TTFTMS *int64 `json:"ttftMs"`
 	Out    int64  `json:"out"`
@@ -84,7 +89,11 @@ type Snapshot struct {
 	Requests int64             `json:"requests"`
 	Days     map[string]Bucket `json:"days"`
 	Models   map[string]Bucket `json:"models"`
-	Samples  []Sample          `json:"samples"`
+	// Exits 是按出口聚合的同一批调用(面板用量页的出口表)。旧文件没有这个
+	// 键:normalize 会补空表,JSON 里 omitempty 让空表在落盘时省略 —— 与旧版
+	// 数据文件保持字节兼容。
+	Exits   map[string]Bucket `json:"exits,omitempty"`
+	Samples []Sample          `json:"samples"`
 }
 
 // HistoryRow is one day of History: a Bucket plus the UTC date it belongs to.
@@ -128,6 +137,7 @@ func emptySnapshot() Snapshot {
 	return Snapshot{
 		Days:    map[string]Bucket{},
 		Models:  map[string]Bucket{},
+		Exits:   map[string]Bucket{},
 		Samples: []Sample{},
 	}
 }
@@ -172,6 +182,9 @@ func normalize(snap Snapshot) Snapshot {
 	if snap.Models == nil {
 		snap.Models = map[string]Bucket{}
 	}
+	if snap.Exits == nil {
+		snap.Exits = map[string]Bucket{}
+	}
 	if snap.Samples == nil {
 		snap.Samples = []Sample{}
 	}
@@ -212,6 +225,14 @@ func (s *Stats) Record(r Record) {
 	m.Out += r.Output
 	s.snap.Models[r.Model] = m
 
+	if r.Exit != "" {
+		x := s.snap.Exits[r.Exit]
+		x.Req++
+		x.In += r.Input
+		x.Out += r.Output
+		s.snap.Exits[r.Exit] = x
+	}
+
 	s.snap.Requests++
 
 	var ttft *int64
@@ -222,6 +243,7 @@ func (s *Stats) Record(r Record) {
 	s.snap.Samples = append(s.snap.Samples, Sample{
 		T:      r.At,
 		Model:  r.Model,
+		Exit:   r.Exit,
 		OK:     r.OK,
 		TTFTMS: ttft,
 		Out:    r.Output,
@@ -266,6 +288,7 @@ func (s *Stats) flushPending() {
 	}
 	s.dirty = false
 	snap := clone(s.snap)
+	pruneDays(snap, time.Now().UnixMilli())
 	s.mu.Unlock()
 
 	s.persist(snap)
@@ -295,12 +318,16 @@ func (s *Stats) Snapshot() Snapshot {
 	return clone(s.snap)
 }
 
-// clone deep-copies a snapshot, including both maps and the sample slice.
+// clone deep-copies a snapshot, including all maps and the sample slice.
+// TTFTMS 是**指针**,copy 只复制指针本身 —— 调用方解引用改写会直接污染看板
+// 内存值并写回下一个 flush,这里对非 nil 的样本复制一份值(I19 的「号称深拷贝
+// 其实浅拷贝」)。
 func clone(snap Snapshot) Snapshot {
 	out := Snapshot{
 		Requests: snap.Requests,
 		Days:     make(map[string]Bucket, len(snap.Days)),
 		Models:   make(map[string]Bucket, len(snap.Models)),
+		Exits:    make(map[string]Bucket, len(snap.Exits)),
 		Samples:  make([]Sample, len(snap.Samples)),
 	}
 	for k, v := range snap.Days {
@@ -309,8 +336,37 @@ func clone(snap Snapshot) Snapshot {
 	for k, v := range snap.Models {
 		out.Models[k] = v
 	}
+	for k, v := range snap.Exits {
+		out.Exits[k] = v
+	}
 	copy(out.Samples, snap.Samples)
+	for i := range out.Samples {
+		if out.Samples[i].TTFTMS != nil {
+			v := *out.Samples[i].TTFTMS
+			out.Samples[i].TTFTMS = &v
+		}
+	}
 	return out
+}
+
+// daysRetention 是按天桶的保留期:Days 的键每天增一、永不删(约 365 键/年,
+// 各 24 字节),长期运行的实例会无限累积。90 天远超面板历史(7 天)与任何
+// 实际查询窗口,淘汰只发生在落盘前,不改变内存账目的正确性。
+const daysRetention = 90
+
+// pruneDays 删掉保留期之外的按天桶。日期键是 UTC 的 "2006-01-02"(dayKey);
+// 解析不了的键(不该存在)原样保留 —— 宁可多留一行也不能误删数据。
+func pruneDays(snap Snapshot, now int64) {
+	if len(snap.Days) == 0 {
+		return
+	}
+	cutoff := time.UnixMilli(now).UTC().AddDate(0, 0, -daysRetention)
+	for k := range snap.Days {
+		d, err := time.Parse("2006-01-02", k)
+		if err != nil || d.Before(cutoff) {
+			delete(snap.Days, k)
+		}
+	}
 }
 
 // History returns the last days days, oldest first, one row per day with
@@ -349,6 +405,7 @@ func (s *Stats) Flush() error {
 	}
 	s.dirty = false
 	snap := clone(s.snap)
+	pruneDays(snap, time.Now().UnixMilli())
 	s.mu.Unlock()
 
 	if s.file == "" {

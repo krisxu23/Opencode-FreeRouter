@@ -219,9 +219,13 @@ function rewriteNotice(rows) {
 // 清单不会 —— 排除项及理由：*.exe 与 dist/ 是产物不是源码（dist/ 是 CI 发布作业
 // 放 zip 的地方，源码包混进二进制就没人核对「源码就是二进制里那份」了）；data/
 // 里有用户的订阅 URL 与 forward key；node_modules/ 与 archive/ 属于已冻结的 MIT
-// 作品；difftest-tmp/ 是工装的临时产物；docs/ 整棵不要，只单列其中的验收报告
+// 作品；difftest/（fixtures 含别人订阅节点的身份与口令，.gitignore 同款裁定）与
+// difftest-tmp/ 是工装目录；docs/ 整棵不要，只单列其中的验收报告
 // （见 EXTRA_DIRS）。
-const EXCLUDE_NAMES = new Set(['node_modules', 'data', 'archive', 'release', 'difftest-tmp', 'dist', '.git', 'docs'])
+const EXCLUDE_NAMES = new Set(['node_modules', 'data', 'archive', 'release', 'difftest', 'difftest-tmp', 'dist', '.git', 'docs'])
+// rel 路径精确排除:scripts/diff-accept.mjs 是内部差分工装(.gitignore 裁定
+// 不上公网),不能靠名字排除 —— scripts/ 整体要进包(构建契约进产物)。
+const EXCLUDE_FILES = new Set(['scripts/diff-accept.mjs'])
 const EXTRA_DIRS = [[path.join(ROOT, 'docs', 'accept'), 'docs/accept']]
 
 /** 源码包的文件清单（确定性排序）。 */
@@ -232,6 +236,7 @@ export function sourceFiles() {
       if (EXCLUDE_NAMES.has(e.name)) continue
       const abs = path.join(dir, e.name)
       const rel = prefix ? `${prefix}/${e.name}` : e.name
+      if (EXCLUDE_FILES.has(rel)) continue
       if (e.isDirectory()) { walk(abs, rel); continue }
       if (e.name.endsWith('.exe')) continue
       out.push([abs, rel])

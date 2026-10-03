@@ -88,7 +88,7 @@ func TestScanUsageReadsBothCacheTokenLocations(t *testing.T) {
 	} {
 		var acc Usage
 		t0 := time.Now()
-		if _, isContent := ScanUsage([]byte(body), &acc, new(bool), t0); isContent {
+		if isContent := ScanUsage([]byte(body), &acc, new(bool), t0); isContent {
 			t.Fatalf("usage-only chunk must not count as content: %s", body)
 		}
 		if !acc.HasUsage {
@@ -109,7 +109,7 @@ func TestScanUsageReadsBothCacheTokenLocations(t *testing.T) {
 func TestScanUsagePicksOneSpellingInsteadOfAddingThem(t *testing.T) {
 	var acc Usage
 	body := `{"usage":{"prompt_tokens":100,"input_tokens":100,"output_tokens":5,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":40}}}`
-	if _, isContent := ScanUsage([]byte(body), &acc, new(bool), time.Now()); isContent {
+	if isContent := ScanUsage([]byte(body), &acc, new(bool), time.Now()); isContent {
 		t.Fatal("a usage-only frame is not content")
 	}
 	if acc.In != 60 || acc.Out != 5 || acc.CacheRead != 40 {
@@ -192,14 +192,14 @@ func TestTTFTFreezesOnFirstContentNotFirstChunk(t *testing.T) {
 	first := new(bool)
 	t0 := time.Now().Add(-2 * time.Second) // 假装已经过了 2s
 	// 第一个 chunk 只是 role 骨架。
-	if _, isContent := ScanUsage([]byte(`{"type":"message_start"}`), &acc, first, t0); isContent {
+	if isContent := ScanUsage([]byte(`{"type":"message_start"}`), &acc, first, t0); isContent {
 		t.Fatal("message_start is not content")
 	}
 	if acc.TTFTMS != 0 {
 		t.Fatalf("TTFT set by a non-content chunk: %d", acc.TTFTMS)
 	}
 	// 第二个才是内容。
-	if _, isContent := ScanUsage([]byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`), &acc, first, t0); !isContent {
+	if isContent := ScanUsage([]byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`), &acc, first, t0); !isContent {
 		t.Fatal("text_delta is content")
 	}
 	if acc.TTFTMS < 1500 {
@@ -282,4 +282,19 @@ func (byteFiller) Read(p []byte) (int, error) {
 		p[i] = 'a'
 	}
 	return len(p), nil
+}
+
+func TestScanUsageAcceptsFloatLiterals(t *testing.T) {
+	// W8:上游偶发以浮点形状发 token 数;旧 *int64 遇到 1234.0 会在解码时
+	// 整帧失败,连同内容检测一起丢 —— chat 线的整轮 usage 就此蒸发。
+	// 注意:choices 形状的内容判定不归 ScanUsage(adapter 的 carriesDelta 管,
+	// ScanUsage 只认 claude 线的 content_block 形状),所以这里只断言 usage。
+	var acc Usage
+	ScanUsage([]byte(`{"choices":[{"delta":{"content":"hi"}}],"usage":{"prompt_tokens":1234.0,"completion_tokens":5e0,"prompt_tokens_details":{"cached_tokens":34.0}}}`), &acc, new(bool), time.Now())
+	if !acc.HasUsage {
+		t.Fatal("浮点形状的 usage 帧必须被识别")
+	}
+	if acc.In != 1200 || acc.Out != 5 || acc.CacheRead != 34 {
+		t.Fatalf("In=%d Out=%d CacheRead=%d, want 1200/5/34(disjoint-count 减缓存)", acc.In, acc.Out, acc.CacheRead)
+	}
 }

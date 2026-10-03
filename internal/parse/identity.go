@@ -137,6 +137,9 @@ var (
 	reRfc1918_172  = regexp.MustCompile(`^172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2}$`)
 	reLinkLocal169 = regexp.MustCompile(`^169\.254(\.\d{1,3}){2}$`)
 	reIPv6ULA      = regexp.MustCompile(`^f[cd][0-9a-f]{2}:`)
+	// reThisNet 是 0.0.0.0/8(「本网段」):Windows 上 0.x 的目的地同样落在
+	// 本机栈,过去只精确匹配了 0.0.0.0 一个字面量。
+	reThisNet = regexp.MustCompile(`^0(\.\d{1,3}){3}$`)
 )
 
 // IsUnroutableServer reports whether a node advertises an address this machine
@@ -169,7 +172,19 @@ func IsUnroutableServer(server string) bool {
 	if reLoopback127.MatchString(h) {
 		return true
 	}
-	if strings.HasPrefix(h, "::ffff:127.") {
+	// ::ffff: 前缀的 IPv4-mapped IPv6 写法是同一批地址的另一种拼法:剥掉前缀
+	// 后按 IPv4 的同一组判据重跑。过去只堵了 ::ffff:127.,::ffff:192.168.1.10
+	// 与云元数据 ::ffff:169.254.169.254 都能穿透到 nodeprobe 的拨号器 ——
+	// 一条恶意订阅就能拿网关当内网触探器。IPv6 侧再补 fe80::/10(link-local,
+	// 与 169.254 同义)。
+	if v4, ok := strings.CutPrefix(h, "::ffff:"); ok {
+		return IsUnroutableServer(v4)
+	}
+	if strings.HasPrefix(h, "fe8") || strings.HasPrefix(h, "fe9") ||
+		strings.HasPrefix(h, "fea") || strings.HasPrefix(h, "feb") {
+		return true
+	}
+	if reThisNet.MatchString(h) {
 		return true
 	}
 	if reRfc1918Ten.MatchString(h) {

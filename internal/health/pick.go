@@ -89,25 +89,35 @@ type ranked struct {
 // 候选按 bucket、再按 (load+1)×latency 排序。三个独立的 +1 惩罚只重排、永不
 // 排除:被别的会话钉着的出口 IP、正超过软上限的出口 IP、刚撞过配额墙的出口。
 // (src/health.js:905-924)
+// pickRanked 把排好序的候选压成 Picked(带前 8 行的决策快照)。O2 之后排序
+// 发生在锁外,这个小助手取代了旧闭包对 lastOrder 的就地赋值。
+func pickRanked(hit *ranked, sorted []*ranked, stickyNode string) *Picked {
+	if hit == nil {
+		return nil
+	}
+	p := &Picked{NodeKey: hit.node.Tag, Country: hit.country, ExitIP: hit.ip}
+	for _, r := range sorted {
+		p.Order = append(p.Order, orderRowOf(r, stickyNode))
+	}
+	return p
+}
+
+// top8 决策快照只留前 8:整池几千个候选全写下来,一条记录就能顶掉一天的量,
+// 而这个顺序的前 8 名已经能解释「为什么选了它」(src/health.js:1037-1040)。
+func top8(list []*ranked) []*ranked {
+	if len(list) > 8 {
+		return list[:8]
+	}
+	return list
+}
+
 func (h *Health) Pick(req PickRequest) *Picked {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	now := time.Now().UnixMilli()
+	h.mu.Lock()
 	// 长期占用:每个出口 IP 被多少个活会话钉着(不含调用方自己那个)
 	busy := h.busyExitIpsLocked(req.StickyNode)
 	// 配额扩散:还在记号有效期内的出口 IP 集合
 	quotaIps := h.quotaMarkedExitIpsLocked(now)
-	var lastOrder []*ranked
-	withOrder := func(hit *ranked) *Picked {
-		if hit == nil {
-			return nil
-		}
-		p := &Picked{NodeKey: hit.node.Tag, Country: hit.country, ExitIP: hit.ip}
-		for _, r := range lastOrder {
-			p.Order = append(p.Order, orderRowOf(r, req.StickyNode))
-		}
-		return p
-	}
 
 	// sticky 优先(src/health.js:1007-1019):命中时 Order 只有它一行 —— 粘性
 	// 压过排序是这个模块最容易被误判的行为(「为什么还在用那个慢出口」只能从
@@ -119,8 +129,8 @@ func (h *Health) Pick(req PickRequest) *Picked {
 				continue
 			}
 			if r := h.rankLocked(node, req, busy, quotaIps, now); r != nil {
-				lastOrder = []*ranked{r}
-				return withOrder(r)
+				h.mu.Unlock()
+				return pickRanked(r, []*ranked{r}, req.StickyNode)
 			}
 			break
 		}
@@ -172,32 +182,27 @@ func (h *Health) Pick(req PickRequest) *Picked {
 			return list[i].node.Tag < list[j].node.Tag
 		})
 	}
+	// O2:rank 之后的账目只读,锁在这里放掉 —— 排序(整池几千候选)是纯计算,
+	// 留在 h.mu 里会把所有并发 Pick 串成一条队(engine 每个 attempt 都要 Pick
+	// 一次)。快照与选中瞬间之间状态再变的窗口本来就是 Pick 返回后同样存在的
+	// (engine 的 NoteExitBusy 在 Pick 返回后才落账),这里不引入新的竞争类。
+	h.mu.Unlock()
 	for _, group := range want {
 		list := byGroup[group]
 		if len(list) == 0 {
 			continue
 		}
 		sortRanked(list)
-		// 只留前 8:整池几千个候选全写下来,一条记录就能顶掉一天的量,而这个
-		// 顺序的前 8 名已经能解释「为什么选了它」(src/health.js:1037-1040)。
-		lastOrder = list
-		if len(lastOrder) > 8 {
-			lastOrder = lastOrder[:8]
-		}
-		return withOrder(list[0])
+		return pickRanked(list[0], top8(list), req.StickyNode)
 	}
 	// 选定分组全部落空:仍然优先给一个可用池内节点而不是直接失败 —— 错国家的
 	// 好答案胜过没有答案。直连在这里永远不是候选;受限模型已在 rank 里滤掉非 B。
 	// (src/health.js:1044-1048)
 	if len(rankedAll) > 0 {
 		sortRanked(rankedAll)
-		lastOrder = rankedAll
-		if len(lastOrder) > 8 {
-			lastOrder = lastOrder[:8]
-		}
-		return withOrder(rankedAll[0])
+		return pickRanked(rankedAll[0], top8(rankedAll), req.StickyNode)
 	}
-	return withOrder(nil)
+	return nil
 }
 
 // rankLocked 是 pick 的核心公式(src/health.js:965-999)。返回 nil 的两种情形:

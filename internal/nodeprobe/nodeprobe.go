@@ -195,7 +195,7 @@ func fetchVia(ctx context.Context, dial httpclient.Dialer, url string, timeoutMs
 			return dial(dialCtx, network, addr)
 		}
 	}
-	client := httpclient.NewClient(bounded, time.Duration(timeoutMs)*time.Millisecond)
+	client := httpclient.NewOneShotClient(bounded, time.Duration(timeoutMs)*time.Millisecond)
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	req, err := http.NewRequestWithContext(shot, http.MethodGet, url, nil)
 	if err != nil {
@@ -408,6 +408,14 @@ func (p *Prober) ProbeNode(ctx context.Context, dial httpclient.Dialer, timeoutM
 		}
 	}
 	if len(samples) == 0 {
+		if ctx.Err() != nil {
+			// C2:取消导致的「一枪都没打完」不是判决。调用方(app/probe.go 的
+			// 取消守卫)会把取消轮整体丢弃,但 MarkProbe 对 unknown 本来就有
+			// 「跳过」契约 —— 在这里就报 unknown,让「取消 ≠ dead」由类型
+			// 保证,而不只依赖调用方的守卫。dead 会改写健康行并参与淘汰,
+			// 一整轮取消就能把全池写成 dead(C2 的事故链)。
+			return ProbeResult{State: StateUnknown, LatencyMS: time.Since(start).Milliseconds(), Incomplete: true}
+		}
 		return ProbeResult{State: StateDead, LatencyMS: time.Since(start).Milliseconds()}
 	}
 	var echo exitInfo

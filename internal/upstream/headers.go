@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // headerOverrides 解析 OUR_FREE_MODEL_HEADERS_JSON(src/upstream.js:76-92)。
@@ -22,10 +23,32 @@ import (
 //
 // 畸形 JSON 必须**忽略**而不是致命(js :82 的中文注释):可选覆盖项里的一个
 // 笔误不能拦住网关启动,默认值本来就是实测能过的那组。JS 在模块加载时读
-// 一次;Go 侧改为每次调用时解析 —— 环境变量在进程生命周期内不变,行为一致,
-// 代价只是每请求一次极小的 JSON 解析,且 t.Setenv 的测试因此可行。
+// 一次;Go 侧以**原始环境变量字符串为键**缓存解析结果 —— 环境变量在进程
+// 生命周期内不变,每请求一次 JSON 解析是纯浪费;键取原始串则 t.Setenv 改完
+// 变量下一次调用立即生效,测试可行性不丢。返回的是共享缓存,调用方只读。
 func headerOverrides() map[string]string {
 	raw := os.Getenv("OUR_FREE_MODEL_HEADERS_JSON")
+	overridesMu.Lock()
+	defer overridesMu.Unlock()
+	if overridesHas && overridesRaw == raw {
+		return overridesParsed
+	}
+	parsed := parseHeaderOverrides(raw)
+	overridesRaw = raw
+	overridesParsed = parsed
+	overridesHas = true
+	return parsed
+}
+
+var (
+	overridesMu     sync.Mutex
+	overridesRaw    string
+	overridesParsed map[string]string
+	overridesHas    bool
+)
+
+// parseHeaderOverrides 是 headerOverrides 的无缓存实现。
+func parseHeaderOverrides(raw string) map[string]string {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}

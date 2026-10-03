@@ -90,16 +90,52 @@ jobs:
           $all = $files | Where-Object { $_ -notmatch '_test\.go$' }
           $product = $all | Where-Object { $_ -match '^(internal/|cmd/|scripts/|web/|go\.mod|go\.sum)' }
           if (-not $product) { Write-Host "没有产品代码改动，无需 bump 版本"; exit 0 }
-          if (-not ($files | Where-Object { $_ -eq 'package.json' })) {
+          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          # C3：必须**真正比较版本号前进**，而不只是检查 package.json 出现在文件
+          # 列表里 —— 旧实现只看文件名，改个 description 字段（版本号不动）门禁
+          # 照样绿，随后 release 作业因「tag 已存在」静默 skip，新代码永远发不出
+          # 去；版本号回退同样绿，这是这道门禁要防的核心事故。
+          $oldV = $null
+          if ($reachable) {
+            $oldRaw = git show "$($env:BEFORE):package.json"
+            if ($LASTEXITCODE -eq 0 -and $oldRaw) {
+              try { $oldV = (($oldRaw | Out-String) | ConvertFrom-Json).version } catch { $oldV = $null }
+            }
+          }
+          if (-not $oldV) {
+            # before 不可达（分支首推/强推）：退化成只要求 package.json 出现在本次 push 里
+            if (-not ($files | Where-Object { $_ -eq 'package.json' })) {
+              throw (
+                "改了产品代码但 package.json 没有出现在这次 push 里。`n" +
+                "本次动到的产品路径：`n" + ($product | ForEach-Object { "  " + $_ }) -join "`n" +
+                "`n发布契约：同一次 push 里 bump version，release 作业会为该版本号自动建 tag 并" +
+                "发布 zip + GPL 源码包；不 bump 就等于这一版没人能拿到。"
+              )
+            }
+            Write-Host "before 不可达，无法比较版本前进；package.json 已在本次 push 中，放行 v$v"
+            exit 0
+          }
+          function Get-Sem([string]$s) {
+            # 宽松解析 x.y.z（忽略可能的 v 前缀/预发布尾巴），取前三段数字
+            $nums = [int[]](($s -replace '^[^0-9]*', '') -replace '-.*$', '' -split '\.' | ForEach-Object { [int]($_ -replace '\D.*$', '') })
+            return @($nums + @(0, 0, 0)) | Select-Object -First 3
+          }
+          $a = Get-Sem $oldV
+          $b = Get-Sem $v
+          $forward = $false
+          for ($i = 0; $i -lt 3; $i++) {
+            if ($b[$i] -gt $a[$i]) { $forward = $true; break }
+            if ($b[$i] -lt $a[$i]) { break }
+          }
+          if (-not $forward) {
             throw (
-              "改了产品代码但 package.json 的 version 没有前进。`n" +
+              "改了产品代码但版本号没有前进（$oldV → $v）。`n" +
               "本次动到的产品路径：`n" + ($product | ForEach-Object { "  " + $_ }) -join "`n" +
               "`n发布契约：同一次 push 里 bump version，release 作业会为该版本号自动建 tag 并" +
-              "发布 zip + GPL 源码包；不 bump 就等于这一版没人能拿到。"
+              "发布 zip + GPL 源码包；不前进就等于这一版没人能拿到（回退版本还会与已发布 tag 冲突后静默 skip）。"
             )
           }
-          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          Write-Host "版本已前进到 v$v，release 作业会据此发布"
+          Write-Host "版本已前进 $oldV → v$v，release 作业会据此发布"
 
       - uses: actions/setup-node@v4
         with:
@@ -253,4 +289,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $notes = 'OpenAI 兼容的本地网关（Windows x64）。解压到任意目录，双击 FreeRouter.exe，托盘出现图标就已在跑；面板 http://127.0.0.1:3458/ ，接入点 http://127.0.0.1:3457/v1 。免安装、无运行时依赖；订阅地址要自己填。 同一个 Release 里的 freerouter-*-source.tar.gz 是这份二进制的完整对应源码（GPL-3.0-or-later，含依赖许可证全文与构建脚本）。'
+          $notes = "$notes`n`n构建自 commit $env:SHA。"
+          # I29 TOCTOU 收口：Resolve 步骤的「查存在→创建」与并发 push 之间有窗口，
+          # 两个 run 都会看到「不存在」然后都执行 create，其中一个必红（tag 已存在）。
+          # create 前重查一次；still 不存在但 create 失败（并发窗口刚好落在两次检查
+          # 之间）时，容错 "already exists" —— 发布件已经在了，红一个 run 没有意义。
+          $null = gh release view $env:TAG 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "release $env:TAG 已被并发 run 创建，本次跳过发布"
+            exit 0
+          }
+          $ErrorActionPreference = 'Continue'
           gh release create $env:TAG --target $env:SHA --title "FreeRouter $env:TAG" --notes $notes (Get-ChildItem dist).FullName
+          if ($LASTEXITCODE -ne 0) {
+            $null = gh release view $env:TAG 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "create 撞上并发窗口但 release 已存在：视为成功"
+            } else {
+              throw "gh release create 失败"
+            }
+          }

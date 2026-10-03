@@ -47,7 +47,7 @@ type Deps struct {
 	// (stats) installs it; until then it may be nil. model 是 base id:
 	// JS 的 recordUsage({model, ...})(src/index.js:185)按模型分列用量,
 	// 丢了它 byModel 表就没有行。
-	RecordUsage func(model string, u stream.Usage)
+	RecordUsage func(model, exit string, u stream.Usage)
 	// Dialer builds the per-exit dialer. Zero-port architecture: the engine
 	// hands the adapter an http.Client whose DialContext dials the in-process
 	// sing-box outbound for the picked tag, so no local port is ever opened.
@@ -106,6 +106,13 @@ type Chunk struct {
 	Usage stream.Usage
 	// Index is the tool-call slot, set only on KindToolCallDelta.
 	Index int
+	// tool-call 增量的结构化载荷(替代旧的 JSON-in-Text 信封):Delta 帧带
+	// ToolDelta,block-end 完整帧带 ToolArguments —— 判别符是 ToolArguments
+	// 是否非空(见 translate.go 的折叠语义)。
+	ToolID        string
+	ToolName      string
+	ToolDelta     string
+	ToolArguments string
 	// Finish is set only on KindFinish.
 	Finish FinishReason
 }
@@ -331,6 +338,10 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			// 需要的数据(试了几个、各花多久)。漏了它,那个决定就没有依据
 			// 可回头评估。
 			e.logRotation(trail, fmt.Sprintf("放弃（cap %d）", attemptCap), startedAt, tr)
+			// 给粘性出口记一次熔断分:每轮 attempt 都会把 sticky 重钉在最新
+			// 的出口上,放弃路径不清账,会话就钉在最后一个已知失败的出口上,
+			// 下一条请求必然先在它上面白付一次失败。记一次分,连跪两次即换。
+			snapshot.Health.NoteStickyFailure(session)
 			return Outcome{}, errors.Failure{
 				Code:    codeOrServer(lastFailure),
 				Status:  503,
@@ -339,6 +350,7 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 		}
 		if wallClock > 0 && nowMS()-startedAt > wallClock {
 			e.logRotation(trail, fmt.Sprintf("超出墙钟预算 %dms", wallClock), startedAt, tr)
+			snapshot.Health.NoteStickyFailure(session)
 			return Outcome{}, errors.Failure{
 				Code:    codeOrServer(lastFailure),
 				Status:  503,
@@ -346,10 +358,9 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			}
 		}
 		// 粘性出口在本轮已烧掉:进排除集(engine.js:249-250)。连跪两次的
-		// 会话不再给它任何机会,哪怕 Pick 的 sticky 分支还会拉它。
-		if startedSticky != "" && snapshot.Health.StickyBurned(session) {
-			excluded[startedSticky] = true
-		}
+		// 会话不再给它任何机会 —— 不过这个判断实际由 ExitForSession 承担
+		// (stickyFail 达到 2 时它已把行删掉、返回空串),循环内不会再进到
+		// 烧掉的 sticky 上,这里没有可补的排除。
 		restricted := health.IsRestrictedModel(base) || entry.RegionSensitive
 		candidates := make([]health.PoolNode, 0, len(pool))
 		for _, node := range pool {
@@ -381,6 +392,9 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 				// 「每请求恰一条 Route」,这里补记录(人类可读行仍不打)。
 				tr.record("池子扫完", "")
 			}
+			// 与 cap/墙钟放弃路径同理:清一次粘性账,别把会话钉死在
+			// 最后一个失败的出口上。
+			snapshot.Health.NoteStickyFailure(session)
 			message := "no healthy exit for the selected countries"
 			if lastFailure != nil {
 				message = fmt.Sprintf("no other healthy exit (last: %s)", lastFailure.Message)
@@ -446,7 +460,11 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 		// ---- 失败分流的三条分支(js :335-407,顺序不可换) ----
 
 		// A) 可换出口的会前失败:进排除集、按码记账、换下一个出口。
-		if failure != nil && !sawContent && retryOn[code] {
+		// Unavailable 位必须把门:供应商不再服务的模型是服务端事实,换多少
+		// 个出口都一样 —— 过去这个位没有消费者,死模型让每个请求都白扫满
+		// attemptCap 个出口、还向调用方报告「可重试」(errors 包注释的承诺
+		// 就是在这里兑现的)。
+		if failure != nil && !sawContent && retryOn[code] && !failure.Unavailable {
 			used := codeAttempts[code] + 1
 			codeAttempts[code] = used
 			trail = append(trail, fmt.Sprintf("%s(%dms,%s)", code, attemptMS, shortTag(picked.NodeKey)))
@@ -515,19 +533,24 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			})
 		}
 		if e.deps.RecordUsage != nil && failure == nil {
-			e.deps.RecordUsage(base, outcome.Usage)
+			// exit 一并交给记账:面板按出口分列用量(README 承诺的「模型 ×
+			// 出口」维度),断流/轮换的失败轮不走这里。
+			e.deps.RecordUsage(base, picked.NodeKey, outcome.Usage)
 		}
 		if failure != nil {
 			// 断流发生在已出内容之后:换出口重试会把前缀重发一遍,整条丢弃
 			// 又把已成功的半截也烧掉。保留已转发文本,把失败标注给转发层 ——
 			// SSE 头已发出的场景里,流内 error 事件(配合 FinishAbort 关帧)
-			// 是把失败告诉客户端的唯一通道。
+			// 是把失败告诉客户端的唯一通道。Retryable 同样要过 Unavailable
+			// 位:别让一个死模型被报成「值得重试」。
 			outcome.Error = failure.Message
-			outcome.Retryable = retryOn[code]
+			outcome.Retryable = retryOn[code] && !failure.Unavailable
 		}
-		if outcome.Truncated {
+		if outcome.Truncated || failure != nil {
 			// max-tokens 收尾意味着 arguments 被截在 JSON 半截上;保留它会让
-			// OpenAI 答案与 finish_reason 不一致(js :412-416)。
+			// OpenAI 答案与 finish_reason 不一致(js :412-416)。断流同享这一
+			// 道(过去只有 Truncated 路径清洗):折到一半的调用,其参数同样
+			// 可能停在非法 JSON 上,原样出境会被客户端当合法形状执行。
 			dropBrokenToolCalls(&outcome)
 		}
 		// usage → OpenAI 形状(js :419-428)由 OpenAIUsage 提供,转发层在
@@ -568,7 +591,14 @@ type attemptInput struct {
 func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishReason, bool, *errors.Failure) {
 	var out Outcome
 	sawContent := false
+	// 正文增量在这里用 Builder 攒,foldChunks 不再摸 Outcome.Text(长答案上的
+	// `+=` 是 O(n²));每个返回点先 materialize 回填。
+	var textSB strings.Builder
+	materialize := func() { out.Text = textSB.String() }
 	emit := func(c Chunk) error {
+		if c.Kind == ChunkText {
+			textSB.WriteString(c.Text)
+		}
 		if _, saw := foldChunks(c, &out); saw {
 			sawContent = true
 		}
@@ -618,6 +648,11 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 	}
 	if v, ok := in.openAi["max_tokens"].(float64); ok && v > 0 {
 		areq.MaxTokens = int(v)
+	} else if v, ok := in.openAi["max_completion_tokens"].(float64); ok && v > 0 {
+		// OpenAI 的新参数名(chat completions 的 max_completion_tokens):与
+		// max_tokens 同义。过去只有老名字被读,新名字的输出上限被静默丢弃、
+		// 回落到面板默认 —— 新 SDK 是会发新名字的。
+		areq.MaxTokens = int(v)
 	}
 	// R19:客户端的停止序列要上线。adapter 写 payload["stop"] 的分支一直在,但全仓
 	// 没有生产赋值点(JS 的 engine.js 同样不生产 options.stop),于是「调用方指定
@@ -629,19 +664,18 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 	res, err := adapter.NewAdapter(deps).Complete(ctx, areq, func(d adapter.Delta) error {
 		return emit(chunkOfDelta(d))
 	})
-	if res.Usage.HasUsage {
-		if err2 := emit(Chunk{Kind: ChunkUsage, Usage: res.Usage}); err2 != nil && err == nil {
-			err = err2
-		}
-	}
 	if err != nil {
 		failure := classifyAttemptError(err)
 		if sawContent {
 			// 断流:流被消费到一半。转发层靠这个 Finish 关帧,并且它绝不
 			// 算成功 —— Complete 的分支 C 会把失败写进 Outcome。
 			_ = emit(Chunk{Kind: ChunkFinish, Finish: FinishAbort})
+			materialize()
+			// 断流轮的 usage 不发给客户端也不进 Outcome:它属于一条失败
+			// 的尝试,计数不可信;转发层的延迟发头因此也保得住。
 			return out, FinishAbort, sawContent, failure
 		}
+		materialize()
 		return out, FinishStop, sawContent, failure
 	}
 	// 三个 saw 位全空 + 正常收尾:退化完成。交给调用方一个「成功的空回合」是最
@@ -666,11 +700,25 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 			finish = FinishToolCalls
 		}
 	}
+	if res.Usage.HasUsage {
+		// usage 帧只在这一轮被判定为「最终交付」时才发给客户端:过去它在
+		// 失败分类之前无条件 emit,而 usage 不算内容(sawContent 不为真),
+		// 于是上游空回合的 usage 尾包会先把 SSE 头花掉、随后 EMPTY/超时
+		// 被判可重试继续换出口 —— 「出口切换只在首字节前」的承诺被打破,
+		// 客户端还会收到两帧 usage。失败轮的 usage 同样不可信,直接不发。
+		if err2 := emit(Chunk{Kind: ChunkUsage, Usage: res.Usage}); err2 != nil {
+			materialize()
+			return out, finish, sawContent,
+				&errors.Failure{Code: check.CodeServer, Message: err2.Error()}
+		}
+	}
 	if err2 := emit(Chunk{Kind: ChunkFinish, Finish: finish}); err2 != nil {
 		// 收尾帧都发不出去 = 客户端已走,按出内容后的失败收场。
+		materialize()
 		return out, finish, sawContent,
 			&errors.Failure{Code: check.CodeServer, Message: err2.Error()}
 	}
+	materialize()
 	return out, finish, sawContent, nil
 }
 
@@ -793,8 +841,10 @@ func (e *Engine) logRotation(trail []string, result string, startedAt int64, tr 
 		// A 20-exit sweep is unreadable as one line, and the elided exits are
 		// the interchangeable ones; the first four explain why we started
 		// rotating and the last two explain where we ended up.
-		shown = append(append(append([]string{}, trail[:4]...),
-			fmt.Sprintf("…%d个…", len(trail)-6)), trail[len(trail)-2:]...)
+		shown = make([]string, 0, 7)
+		shown = append(shown, trail[:4]...)
+		shown = append(shown, fmt.Sprintf("…%d个…", len(trail)-6))
+		shown = append(shown, trail[len(trail)-2:]...)
 	}
 	// Build the body first and only add the separator when there is
 	// something to separate. The JS version always joined a separator, so a

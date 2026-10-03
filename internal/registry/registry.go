@@ -72,6 +72,26 @@ type entry struct {
 	LastSeenAt time.Time
 	Fails      int
 	LastFailAt time.Time
+	// flat 是 O24 的落盘形态缓存:snapshotLocked 每次 Flush 都把全池重新
+	// flatten(1.1MB 级文件 = 全池 marshal 一遍),而 Outbound 的赋值点只有
+	// Merge 的两处 —— 缓存随写失效,Fails 等账目字段不进 flat。调用方
+	// 必须持 r.mu。
+	flat     map[string]any
+	flatHave bool
+}
+
+// flatForm 返回(必要时构建)这一条的落盘形态;构建失败的条目恒返回 false
+// (与 snapshotLocked 的跳过语义一致)。调用方必须持 r.mu。
+func (e *entry) flatForm() (map[string]any, bool) {
+	if !e.flatHave {
+		ob, err := flattenOutbound(e.Outbound)
+		if err != nil {
+			return nil, false
+		}
+		e.flat = ob
+		e.flatHave = true
+	}
+	return e.flat, true
 }
 
 // tombstone 淘汰判决的持久记忆。**按身份而不是 tag 存**:订阅里同一个物理
@@ -240,9 +260,18 @@ func (r *Registry) Merge(outs []parse.Outbound) int {
 			continue
 		}
 		// 同 tag 但身份变了(机场轮换凭据/改 sni):原位更新,**不重置连败** ——
-		// tag 没变就还是「那个位置的节点」,JS :173-175 同款。
+		// tag 没变就还是「那个位置的节点」,JS :173-175 同款。身份真的变了
+		// 必须涨 generation:派生视图(候选池按 tag 国旗段的 CountryOf、
+		// 出口拨号闭包按新凭据)跟着身份走,缓存方按代数判新旧(O10)。
+		// 过去这个分支不涨代数,而 Generation() 的注释宣称它是派生视图的
+		// 失效信号 —— 接线缓存的瞬间这就是一个错账。
 		existing.LastSeenAt = now
+		if parse.IdentityOf(existing.Outbound) != key {
+			r.generation++
+		}
 		existing.Outbound = o
+		existing.flat = nil
+		existing.flatHave = false
 		seen[key] = true
 	}
 	if added > 0 {
@@ -464,6 +493,21 @@ func (r *Registry) FailCount(tag string) int {
 	return 0
 }
 
+// ProbationCount 是「观察期」节点数(连败 > 0),一次加锁算完。app 的
+// /api/status 每 5 秒一轮,过去对每个 tag 单独调一次 FailCount —— 池上限 8000
+// 时是每轮一万六千次锁往返,换来一个只有调用方自己在算的聚合值。
+func (r *Registry) ProbationCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, e := range r.entries {
+		if e.Fails > 0 {
+			n++
+		}
+	}
+	return n
+}
+
 // Len 池子大小(JS size,:196-198)。
 func (r *Registry) Len() int {
 	r.mu.RLock()
@@ -564,8 +608,8 @@ func (r *Registry) snapshotLocked() diskFile {
 		Tombstones: make(map[string]diskTombstone, len(r.tombstones)),
 	}
 	for tag, e := range r.entries {
-		ob, err := flattenOutbound(e.Outbound)
-		if err != nil {
+		ob, ok := e.flatForm()
+		if !ok {
 			// json 链路对纯数据结构不会失败;真来了就跳过这一条,不让单个坏
 			// 条目把整份注册表锁死(与 Load 的逐条守卫对称)。
 			continue
