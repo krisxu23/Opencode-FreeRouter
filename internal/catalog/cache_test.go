@@ -9,9 +9,10 @@ import (
 	"testing"
 )
 
-// 目录缓存的存在理由(总纲 §5 漏了这个文件,差分 B5 才暴露):直连被挡的机器
-// 拉不到上游列表,而 CAPABILITIES 兜底表只能补元数据、补不出 id。JS 在
-// src/index.js:219/234-250 用 data/catalog-ids.json 让冷启动就有真实列表。
+// 基线文件的存在理由(2026-10-03 起语义变更):它不再是冷启动的目录来源
+// (目录 id 的唯一来源是上游实时列表,冷启动恒播静态表),只是「上次运行见过
+// 的 id」的落盘,供换代时打增删对比日志。src/index.js:219/234-250 是 JS 侧
+// 的同名同形状文件。
 
 func TestLoadCacheMissingFileIsEmpty(t *testing.T) {
 	if got := LoadCache(filepath.Join(t.TempDir(), "nope.json")); got != nil {

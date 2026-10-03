@@ -733,21 +733,34 @@ func TestRefreshCatalogFallsBackToDirect(t *testing.T) {
 	}
 }
 
-func TestRefreshCatalogFallsBackToOverlay(t *testing.T) {
+// TestRefreshCatalogDoesNotFallBackToOverlay:上游全挂时目录不再吃 models.dev
+// 覆盖层(2026-10-03 裁决):overlay 的 id 是 24h 快照,混着上游已下架的模型,
+// 曾把面板毒成恒 33 个免费模型。目录保持启动时的静态表,只排重试。
+func TestRefreshCatalogDoesNotFallBackToOverlay(t *testing.T) {
 	p := newProbeParts(t, 0)
-	// 上游恒 500:节点出口与直连都拿不到列表,models.dev 覆盖层兜底。
+	swallowTimers(p) // 全挂路径会排 60s 重试定时器,别让它在测试外开火
 	url := subAndCatalogServer(t, "", "no", http.StatusInternalServerError)
 	t.Setenv("OUR_FREE_MODEL_BASE", url)
 	no := false
 	p.overlayByID = map[string]limits.OverlayRow{
 		"overlay-model": {ContextWindow: 100000, MaxOutput: 40000, Reasoning: &no},
 	}
+	before := append([]catalog.Model(nil), p.catalog.get()...)
 	p.refreshCatalog(context.Background())
 	p.upstreamMu.Lock()
 	ids := append([]string(nil), p.lastUpstreamIDs...)
 	p.upstreamMu.Unlock()
-	if len(ids) != 1 || ids[0] != "overlay-model" {
-		t.Fatalf("overlay 回退 ids = %v, want [overlay-model]", ids)
+	if len(ids) != 0 {
+		t.Fatalf("overlay 仍在兜底: lastUpstreamIDs = %v", ids)
+	}
+	after := p.catalog.get()
+	if len(after) != len(before) {
+		t.Fatalf("目录被 overlay 改写: %d 行 → %d 行", len(before), len(after))
+	}
+	for i := range after {
+		if after[i].ID != before[i].ID {
+			t.Fatalf("目录被 overlay 改写: 第 %d 行 %s → %s", i, before[i].ID, after[i].ID)
+		}
 	}
 }
 
@@ -969,8 +982,8 @@ func TestWarmUpProbesWithoutWaitingForTheInterval(t *testing.T) {
 }
 
 // TestWarmUpRefreshesCatalogAtStartup:启动即刷一次上游模型列表。JS 版是
-// src/index.js:1099 那句 void refreshCatalog();没有它,面板的模型表只能吃
-// data/catalog-ids.json 的磁盘缓存,要等 6 小时后的第一次重建才见新列表。
+// src/index.js:1099 那句 void refreshCatalog();没有它,面板冷启动只能播
+// 静态回退表,要等 6 小时后的第一次重建才见新列表。
 func TestWarmUpRefreshesCatalogAtStartup(t *testing.T) {
 	p := newProbeParts(t, 0)
 	url := subAndCatalogServer(t, "", `{"data":[{"id":"warm-a"},{"id":"warm-b"}]}`, http.StatusOK)

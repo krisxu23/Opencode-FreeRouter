@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FreeRouter contributors
 //
-// 模型目录的磁盘缓存。总纲 §5 的文件清单漏了这一份,差分验收 B5 才暴露:
-// Go 冷启动只播 Static(),而 JS 播的是上一轮存下的真实列表 —— 重启后的
-// /v1/models 一边 34 条、一边 18 条。JS 的对应实现是 src/index.js:219
+// 上游 id 列表的落盘基线(data/catalog-ids.json)。2026-10-03 之前它是冷启动
+// 的目录来源;之后降级为「上次运行见过的 id」,只用于换代时的增删对比日志,
+// 不再是目录来源(models.dev 快照曾借「缓存作目录」与「overlay 兜底」两条路
+// 把 20+ 个上游已下架的 id 写进目录)。JS 的对应实现是 src/index.js:219
 // (路径)、:234-246(读)、:249(写)。
 package catalog
 
@@ -30,8 +31,8 @@ type cacheFile struct {
 	IDs       []string `json:"ids"`
 }
 
-// LoadCache 返回缓存里的 id 列表;没有可用缓存(缺文件、坏 JSON、ids 不是
-// 数组或为空)返回 nil,由调用方回落 Static()。
+// LoadCache 返回基线里的 id 列表;没有可用基线(缺文件、坏 JSON、ids 不是
+// 数组或为空)返回 nil,由调用方当作「首次安装、无对比基准」处理。
 func LoadCache(file string) []string {
 	raw, err := os.ReadFile(file)
 	if err != nil {
@@ -58,12 +59,13 @@ func LoadCache(file string) []string {
 		return nil
 	}
 	if age := time.Since(time.UnixMilli(shell.FetchedAt)); shell.FetchedAt > 0 && age > cacheTTL {
-		logger.Warn(fmt.Sprintf("目录缓存已过期（%d 小时前写入），先按缓存展示，等本轮上游刷新覆盖", int(age.Hours())))
+		logger.Warn(fmt.Sprintf("目录基线已过期（%d 小时前写入），仅作换代对比用，等本轮上游刷新换代", int(age.Hours())))
 	}
 	return ids
 }
 
-// SaveCache 写回上游刚报回来的 id 列表,格式紧凑(与 JS 的 writeJsonFile 同款)。
+// SaveCache 写回上游刚报回来的 id 列表作换代基线,格式紧凑(与 JS 的
+// writeJsonFile 同款)。
 func SaveCache(file string, ids []string, fetchedAt int64) error {
 	return persistence.WriteJSONFile(file, cacheFile{FetchedAt: fetchedAt, IDs: ids}, false)
 }

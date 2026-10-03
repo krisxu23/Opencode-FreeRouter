@@ -327,8 +327,9 @@ func (p *Parts) StartTimers(ctx context.Context) {
 // 后跑首轮探测。JS 版这两步挂在启动那次 rebuild 的尾巴上(src/index.js:1099 的
 // refreshCatalog、:1101 await rebuild() 走到 :736 的 setTimeout(probeNow, 3000));
 // Go 版把开场拉取内联进了 Build(app.go 步骤 4 —— 监听端口不该等订阅),那条路径
-// 不经过 Rebuild,于是两个尾巴一起丢了:面板只吃 data/catalog-ids.json 的磁盘缓存,
-// 节点状态要等满一个探测周期(实测 probeIntervalMin=30 就是 30 分钟)才出现第一轮实测。
+// 不经过 Rebuild,于是两个尾巴一起丢了:面板冷启动只能播静态回退表
+// (data/catalog-ids.json 只是下次启动的对比基线,不是目录来源),节点状态要等
+// 满一个探测周期(实测 probeIntervalMin=30 就是 30 分钟)才出现第一轮实测。
 //
 // 用 wait 而不是 afterFunc:后者在 timersWG 上记一笔、只有回调真跑完才 Done,于是
 // 一个被 ctx 取消掉的定时器会把 Wait 挂到超时为止。

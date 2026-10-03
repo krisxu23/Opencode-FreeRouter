@@ -187,14 +187,21 @@ func DisplayModelName(modelID string) string {
 
 // staticIDs 是离线/首启动回落名单。上游一次抖动不能让目录清空(实测事故:
 // 目录清空 → 用户以为没额度),这份名单保证 Static() 永远有货。
+//
+// 2026-10-03 对照上游 /zen/v1/models 实测修剪:只保留当时确实在列的 free
+// 车道 id(14 个)+ union-alpha 恒免费位。被摘的 kimi-k2.5-free、
+// qwen3.6-plus-free、glm-5-free、longcat-2.0-free、mimo-v2-pro-free 等
+// 已不在上游列表(它们是 models.dev 旧快照的残留);上游恢复会经实时刷新
+// 带回来,不受这份名单影响。ling-3.0-flash-fin-free 虽仍在列但实测双通道
+// 皆死,由 measuredDead 摘除 —— Static() 实际 14 行。
 var staticIDs = []string{
-	"union-alpha", "space-bunny-free", "big-pickle", // ALWAYS_FREE 三件套先列
-	"mimo-v2.6-flash-free", "mimo-v2.5-free", "mimo-v2-pro-free",
-	"muse-spark-1.3-contributor-free", "muse-spark-1.2-contributor-free",
+	"union-alpha", "space-bunny-free", "big-pickle", // 恒免费三件套先列
+	"deepseek-v4-flash-free", "fledge-alpha-free", "jev-1.13-free",
+	"ling-3.0-flash-fin-free", // 在列但实测死:measuredDead 摘除,见上
+	"ling-3.1-flash-free", "longcat-2.5-preview-free",
+	"mimo-v2.5-free", "mimo-v2.6-flash-free",
+	"muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free",
 	"nemotron-3-ultra-free", "nemotron-3.5-lightning-free",
-	"ling-3.0-flash-fin-free", "deepseek-v4-flash-free",
-	"longcat-2.5-preview-free", "longcat-2.0-free",
-	"kimi-k2.5-free", "qwen3.6-plus-free", "glm-5-free", "jev-1.13-free",
 }
 
 // Model 是一条目录项,按 listing 顺序排列。

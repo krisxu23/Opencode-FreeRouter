@@ -165,6 +165,11 @@ type Parts struct {
 	catalog         *catalogBox
 	upstreamMu      sync.Mutex
 	lastUpstreamIDs []string
+	// baselineIDs 是「上次运行见过的 id」(boot 时从 data/catalog-ids.json 载入,
+	// 每次换代由 applyIDs 更新并落盘):只用来打增删对比日志,不是目录来源
+	// —— 冷启动恒播静态表(2026-10-03 裁决)。nil 表示没有基线(首次安装)。
+	baselineMu      sync.Mutex
+	baselineIDs     []string
 	overlayMu       sync.Mutex
 	overlayByID     map[string]limits.OverlayRow
 	limitsMu        sync.Mutex
@@ -408,16 +413,13 @@ func Load(root string) (*Parts, error) {
 	//
 	// 目录挂在 catalogBox 上:rebuild.go 的 applyIDs 是唯一换代入口,engine 的
 	// State 回调每轮路由读一次 —— 换代对在途请求不可见,它们用旧的一代跑完。
-	// 冷启动优先读上一轮落盘的上游 id 列表(data/catalog-ids.json,JS
-	// src/index.js:219/235 同名同语义):本机实测直连被封而节点可用,若只能等
-	// 上游,面板 opening 就是一张空模型表。缓存里没有才播静态回退表 —— 静态表
-	// 18 行,上游实测 34 行,少了 16 个模型也是「用户以为没额度」。
-	cachedIDs := catalog.LoadCache(filepath.Join(dataDir, "catalog-ids.json"))
-	catList := catalog.Static()
-	if len(cachedIDs) > 0 {
-		catList = catalog.Build(cachedIDs)
-	}
-	catBox := &catalogBox{list: catList}
+	// 冷启动恒播静态回退表(2026-10-03 裁决:目录 id 的唯一来源是上游实时
+	// 列表,网关程序每次打开即时访问 /zen/v1/models)。磁盘上的
+	// data/catalog-ids.json 降级为「上次运行见过的 id」基线,只供换代时打
+	// 增删对比日志 —— models.dev 的 24h 快照曾借「缓存作目录」与「overlay
+	// 兜底」两条路把 20+ 个上游已下架的 id 写进面板(恒 33 个免费模型)。
+	baselineIDs := catalog.LoadCache(filepath.Join(dataDir, "catalog-ids.json"))
+	catBox := &catalogBox{list: catalog.Static()}
 	// parts 先声明后装配:下面几个闭包要读活设置(B7),而 parts 的字段又依赖
 	// 它们构造出来的 eng/statStore。闭包只可能在 Load 返回之后被调用,
 	// 那时 parts 一定已赋值。
@@ -530,6 +532,7 @@ func Load(root string) (*Parts, error) {
 		firstFetch:  firstFetch,
 		tierGate:    gate.New(tierGapMS),
 		catalog:     catBox,
+		baselineIDs: baselineIDs,
 		overlayByID: bootOverlay,
 		// B8:这两个字段与 limitsMu 保护,必须在结构体字面量里装配好 ——
 		// 从前是字面量之后的两行无锁写,而 refreshLimitsOverlay 已经在

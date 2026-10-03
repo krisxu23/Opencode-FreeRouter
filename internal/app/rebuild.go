@@ -15,7 +15,6 @@ import (
 	"math/rand"
 	"net/http"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -284,8 +283,9 @@ func (p *Parts) setRebuildResult(added, removed, dropped int, err error) {
 	}
 }
 
-// refreshCatalog 刷新模型目录,顺序是承重的:先用节点出口试,再走直连,
-// 最后才用 models.dev 覆盖层兜底。
+// refreshCatalog 刷新模型目录,顺序是承重的:先用节点出口试,再走直连。
+// 2026-10-03 之后的第三条路(models.dev 覆盖层兜底)已删:那张 24h 快照混着
+// 上游已下架的 id,曾把目录毒成 33 个免费模型;上游全挂时目录保持现状并重试。
 //
 // 翻车史(src/index.js:274-287):原来的顺序是反的,于是直连被墙的机器上
 // 每一轮都要先白等 12 秒,而且一旦直连成功就再也不试节点出口 —— 控制面
@@ -310,11 +310,9 @@ func (p *Parts) refreshCatalogAttempt(ctx context.Context, attempt int) bool {
 		if len(ids) > 0 {
 			via = "direct"
 		} else {
-			overlay := p.limitsKeys()
-			if len(overlay) > 0 {
-				p.applyIDs(overlay, "models.dev overlay")
-				return true
-			}
+			// 不再用 models.dev 覆盖层兜底(2026-10-03 裁决):那张 24h 快照
+			// 混着上游已下架的 id,曾把目录毒成 33 个免费模型。上游全挂时
+			// 目录保持现状(冷启动即静态表),只排重试。
 			logger.Warn(fmt.Sprintf("[app] catalog refresh failed（节点出口与直连都不可用）; retry %d/%d in %s",
 				minInt(attempt+1, catalogRetryLimit), catalogRetryLimit, catalogRetryDelay))
 			if attempt < catalogRetryLimit {
@@ -394,37 +392,76 @@ func (p *Parts) fetchIDs(ctx context.Context, d httpclient.Dialer, timeoutMS int
 	return ids
 }
 
-// applyIDs 是目录换代的唯一入口:记住这一代的 id 列表(限额覆盖层要拿它
-// 重套),换掉 engine 读到的那一代,然后打一行日志。覆盖层在 Build 之后套上
-// —— JS 的 applyIds 同序(src/index.js:263-266):models.dev 的 -free 行
-// 才带真实额度,canonical 行在某些模型上大 5 倍。
+// applyIDs 是目录换代的唯一入口:对着上一份基线打增删对比日志,记住这一代
+// 的 id 列表(限额覆盖层要拿它重套),换掉 engine 读到的那一代,把基线落盘,
+// 然后打一行日志。覆盖层在 Build 之后套上 —— JS 的 applyIds 同序
+// (src/index.js:263-266):models.dev 的 -free 行才带真实额度,canonical 行
+// 在某些模型上大 5 倍。
+//
+// 基线(data/catalog-ids.json)在 2026-10-03 之后只有一个职责:下次启动的
+// 对比基准。它不是目录来源 —— 冷启动恒播静态表;models.dev 快照曾借兜底
+// 路径把 20+ 个上游已下架的 id 写进目录(面板恒 33 个免费模型),那条路已删。
 func (p *Parts) applyIDs(ids []string, via string) {
+	next := append([]string(nil), ids...)
+	p.baselineMu.Lock()
+	prev := p.baselineIDs
+	p.baselineIDs = next
+	p.baselineMu.Unlock()
+	if prev == nil {
+		logger.Info(fmt.Sprintf("[app] catalog 基线首次建立: %d 个 id", len(next)))
+	} else if added, removed := diffIDs(prev, next); len(added) > 0 || len(removed) > 0 {
+		logger.Info(fmt.Sprintf("[app] catalog 对比上次运行: 新增 %s, 摘除 %s",
+			summarizeIDs(added), summarizeIDs(removed)))
+	}
 	list := p.applyOverlay(catalog.Build(ids))
 	p.catalog.set(list)
 	p.upstreamMu.Lock()
-	p.lastUpstreamIDs = append([]string(nil), ids...)
+	p.lastUpstreamIDs = next
 	p.upstreamMu.Unlock()
-	// last-good 列表落盘,下一台冷启动才有东西可读(JS saveCatalogCache,
-	// src/index.js:248 + :264 —— 只有换代路径存,boot 读缓存时不回存,否则缓存
-	// 的年龄恒为 0,那条过期告警就失去意义)。写失败只 warn:目录换代本身已经
-	// 成功,缓存进不去不该让正在跑的网关报错。
+	// 基线落盘,下次启动才有 diff 基准(JS saveCatalogCache,src/index.js:248
+	// + :264)。写失败只 warn:目录换代本身已经成功,基线进不去不该让正在跑
+	// 的网关报错 —— 最坏代价是下次启动少打一行对比。
 	if err := catalog.SaveCache(p.catalogCacheFile(), ids, time.Now().UnixMilli()); err != nil {
-		logger.Warn(fmt.Sprintf("[app] 目录缓存落盘失败（继续运行）: %v", err))
+		logger.Warn(fmt.Sprintf("[app] 目录基线落盘失败（继续运行）: %v", err))
 	}
 	logger.Info(fmt.Sprintf("[app] catalog: %d free models via %s", len(list), via))
 }
 
-// limitsKeys 是覆盖层里的模型 id,按字典序稳定输出(JS 用 Object.keys,
-// Go 的 map 无序,顺序不同会让日志与测试抖动)。
-func (p *Parts) limitsKeys() []string {
-	p.overlayMu.Lock()
-	defer p.overlayMu.Unlock()
-	keys := make([]string, 0, len(p.overlayByID))
-	for id := range p.overlayByID {
-		keys = append(keys, id)
+// diffIDs 以集合语义对比两代 id 列表:added 在 next 不在 prev,removed 相反;
+// 各自保持输入里的首次出现顺序,同一列表内部的重复元素按一次计。
+func diffIDs(prev, next []string) (added, removed []string) {
+	prevSet := make(map[string]bool, len(prev))
+	for _, id := range prev {
+		prevSet[id] = true
 	}
-	sort.Strings(keys)
-	return keys
+	nextSet := make(map[string]bool, len(next))
+	for _, id := range next {
+		nextSet[id] = true
+	}
+	seen := make(map[string]bool)
+	for _, id := range next {
+		if !prevSet[id] && !seen[id] {
+			seen[id] = true
+			added = append(added, id)
+		}
+	}
+	seen = make(map[string]bool)
+	for _, id := range prev {
+		if !nextSet[id] && !seen[id] {
+			seen[id] = true
+			removed = append(removed, id)
+		}
+	}
+	return added, removed
+}
+
+// summarizeIDs 把 diff 列表压进一行日志:最多列 8 个,多的报个数。
+func summarizeIDs(ids []string) string {
+	const maxListed = 8
+	if len(ids) <= maxListed {
+		return strings.Join(ids, ", ")
+	}
+	return fmt.Sprintf("%s …等共 %d 个", strings.Join(ids[:maxListed], ", "), len(ids))
 }
 
 // applyOverlay 把覆盖层的容量值按精确 id 套到目录行上
@@ -475,10 +512,11 @@ func ApplyOverlay(list []catalog.Model, byID map[string]limits.OverlayRow) []cat
 	return out
 }
 
-// refreshLimitsOverlay 刷新 models.dev 覆盖层并按 JS 的两条分派重排目录
-// (src/index.js:327-352 逐字语义):
-//   - 有 upstream 列表 → build 后套覆盖层;
-//   - 没有 upstream 列表但覆盖层非空 → 用覆盖层 id 先把目录撑起来;
+// refreshLimitsOverlay 刷新 models.dev 覆盖层并重套目录数值。JS 的两条分派
+// (src/index.js:327-352)在 2026-10-03 剪掉了一条 —— 覆盖层快照混着上游已
+// 下架的 id,不再能撑目录:
+//   - 有 upstream 列表 → build 后套覆盖层数值;
+//   - 没有 upstream 列表 → 目录保持现状(冷启动即静态表),等下一轮目录刷新;
 //   - 抓取失败 → 保留上一份覆盖层只把 stale 置真(清空会让面板把
 //     「暂时查不到」显示成「额度全满」)。
 //
@@ -533,12 +571,10 @@ func (p *Parts) refreshLimitsOverlay(ctx context.Context) error {
 	p.upstreamMu.Unlock()
 	if haveUpstream {
 		p.catalog.set(p.applyOverlay(catalog.Build(ids)))
-	} else if len(byID) > 0 {
-		// catalog 拉取从未成功(如本机直连被封)时,用覆盖层的 id 先把列表
-		// 撑起来:picker 和预算都能工作,lane 真实性由后续 probe 校验
-		// (src/index.js:341-345)。
-		p.applyIDs(p.limitsKeys(), "models.dev overlay")
 	}
+	// 没有 upstream 列表时到此为止:目录 id 的唯一来源是上游列表(2026-10-03
+	// 裁决),覆盖层的快照 id 不再能撑目录 —— 保持现状(静态表),等下一轮
+	// 目录刷新成功后整体换代。
 	logger.Info(fmt.Sprintf("[app] limits overlay: %d opencode rows%s%s",
 		len(byID), staleSuffix(fetchErr), errSuffix(fetchErr)))
 	return nil
@@ -585,8 +621,8 @@ func (p *Parts) overlayCacheFile() string {
 	return filepath.Join(p.Root, "data", "modelsdev.json")
 }
 
-// catalogCacheFile 是 last-good 上游 id 列表(data/catalog-ids.json,
-// JS CATALOG_CACHE_FILE 同名同形状)。
+// catalogCacheFile 是「上次运行见过的 id」基线(data/catalog-ids.json,
+// JS CATALOG_CACHE_FILE 同名同形状;2026-10-03 起只作换代对比,不作目录来源)。
 func (p *Parts) catalogCacheFile() string {
 	return filepath.Join(p.Root, "data", "catalog-ids.json")
 }
