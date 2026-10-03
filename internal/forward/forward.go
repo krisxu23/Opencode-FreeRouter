@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"freerouter/internal/check"
@@ -97,6 +98,46 @@ type Config struct {
 type Server struct {
 	cfg  Config
 	http *http.Server
+	// busy 是「正在做工作」的请求计数(移植自 magpie busy.go):只数转发
+	// 端口上真正跑一轮对话的请求 —— GET/OPTIONS/探活不占数。lastDone 让
+	// 面板能区分「工具链间隙」(agent 在跑工具,没发请求但回合没完)与
+	// 「回合结束」(inFlight 落到 0 且 lastDone 刚刷新)。
+	busy busyCounter
+}
+
+// busyCounter 是转发在途请求的原子账本。inFlight 只数已鉴权的 POST 对话
+// 请求;lastDone 记最后一个请求完成的 unix 纳秒,0 表示进程启动以来还没
+// 完成过。
+type busyCounter struct {
+	inFlight atomic.Int64
+	lastDone atomic.Int64
+}
+
+// workBegin/workEnd 是对话请求的进出账;workEnd 记完成时刻。二者之间
+// panic 也由 handle 的 recover 兜底调 workEnd,账面不泄漏。
+func (s *Server) workBegin() { s.busy.inFlight.Add(1) }
+
+func (s *Server) workEnd() {
+	if n := s.busy.inFlight.Add(-1); n < 0 {
+		// 多余的 workEnd(理论不可达,防御):别把账压成负数。
+		s.busy.inFlight.Add(1)
+		return
+	}
+	s.busy.lastDone.Store(time.Now().UnixNano())
+}
+
+// Busy 是转发端口「正在做工作」的实时视图,给面板 /api/status 用。
+func (s *Server) Busy() ForwardBusy {
+	return ForwardBusy{
+		Requests: s.busy.inFlight.Load(),
+		Last:     s.busy.lastDone.Load(),
+	}
+}
+
+// ForwardBusy 是 busy 视图的形状(magpie Busy{Requests, Last} 同款)。
+type ForwardBusy struct {
+	Requests int64 `json:"requests"`
+	Last     int64 `json:"last"`
 }
 
 // serverReadHeaderTimeout / serverIdleTimeout / serverReadTimeout 是两个服务器
@@ -259,6 +300,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+		// busy 计数从 body 读完后开始:排队读 body 的慢连接不算「做工作」,
+		// 只数真正进对话处理的那一段。
+		s.workBegin()
+		defer s.workEnd()
 		s.chatCompletions(rw, r, body)
 		return
 	}
@@ -267,6 +312,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
+		s.workBegin()
+		defer s.workEnd()
 		s.responsesEndpoint(rw, r, body)
 		return
 	}

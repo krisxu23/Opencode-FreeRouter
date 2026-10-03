@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"freerouter/internal/check"
+	"freerouter/internal/engine"
 	"freerouter/internal/health"
 	"freerouter/internal/logger"
 	"freerouter/internal/panel"
@@ -524,12 +525,26 @@ func (p *Parts) Status() any {
 		diagnostics["stats"] = map[string]any{"lastError": p.StatsStore.LastError()}
 	}
 
+	// forward 视图:端口/鉴权之外再挂 busy(正在做工作的请求数 + 最后一次
+	// 完成时刻,magpie Busy 同款) —— 面板用它区分「工具链间隙」与「回合结束」。
+	forward := map[string]any{"running": true, "port": cur.ForwardPort, "key": cur.ForwardKey}
+	if p.Forward != nil {
+		forward["busy"] = p.Forward.Busy()
+	}
+	// lanes 是出口 IP 车道视图(ExitConcurrency 闸门的 busy/waiting/limit),
+	// 没开闸门时是空 map,前端藏卡片。
+	lanes := map[string]engine.Lane{}
+	if p.Engine != nil {
+		lanes = p.Engine.Lanes()
+	}
+
 	return map[string]any{
 		// probing 供面板把「探测中」渲染成状态而不是本地布尔:探测改异步
 		// 受理后(F5),前端不再自己维护探测期。
 		"probing":      p.probing.Load(),
 		"singbox":      singbox,
-		"forward":      map[string]any{"running": true, "port": cur.ForwardPort, "key": cur.ForwardKey},
+		"forward":      forward,
+		"lanes":        lanes,
 		"models":       ids,
 		"modelCaps":    caps,
 		"limits":       limits,
@@ -629,6 +644,7 @@ func (p *Parts) SettingsView() map[string]any {
 		"forwardPort":      s.ForwardPort,
 		"panelPort":        s.PanelPort,
 		"maxWallClockMs":   s.MaxWallClockMS,
+		"exitConcurrency":  s.ExitConcurrency,
 	}
 }
 
@@ -703,6 +719,7 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 	for _, key := range []string{
 		"subUrls", "countries", "probeEnabled", "probeWorkers", "probeIntervalMin",
 		"effortLevel", "defaultMaxTokens", "forwardPort", "panelPort", "maxWallClockMs",
+		"exitConcurrency",
 	} {
 		v, ok := patch[key]
 		if !ok {
@@ -770,7 +787,7 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 			} else {
 				clean[key] = n
 			}
-		case "probeWorkers", "probeIntervalMin", "forwardPort", "panelPort":
+		case "probeWorkers", "probeIntervalMin", "forwardPort", "panelPort", "exitConcurrency":
 			n, ok := settingsInt(v)
 			if !ok {
 				return nil, fmt.Errorf("app: 设置 %s 必须是整数", key)
@@ -795,6 +812,12 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 				// 收 256、运行时按 128 跑,设置页展示值与事实不符。
 				if n > 128 {
 					return nil, fmt.Errorf("app: 设置 probeWorkers 不能超过 128")
+				}
+			case "exitConcurrency":
+				// 0 = 不限是合法值;上限取 128 与 probeWorkers 同级 —— 超过
+				// 它的并发对一个免费池没有意义,只会把自己出口 IP 打成 429。
+				if n > 128 {
+					return nil, fmt.Errorf("app: 设置 exitConcurrency 不能超过 128")
 				}
 			}
 			clean[key] = n

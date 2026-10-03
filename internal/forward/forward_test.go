@@ -986,3 +986,166 @@ func TestUnknownModelMapsTo400(t *testing.T) {
 		t.Fatalf("status %d, want 400: %s", res.StatusCode, body)
 	}
 }
+
+// ---- chattidy 形状钉测试(移植自 magpie chattidy.go 的教训) ----
+//
+// magpie 是字节转发架构,要在流上现修四类真实客户端兼容形状;FreeRouter 是
+// 解析+重渲染架构,天然不产这些形状 —— 这里的测试把「永不产出」钉死,防止
+// 未来的渲染改动悄悄退化。四类形状:
+//
+//	(1) "reasoning_content":"" / "reasoning":"" 空思考增量 → 一字一行回复
+//	(2) "finish_reason":"" 空串 → OpenAI 契约是 null,严格客户端拒绝空串
+//	(3) tool-call 增量重复 "name":"" → 覆盖式合并组装出名为 "" 的工具调用
+//	(4) "tool_calls":[] 空数组 → 按存在性判断的客户端反复关闭文本块
+
+// streamAssert 沿流断言:每个 delta 帧的形状由 assert 把关,违规即 Fail。
+func streamAssert(t *testing.T, body string, assert func(t *testing.T, raw []byte, delta map[string]any, finish any)) {
+	t.Helper()
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		raw := []byte(payload)
+		var f struct {
+			Choices []struct {
+				Delta        map[string]any `json:"delta"`
+				FinishReason *string        `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(raw, &f); err != nil {
+			t.Fatalf("bad SSE JSON %q: %v", payload, err)
+		}
+		for _, c := range f.Choices {
+			var fin any
+			if c.FinishReason != nil {
+				fin = *c.FinishReason
+			}
+			assert(t, raw, c.Delta, fin)
+		}
+	}
+}
+
+func TestChatTidyNeverEmitsEmptyReasoningDelta(t *testing.T) {
+	// 形状(1):思考结束后的空 delta 不发帧。客户端把 "reasoning":""
+	// 当成一次新的思考开始,回复被拆成一字一行(Qoder 实测)。
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		for _, c := range []engine.Chunk{
+			{Kind: engine.ChunkReasoning, Text: "想"},
+			{Kind: engine.ChunkReasoning, Text: ""}, // 上游补的空增量
+			{Kind: engine.ChunkText, Text: "答"},
+		} {
+			if err := onChunk(c); err != nil {
+				return engine.Outcome{}, err
+			}
+		}
+		return engine.Outcome{Text: "答"}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m","stream":true}`)
+	sawReasoning := false
+	streamAssert(t, body, func(t *testing.T, raw []byte, delta map[string]any, _ any) {
+		if r, ok := delta["reasoning"]; ok {
+			sawReasoning = true
+			if s, _ := r.(string); s == "" {
+				t.Fatalf("流上出现空 reasoning 增量(chattidy 形状1): %s", raw)
+			}
+		}
+	})
+	if !sawReasoning {
+		t.Fatalf("非空 reasoning 增量丢失: %s", body)
+	}
+}
+
+func TestChatTidyFinishReasonIsNeverEmptyString(t *testing.T) {
+	// 形状(2):收尾帧的 finish_reason 要么是语义值要么缺省成 null,永远
+	// 不发 ""(OpenAI 契约是 null;AI SDK 严格拒绝空串)。
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		// 非流式线 onChunk 是 nil(chatCompletionOnce 不传),先护住。
+		if onChunk != nil {
+			if err := onChunk(engine.Chunk{Kind: engine.ChunkText, Text: "hi"}); err != nil {
+				return engine.Outcome{}, err
+			}
+		}
+		return engine.Outcome{Text: "hi"}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m","stream":true}`)
+	streamAssert(t, body, func(t *testing.T, raw []byte, _ map[string]any, finish any) {
+		if s, ok := finish.(string); ok && s == "" {
+			t.Fatalf("finish_reason 空串(chattidy 形状2): %s", raw)
+		}
+	})
+	// 非流式同款:choice.finish_reason 不为 ""。
+	_, body2 := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m"}`)
+	if s, ok := firstChoice(t, decode(t, body2))["finish_reason"].(string); ok && s == "" {
+		t.Fatalf("非流式 finish_reason 空串: %s", body2)
+	}
+}
+
+func TestChatTidyToolCallNameCarriedOnce(t *testing.T) {
+	// 形状(3):只有每个调用的首帧带 id+name,后续增量帧绝不重复 —— 覆盖式
+	// 合并的客户端(grok CLI)会把重复的 "name":"" 组装成名为 "" 的工具调用,
+	// 报 "Tool not found"。(TestToolCallFirstFrameCarriesIDAndName 已断言
+	// 帧数与首帧形状;这里从原始字节角度再钉一次「name 只出现一次」。)
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		for _, c := range []engine.Chunk{
+			engine.ToolCallDeltaChunk(0, "call_1", "search", `{"q":`),
+			engine.ToolCallDeltaChunk(0, "", "", `"x"}`),
+		} {
+			if err := onChunk(c); err != nil {
+				return engine.Outcome{}, err
+			}
+		}
+		return engine.Outcome{ToolCalls: []engine.ToolCall{{ID: "call_1", Name: "search", Arguments: `{"q":"x"}`}}}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m","stream":true}`)
+	nameFrames := 0
+	streamAssert(t, body, func(t *testing.T, raw []byte, delta map[string]any, _ any) {
+		tc, ok := delta["tool_calls"].([]any)
+		if !ok {
+			return
+		}
+		call := tc[0].(map[string]any)
+		fn, _ := call["function"].(map[string]any)
+		if fn == nil {
+			return
+		}
+		if n, ok := fn["name"].(string); ok {
+			if n == "" {
+				t.Fatalf("工具增量帧携带空 name(chattidy 形状3): %s", raw)
+			}
+			nameFrames++
+		}
+	})
+	if nameFrames != 1 {
+		t.Fatalf("name 应只出现在首帧一次, got %d 次: %s", nameFrames, body)
+	}
+}
+
+func TestChatTidyNoEmptyToolCallsArray(t *testing.T) {
+	// 形状(4):delta 里不出现 "tool_calls":[] —— 按存在性(不看内容)判断
+	// 的客户端(Qoder)会认为文本块结束了,正文被反复关闭。
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		if err := onChunk(engine.Chunk{Kind: engine.ChunkText, Text: "hi"}); err != nil {
+			return engine.Outcome{}, err
+		}
+		return engine.Outcome{Text: "hi"}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m","stream":true}`)
+	streamAssert(t, body, func(t *testing.T, raw []byte, delta map[string]any, _ any) {
+		if tc, ok := delta["tool_calls"].([]any); ok && len(tc) == 0 {
+			t.Fatalf("delta 出现空 tool_calls 数组(chattidy 形状4): %s", raw)
+		}
+	})
+}

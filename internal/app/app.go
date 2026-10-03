@@ -74,6 +74,9 @@ type Settings struct {
 	MaxAttempts      int      `json:"maxAttempts"`
 	MaxWallClockMS   int64    `json:"maxWallClockMs"`
 	ForwardKey       string   `json:"forwardKey"`
+	// ExitConcurrency 是同一出口 IP 的最大在途请求数(magpie lanes 闸门)。
+	// <=0 表示不限。排队不占在途计数、不算失败。
+	ExitConcurrency int `json:"exitConcurrency"`
 }
 
 // Parts is the running gateway.
@@ -229,6 +232,7 @@ func defaultSettings() Settings {
 		MaxAttempts:      20,
 		MaxWallClockMS:   0,
 		ForwardKey:       "",
+		ExitConcurrency:  0, // 不限;面板显式开启后才生效
 	}
 }
 
@@ -455,6 +459,7 @@ func Load(root string) (*Parts, error) {
 				DefaultMaxTokens: maxTokens,
 				MaxAttempts:      live.MaxAttempts,
 				MaxWallClockMS:   live.MaxWallClockMS,
+				ExitConcurrency:  live.ExitConcurrency,
 			}
 		},
 		// RecordUsage:base id 由引擎给到(stream.Usage 是 harness 形状,

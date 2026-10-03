@@ -84,6 +84,10 @@ type Settings struct {
 	DefaultMaxTokens int
 	MaxAttempts      int
 	MaxWallClockMS   int64
+	// ExitConcurrency 是同一出口 IP 上允许的最大在途请求数(magpie 的
+	// lanes 闸门):超出的请求按先来后到排队,等到槽位再发出 —— 排队不
+	// 是失败,不换出口、不记错误。<=0 表示不限。
+	ExitConcurrency int
 }
 
 // Request is one client turn, already normalized by the forward layer.
@@ -233,13 +237,21 @@ const maxWallClockDefault = 0
 
 // ---- 编排器 ----
 
-// Engine 是轮换编排器;它自身无状态,一轮的全部可变量都在 Complete 的栈上,
-// 因此并发请求互不串账(TestConcurrentCompletesDoNotMixRouteRecords)。
-type Engine struct{ deps Deps }
+// Engine 是轮换编排器。lanes 是出口 IP 车道闸门(ExitConcurrency),它
+// 的状态跨请求存活 —— 除它之外引擎自身无状态,一轮的全部可变量都在
+// Complete 的栈上,因此并发请求互不串账(TestConcurrentCompletesDoNotMixRouteRecords)。
+type Engine struct {
+	deps Deps
+	// exitLanes 按「acquire 时的出口 IP」记车道;视图走 Lanes() 给面板。
+	exitLanes lanes
+}
 
 // NewEngine 绑定依赖。Deps 全是回调:池子、设置与目录都可能被一次 rebuild
 // 整体替换,快照在 Complete 里取一次(见 Deps 注释)。
 func NewEngine(deps Deps) *Engine { return &Engine{deps: deps} }
+
+// Lanes 是全部出口车道视图(busy/waiting/limit),给面板 /api/status 用。
+func (e *Engine) Lanes() map[string]Lane { return e.exitLanes.snapshot() }
 
 func (e *Engine) logf(msg string) {
 	if e.deps.Log != nil {
@@ -407,11 +419,21 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			return Outcome{}, errors.Failure{Code: codeOrServer(lastFailure), Status: 503, Message: message}
 		}
 		snapshot.Health.NoteSticky(session, picked.NodeKey, withinTurn)
+		// 出口车道闸门(magpie lanes):同一出口 IP 最多 ExitConcurrency 个
+		// 在途,超出的排队等槽 —— 排队不是失败,不换出口、不记错误。排队
+		// 时不占在途 busyIP 计数(那是发给上游后的量),轮到才取 IP。
+		exitIP := snapshot.Health.ExitIPOf(picked.NodeKey, attemptStartedAt)
+		releaseLane, ok := e.exitLanes.acquire(ctx, exitIP, settings.ExitConcurrency)
+		if !ok {
+			// 客户端在排队时离开了:这一轮作废,什么都没发出去。
+			return Outcome{}, ctx.Err()
+		}
 		// 在途计数拿 IP 当令牌,acquire 时取一次、release 还同一个
 		// (engine.js:269/:312)。不能在 release 时重新解析 IP:探测轮可能
 		// 在这个请求跑着的时候把节点量到另一个 IP,那样会还错对象、把另一个
-		// 出口的计数清掉(TestExitBusyTokenIsTheIPAtAcquireTime)。
-		busyIP := snapshot.Health.NoteExitBusy(snapshot.Health.ExitIPOf(picked.NodeKey, attemptStartedAt))
+		// 出口的计数清掉(TestExitBusyTokenIsTheIPAtAcquireTime)。车道闸门
+		// 同理:release 还的是 acquire 时的那个 IP。
+		busyIP := snapshot.Health.NoteExitBusy(exitIP)
 
 		var outcome Outcome
 		var finish FinishReason
@@ -419,8 +441,11 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 		var failure *errors.Failure
 		func() {
 			// 唯一归还点:defer 保证 attempt 的每条出路(含 panic)都不泄漏
-			// 在途计数 —— engine.js:308-313 的 finally 语义,continue(换出口)
-			// 和三条 throw(额度用满/不可重试/无候选)全从这里走过。
+			// 在途计数与车道槽位 —— engine.js:308-313 的 finally 语义,
+			// continue(换出口)和三条 throw(额度用满/不可重试/无候选)全
+			// 从这里走过。defer 逆序执行:先还 busyIP 再还车道槽(与获取
+			// 顺序相反,LIFO 正确)。
+			defer releaseLane()
 			defer snapshot.Health.ReleaseExitBusy(busyIP)
 			outcome, finish, sawContent, failure = e.attempt(ctx, attemptInput{
 				snapshot:   snapshot,

@@ -112,13 +112,24 @@
     for (let i = 0; i < NOISE_PATTERNS.length; i++) if (NOISE_PATTERNS[i].test(msg)) return true
     return false
   }
+  /* lanes 是出口车道视图 {ip: {busy, waiting, limit}}（ExitConcurrency 闸门）。
+     渲染成表行；没有任何活动时返回空串（实时负载卡整体隐藏）。 */
+  function laneRows(lanes) {
+    const keys = Object.keys(lanes || {}).sort()
+    if (!keys.length) return ''
+    return keys.map(function (ip) {
+      const l = lanes[ip]
+      return '<tr><td class="mono">' + esc(ip) + '</td><td>' + l.busy + '</td>'
+        + '<td>' + (l.waiting || 0) + '</td><td>' + (l.limit > 0 ? l.limit : '∞') + '</td></tr>'
+    }).join('')
+  }
   const $ = id => document.getElementById(id)
 
   /* ═══════════════════════════════════════════════════════════════════
      3. 状态
      ═══════════════════════════════════════════════════════════════════ */
   const DATA = Object.assign(
-    { singbox:{}, forward:{}, models:[], modelCaps:{}, limits:null, regionModels:[],
+    { singbox:{}, forward:{}, lanes:{}, models:[], modelCaps:{}, limits:null, regionModels:[],
       nodes:[], usage:{ today:{ req:0, in:0, out:0 }, requests:0, byModel:{} },
       diagnostics:{}, settings:{}, logs:[] },
     window.__BOOT__ || {}
@@ -144,6 +155,7 @@
       probeWorkers: String(s.probeWorkers == null ? 24 : s.probeWorkers),
       probeIntervalMin: String(s.probeIntervalMin == null ? 30 : s.probeIntervalMin),
       maxWallClockMs: String(s.maxWallClockMs == null ? 0 : s.maxWallClockMs),
+      exitConcurrency: String(s.exitConcurrency == null ? 0 : s.exitConcurrency),
     }
     S.baseline = JSON.parse(JSON.stringify({ order: S.order, form: S.form }))
   }
@@ -383,6 +395,21 @@
     + '        <span class="mono">输出 ' + fmtTok(today.out) + '</span></div>'
     + '    </div>'
     + '  </div>'
+
+    + ((fw.busy && fw.busy.requests > 0) || laneRows(D.lanes)
+        ? '  <div class="card sec"><div class="card-head"><h2>实时负载</h2>'
+          + '<span class="sub">正在做工作的请求与出口车道</span></div>'
+          + '<div class="card-body">'
+          + (fw.busy && fw.busy.requests > 0
+              ? '<div class="cred-row"><span class="k">在途请求</span>'
+                + '<b>' + fw.busy.requests + '</b><span class="dim">个正在跑（agent 工具链间隙也会保持计数，直到回合完成）</span></div>'
+              : '')
+          + (laneRows(D.lanes)
+              ? '<table class="tbl" style="margin-top:6px"><thead><tr><th>出口 IP</th><th>在途</th><th>排队</th><th>限额</th></tr></thead><tbody>'
+                + laneRows(D.lanes) + '</tbody></table>'
+              : '')
+          + '</div></div>'
+        : '')
 
     + '  <div class="sec"><div class="cred">'
     + '    <div class="cred-head">' + I.bolt + '<h2>接入信息</h2>'
@@ -918,6 +945,10 @@
     + '        <input type="number" id="f-maxWallClockMs" value="' + esc(S.form.maxWallClockMs) + '" placeholder="0" style="max-width:320px" min="0">'
     + '        <div class="help">一轮请求的总耗时上限，0 = 不限（默认）。不设上限时，连续命中慢超时节点的'
     + '请求最坏可挂到小时级（20 次尝试 × 300s 超时）；设一个宽松值（如 600000 = 10 分钟）可以兜住它。</div></div>'
+    + '      <div class="field"><label class="lbl" for="f-exitConcurrency">单出口并发上限</label>'
+    + '        <input type="number" id="f-exitConcurrency" value="' + esc(S.form.exitConcurrency) + '" placeholder="0" style="max-width:320px" min="0" max="128">'
+    + '        <div class="help">同一个出口 IP 上最多的在途请求数，0 = 不限（默认）。超出的请求在网关内'
+    + '排队等槽（不算失败、不换出口），请求发出前不占「在途」计数。并发敏感的代理出口设 3～5 可以少挨上游限流。</div></div>'
     + '    </div></div>'
 
     + '  <div class="card sec"><div class="card-head"><h2>危险操作</h2></div>'
@@ -1060,6 +1091,8 @@
     if (s.nodes) DATA.nodes = s.nodes
     if (s.usage) DATA.usage = s.usage
     if (s.diagnostics) DATA.diagnostics = s.diagnostics
+    /* 车道视图与 busy 一起随 5s 轮询更新；没有闸门活动时是空对象。 */
+    if (s.lanes) DATA.lanes = s.lanes
     /* F5：probing 位以服务端为准 —— 异步受理后，前端本地的乐观值只活到
        下一次 /api/status 轮询（5s）；探测完成/失败也由这里复位按钮。 */
     if (typeof s.probing === 'boolean') S.probing = s.probing
@@ -1090,6 +1123,8 @@
       d.rows.map(r => r.model + ':' + r.req + ':' + (r.in + r.out)).join(','),
       JSON.stringify(DATA.singbox), JSON.stringify(DATA.limits),
       JSON.stringify(DATA.diagnostics), S.probing ? 1 : 0,
+      JSON.stringify(DATA.lanes || {}),
+      (DATA.forward && DATA.forward.busy ? DATA.forward.busy.requests : 0),
       S.routes.length + ':' + (S.routes.length ? JSON.stringify(S.routes[S.routes.length - 1]) : '')
     ].join('|')
   }
@@ -1169,11 +1204,13 @@
       subUrls: S.form.subUrls.split('\n').map(function (x) { return x.trim() }).filter(Boolean),
       countries: S.order.slice(),
       probeEnabled: S.form.probeEnabled,
-      /* I26：后端硬上限 256，HTML 的 max 只是提示。前端 clamp 而不是放行 400 */
-      probeWorkers: Math.min(256, Math.max(1, Number(S.form.probeWorkers) || 24)),
+      /* 后端硬上限 128，HTML 的 max 只是提示。前端 clamp 而不是放行 400 */
+      probeWorkers: Math.min(128, Math.max(1, Number(S.form.probeWorkers) || 24)),
       probeIntervalMin: Number(S.form.probeIntervalMin) || 30,
       /* 0 = 不限(默认)；负数按 0 归一 */
       maxWallClockMs: Math.max(0, Math.round(Number(S.form.maxWallClockMs) || 0)),
+      /* 0 = 不限(默认)；同一出口 IP 的最大在途数 */
+      exitConcurrency: Math.min(128, Math.max(0, Math.round(Number(S.form.exitConcurrency) || 0))),
       effortLevel: S.form.effortLevel || 'balanced',
       /* 空值 = 不额外设限（每个模型用自己车道的上限）。必须发 null 而不是 undefined
          —— JSON.stringify 会丢掉 undefined，旧值就会活过整个往返，字段永远清不掉。 */
@@ -1333,6 +1370,7 @@
     const fmap = {
       'f-subUrls':'subUrls', 'f-probeWorkers':'probeWorkers', 'f-probeIntervalMin':'probeIntervalMin',
       'f-effortLevel':'effortLevel', 'f-defaultMaxTokens':'defaultMaxTokens', 'f-maxWallClockMs':'maxWallClockMs',
+      'f-exitConcurrency':'exitConcurrency',
     }
     if (fmap[t.id]) { S.form[fmap[t.id]] = t.value; checkDirty() }
   })

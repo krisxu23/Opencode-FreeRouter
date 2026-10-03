@@ -491,10 +491,15 @@ func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[strin
 				Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{Content: ptr(c.Text)}}},
 			})
 		case engine.ChunkReasoning:
-			start()
-			if c.Text != "" {
-				forwarded = true
+			if c.Text == "" {
+				// 空思考增量不发帧(magpie chattidy 修的四类形状之一):某些
+				// 上游在思考结束时补一个空 delta,渲染成 "reasoning":"" 后,
+				// 严格客户端(Qoder 一类)会把它当成一次新的思考开始,回复
+				// 被拆成一字一行。start() 也不调 —— 空帧不值得花掉骨架帧。
+				return nil
 			}
+			start()
+			forwarded = true
 			stream.send(chunkFrame{
 				ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 				Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{Reasoning: ptr(c.Text)}}},
