@@ -65,5 +65,11 @@ GPL-3.0-or-later（`LICENSE`）—— 因为 sing-box 是以库的形式链接�
 * `npm run release` 重新汇总上面两项，并打出 GPL 源码包到 `release/`
 * Release 页同时挂 zip 与同版本的源码包 —— 只发二进制就是一次 GPL 违规
 
+> **发布契约**：版本号只认 `package.json` 的 `version`。往 `main` 传改动产品代码
+> （`internal/`、`cmd/`、`scripts/`、`web/`、`go.mod`）的提交时，**必须在同一次推送里
+> bump 这个版本号**，CI 的 gates 会拦住没 bump 的那次；bump 之后 `release` 作业会为该
+> 版本号自动建 tag 并发布 zip + 源码包，不用再手动打 tag。只改文档或 CI 的推送不发新版，
+> 这是刻意的。
+
 > 构建契约（`GOPROXY=off`、链接标签、工具链版本）写在 `scripts/go-build.mjs` 的头注释里，
 > 分层与依赖规则在 `internal/LAYERS.md`，本文件只讲这个程序做什么。

@@ -10,7 +10,12 @@ name: release
 # Windows 可执行 zip，并把同版本的 GPL 对应源码包挂到同一个 Release 上 —— 只发 exe
 # 不发源码是一次 GPL 违规，所以两者必须在同一个分发位置，缺一不可。
 #
-# 四个不显然的点：
+# 五个不显然的点：
+#   - 发布契约（2026-10-03）：往 main 传新代码就要重新出 exe。版本号只认 package.json，
+#     所以 gates 里有一道「改了产品代码必须同一次 push 里 bump version」的门禁，而
+#     release 作业在 main 与 v* tag 两条路径上都会为「还没发过的那个版本号」发布 ——
+#     不 bump 就红，bump 了就自动有下载，不需要人再记得打 tag。只改文档/CI 的 push
+#     版本号不动 ⇒ 不发布，这是刻意的（省一次完整 Go 构建，也不会多出标签）。
 #   - setup-node 仍然要装：CI 跑的是 scripts/*.mjs，它们是唯一的构建/测试入口
 #     （全局约束 1），不是可选的便捷封装。
 #   - `go mod download` 必须显式跑：scripts/go-build.mjs 的 goEnv() 硬写
@@ -37,7 +42,60 @@ jobs:
   gates:
     runs-on: windows-latest
     steps:
+      # fetch-depth: 0 是「改了产品代码就必须同一次 push 里 bump 版本」这道门禁的前提：
+      # 默认只检出 head 一个提交，`github.event.before` 那个提交根本不在本地，
+      # 一次推多个提交（我们的常态）就没法算出这次 push 动了哪些文件。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 对外发布的契约（2026-10-03 裁定：以后往 main 上传新代码，都要重新构建并发布
+      # 新的 exe）。版本号只有一个事实源 —— package.json 的 version，release 作业就
+      # 按它推导要发哪个 tag；版本号不前进，这一版代码就没人能下载到。所以「动了产品
+      # 代码」和「bump 了版本」必须出现在同一次 push 里，否则红。
+      # 只卡 push:main：PR 阶段版本号可以后补（合并那一刻才要求一致），tag 事件本身就是
+      # 发布动作，而只改文档/CI 的 push 不发新版是刻意的（zip 里的 README 值得为它重跑
+      # 一次完整的 Go 构建）。
+      - name: Product changes must bump the version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          $zero = '0000000000000000000000000000000000000000'
+          # 不用 `(cmd; expr)` 这种括号内多语句写法:pwsh 会把它当成子表达式数组,
+          # -and 拿到的是集合而不是布尔值,判定就会飘(而且不同版本行为不一致)。
+          $reachable = $false
+          if ($env:BEFORE -ne $zero) {
+            git cat-file -e "$($env:BEFORE)^{commit}" 2>$null
+            $reachable = ($LASTEXITCODE -eq 0)
+          }
+          if ($reachable) {
+            $files = git diff --name-only $env:BEFORE $env:SHA
+          } else {
+            # 分支首推 / 强推 / 浅历史：退化成只看 head 那一个提交，仍然能抓住
+            # 「改了代码没 bump 版本」这一种主要情形。
+            Write-Host "before=$($env:BEFORE) 不可达，只比对 head 提交"
+            $files = git show --name-only --pretty=format: $env:SHA
+          }
+          # 「产品路径」= 会进入交付二进制的路径。*_test.go 刻意排除在外：它改了
+          # 也不影响发出去的 exe，为它 bump 版本会发布一个内容与上一个 Release 字节
+          # 相同的下载，那是噪音不是发布。scripts/ 与 web/ 留在集合里，因为它们真的
+          # 进产物（构建契约本身，以及 go:embed 进二进制的面板资产）。
+          $all = $files | Where-Object { $_ -notmatch '_test\.go$' }
+          $product = $all | Where-Object { $_ -match '^(internal/|cmd/|scripts/|web/|go\.mod|go\.sum)' }
+          if (-not $product) { Write-Host "没有产品代码改动，无需 bump 版本"; exit 0 }
+          if (-not ($files | Where-Object { $_ -eq 'package.json' })) {
+            throw (
+              "改了产品代码但 package.json 的 version 没有前进。`n" +
+              "本次动到的产品路径：`n" + ($product | ForEach-Object { "  " + $_ }) -join "`n" +
+              "`n发布契约：同一次 push 里 bump version，release 作业会为该版本号自动建 tag 并" +
+              "发布 zip + GPL 源码包；不 bump 就等于这一版没人能拿到。"
+            )
+          }
+          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Write-Host "版本已前进到 v$v，release 作业会据此发布"
 
       - uses: actions/setup-node@v4
         with:
@@ -90,46 +148,70 @@ jobs:
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
           }
 
-  # 只在 v* tag 上跑；gates 绿了才发（同一 run 里 needs 就是这道门）。
+  # gates 绿了才发（同一 run 里 needs 就是这道门）。2026-10-03 起两条路径都发：
+  # 手动打 v* tag（原路径），以及「main 上出现一个还没发过的版本号」—— 后者落实
+  # 对外发布的裁定（往 main 传新代码就要重新出 exe）。两条路径算出的是同一个 tag，
+  # 因为版本号只有 package.json 一个事实源。
   release:
     needs: gates
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
+      # 先算出这次要发的 tag，再决定后面几步跑不跑。**同一个版本号只发一次**：main 上
+      # 后续那些不动产品代码的 push（改文档、改 CI）不该把已发布的版本重发一遍，也不该
+      # 多出第二个 tag。tag 事件仍然检查「tag == package.json」—— 二进制与「完整对应
+      # 源码」必须指同一个版本，否则 GPL 的配对承诺是空的。
+      - name: Resolve the release tag
+        id: rel
+        shell: pwsh
+        env:
+          REF: ${{ github.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = "v$v"
+          if ($env:REF -like 'refs/tags/*') {
+            $tagName = $env:REF -replace '^refs/tags/', ''
+            if ($tagName -ne $tag) { throw "tag=$tagName 而 package.json=$v，两者必须一致" }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "$tag 已经发布过，跳过发布（版本没前进的 push 不发新 exe）"
+            "skip=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "skip=false" >> $env:GITHUB_OUTPUT
+          }
+
       - uses: actions/setup-node@v4
+        if: steps.rel.outputs.skip != 'true'
         with:
           node-version: 24
 
       - uses: actions/setup-go@v5
+        if: steps.rel.outputs.skip != 'true'
         with:
           go-version-file: go.mod
 
       - name: Warm the module cache
+        if: steps.rel.outputs.skip != 'true'
         run: go mod download
 
       - name: Build FreeRouter.exe
+        if: steps.rel.outputs.skip != 'true'
         run: node scripts/build-tray-exe.mjs
-
-      # 二进制与「完整对应源码」必须指同一个版本，否则 GPL 的配对承诺是空的。
-      # 版本号只认 package.json，tag 得是它的 v 前缀形。
-      - name: Tag must match package.json
-        shell: pwsh
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          if ("v$v" -ne $env:TAG) { throw "tag=$env:TAG 而 package.json=$v，两者必须一致" }
 
       # 面板的 index.html/app.js 已经编进 exe（web.FS），zip 里不再带 web/。
       # 剩下三份是文书不是资源：读它们的人是下载者，不是程序，嵌进二进制就等于没告知。
       - name: Package zip
+        if: steps.rel.outputs.skip != 'true'
         shell: pwsh
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path FreeRouter.exe, LICENSE, NOTICE, README.md -DestinationPath "dist/FreeRouter-$env:TAG-windows-x64.zip"
@@ -139,17 +221,23 @@ jobs:
       # 实测 3.8.9 直接「Option --sort=name is not supported」）。Git Bash 的 /usr/bin
       # 在 PATH 前面，那里的 tar 是本机验证过的 GNU tar 1.35。
       - name: GPL source tarball
+        if: steps.rel.outputs.skip != 'true'
         shell: bash
         run: |
           node scripts/make-source-tarball.mjs
           cp release/*-source.tar.gz dist/
           ls -la dist
 
+      # --target 必须是显式的本次提交：main 触发的发布是「由 release create 顺手建 tag」，
+      # 不写 target 时 gh 会去猜仓库默认分支的 HEAD，两次 push 挤在一起就会把 tag 打到
+      # 别的提交上，于是「这个 zip 对应这个源码包」的配对承诺落空。
       - name: Publish
+        if: steps.rel.outputs.skip != 'true'
         shell: pwsh
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          SHA: ${{ github.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $notes = 'OpenAI 兼容的本地网关（Windows x64）。解压到任意目录，双击 FreeRouter.exe，托盘出现图标就已在跑；面板 http://127.0.0.1:3458/ ，接入点 http://127.0.0.1:3457/v1 。免安装、无运行时依赖；订阅地址要自己填。 同一个 Release 里的 freerouter-*-source.tar.gz 是这份二进制的完整对应源码（GPL-3.0-or-later，含依赖许可证全文与构建脚本）。'
-          gh release create $env:TAG --title "FreeRouter $env:TAG" --notes $notes (Get-ChildItem dist).FullName
+          gh release create $env:TAG --target $env:SHA --title "FreeRouter $env:TAG" --notes $notes (Get-ChildItem dist).FullName

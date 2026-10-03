@@ -1,6 +1,6 @@
 {
   "name": "freerouter",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "type": "module",
   "description": "FreeRouter: OpenAI-compatible forward to opencode.ai free lane, with sing-box linked in as a library",
