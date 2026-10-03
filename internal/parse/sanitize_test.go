@@ -199,6 +199,35 @@ func TestSanitizeEnforcesThePortVocabulary(t *testing.T) {
 	}
 }
 
+// TestSanitizeObfsPasswordMatchesSingBoxPredicate 钉住整分支评审的 NIT-8:
+// 密码判据必须与 sing-box 同形 —— 它判的是 `options.Obfs.Password == ""`
+// (protocol/hysteria2/outbound.go:65),纯空白在**它那边是一个合法密钥串**。
+// 我们多一次 TrimSpace 就是替订阅方丢掉一个能用的节点,而且这条丢弃会混进
+// 「剔除 N 个坏节点」的计数里,运维根本看不出是自己把它判死的。
+//
+// 判据要比上游严,只能严在「上游同样会拒」的地方:type 走 enum 比较
+// (option/hysteria2.go:85-91,空白值也是 unknown obfs type),所以 type 这一侧
+// 保留 TrimSpace。
+func TestSanitizeObfsPasswordMatchesSingBoxPredicate(t *testing.T) {
+	blank, ok := SanitizeOutbound(Outbound{Type: "hysteria2", Server: "h", ServerPort: 443,
+		Password: "p", Obfs: &Obfs{Type: "salamander", Password: "  "}})
+	if !ok {
+		t.Fatal("空白 obfs 密码被我们判死了,而 sing-box 会照常接受这个节点")
+	}
+	if blank.Obfs.Password != "  " {
+		t.Fatalf("sanitize 不该改写密码: %q", blank.Obfs.Password)
+	}
+	if _, ok := SanitizeOutbound(Outbound{Type: "hysteria2", Server: "h", ServerPort: 443,
+		Password: "p", Obfs: &Obfs{Type: "  ", Password: "x"}}); ok {
+		t.Fatal("空白 obfs type 应当被拒(sing-box 的 enum 比较同样会拒)")
+	}
+	// 真·空密码照旧拒绝:那才是 "missing obfs password"。
+	if _, ok := SanitizeOutbound(Outbound{Type: "hysteria2", Server: "h", ServerPort: 443,
+		Password: "p", Obfs: &Obfs{Type: "salamander"}}); ok {
+		t.Fatal("空密码必须被拒")
+	}
+}
+
 // TestSanitizeKeepsTlsOnHttpOutbound 钉住 R24:tlsCapableTypes 把 http 和
 // socks/shadowsocks/ssh 归成一类,但 sing-box v1.14 的 http 出站**有** tls
 // (protocol/http/outbound.go:37 用 options.TLS 建 dialer;socks/ss/ssh 确实没有)

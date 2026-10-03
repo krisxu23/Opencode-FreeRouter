@@ -249,7 +249,13 @@ func SanitizeOutbound(o Outbound) (Outbound, bool) {
 	// (protocol/hysteria2/outbound.go:64-77),同理在这里判掉 —— 上面已经把非
 	// hysteria2 的 Obfs 清了,所以这条只会作用到真正带 obfs 的节点。
 	if o.Obfs != nil {
-		if strings.TrimSpace(o.Obfs.Password) == "" || strings.TrimSpace(o.Obfs.Type) == "" {
+		// 密码按**精确空串**判,与 sing-box 同形(整分支评审 NIT-8):它判的是
+		// `options.Obfs.Password == ""`,纯空白在人家那边是合法密钥串;我们多一次
+		// TrimSpace 就是替订阅方丢掉一个能用的节点,而且这种丢弃还会混进
+		// 「剔除 N 个坏节点」的计数,运维看不出是自己把它判死的。
+		// type 仍用 TrimSpace:那边是 enum 比较(option/hysteria2.go:85-91),带
+		// 空白的 type 上游同样会拒 —— 严只能严在「上游也会拒」的地方。
+		if o.Obfs.Password == "" || strings.TrimSpace(o.Obfs.Type) == "" {
 			return Outbound{}, false
 		}
 	}

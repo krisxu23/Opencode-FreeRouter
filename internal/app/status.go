@@ -56,50 +56,107 @@ func (p *Parts) now() time.Time {
 
 func (p *Parts) nowMS() int64 { return p.now().UnixMilli() }
 
-// afterFunc 排一个延时回调,并把定时器登记进 p.timers 以便关停时统一停掉。
-// 回调在 fn() 之前先把自己摘出登记表:否则进程跑上几天,这个切片会跟着
-// 每轮探测/重建无限增长。
+// timerSlot 是 p.timers 的一格。所有字段只在 p.timersMu 下读写。
+//
+// 三个位而不是一个 *time.Timer,是因为「谁负责归还 timersWG 计数」有三种终局:
+//   - 回调跑了(wrapped 自己 Done)→ fired;
+//   - 被关停抢先 Stop 掉(Stop 返回 true,回调不会再跑)→ 由 stopPendingTimers
+//     归还 → stopped;
+//   - 接缝吞掉了定时器(没有 timer 可停、也没有回调会来)→ 由 afterFunc 归还。
+//
+// 谁归还只能有一个答案,否则 timersWG 要么挂死要么被 Done 超次(panic)。
+type timerSlot struct {
+	t       *time.Timer
+	fired   bool
+	stopped bool
+	dropped bool
+}
+
+// afterFunc 排一个延时回调,并把它登记进 p.timers 以便关停时统一停掉。
+//
+// 登记用 timerSlot 这一层间接(整分支评审 RISK-5),不是直接把 *time.Timer 存进
+// 表里,原因有两个:
+//   - 旧写法里回调读的是主线程那个尚未被同步赋值的 `self` 变量 —— 与
+//     rememberTimer 的写之间没有任何同步边,是形式上的数据竞态;而
+//     internal/app 恰好是唯一跑不了 -race 的包(sing-box v1.14 自身的竞态淹没
+//     了它),所以这条竞态在 CI 里永远不可见。
+//   - 更要紧的是次序:回调若在登记之前跑完,forgetTimer(self) 拿到 nil 直接早退,
+//     随后 rememberTimer 把一个**已经触发过**的定时器追加进表 —— 它再没有摘除
+//     点,p.timers 就随探测/重建轮次只长不消,正是 B9 要防的那类不回收。
+//
+// slot 在排程之前就进表,回调按格摘除,attach 时若发现这一格已被摘掉(回调跑过
+// 或已被关停停掉)就不再登记;关停之后排程的一律当场 Stop,绝不留悬格。
 func (p *Parts) afterFunc(d time.Duration, fn func()) *time.Timer {
 	p.timersWG.Add(1)
-	var self *time.Timer
+	slot := &timerSlot{}
+	p.timersMu.Lock()
+	p.timers = append(p.timers, slot)
+	closed := p.timersClosed
+	p.timersMu.Unlock()
+
 	wrapped := func() {
 		defer p.timersWG.Done()
-		p.forgetTimer(self)
+		p.timersMu.Lock()
+		slot.fired = true
+		p.dropTimerLocked(slot)
+		p.timersMu.Unlock()
 		fn()
 	}
+
+	var t *time.Timer
+	if closed {
+		// 关停已经收过表:这一发排下去也没人再停它,直接判为不再跑。
+		p.timersWG.Done()
+		p.timersMu.Lock()
+		p.dropTimerLocked(slot)
+		p.timersMu.Unlock()
+		return nil
+	}
 	if p.afterFuncFn != nil {
-		self = p.afterFuncFn(d, wrapped)
+		t = p.afterFuncFn(d, wrapped)
 	} else {
-		self = time.AfterFunc(d, wrapped)
+		t = time.AfterFunc(d, wrapped)
 	}
-	p.rememberTimer(self)
-	return self
-}
 
-// rememberTimer/forgetTimer 维护 p.timers。测试接缝 afterFuncFn 允许返回 nil
-// (swallowTimers 就是这么做的),nil 不登记 —— 它本来就不会触发,也没有
-// Stop 可以调。
-func (p *Parts) rememberTimer(t *time.Timer) {
-	if t == nil {
-		return
-	}
 	p.timersMu.Lock()
-	p.timers = append(p.timers, t)
+	if slot.fired || slot.stopped {
+		// 回调已经跑过(接缝同步调用、或 0 延时抢先),或者这一格已经被摘除:
+		// 表里不能再留它。nil 接缝(swallowTimers)走的是同一条路 —— 没有可 Stop
+		// 的东西,也没有回调来摘它。
+		if t == nil {
+			slot.stopped = true // 计数已由 wrapped 归还(接缝同步跑过)或无人归还
+		}
+		p.timersMu.Unlock()
+		return t
+	}
+	if t == nil {
+		// 测试接缝吞掉了定时器。**计数归还权始终属于回调那一侧**:接缝可能像
+		// swallowTimers 那样把 fn 扣下来稍后手工调用,在这里抢先 Done 会让那次
+		// 手工调用二次归还 → panic(negative WaitGroup counter)。
+		// 所以只摘格子(没有任何东西能再 Stop 它),不碰计数。
+		slot.stopped = true
+		p.dropTimerLocked(slot)
+		p.timersMu.Unlock()
+		return nil
+	}
+	slot.t = t
 	p.timersMu.Unlock()
+	return t
 }
 
-func (p *Parts) forgetTimer(t *time.Timer) {
-	if t == nil {
+// dropTimerLocked 把一格从登记表里摘掉(调用方已持 timersMu)。摘掉即封口:
+// 之后 attach 不会把它放回去。
+func (p *Parts) dropTimerLocked(slot *timerSlot) {
+	if slot.dropped {
 		return
 	}
-	p.timersMu.Lock()
+	slot.dropped = true
 	for i, cur := range p.timers {
-		if cur == t {
+		if cur == slot {
 			p.timers = append(p.timers[:i], p.timers[i+1:]...)
-			break
+			return
 		}
 	}
-	p.timersMu.Unlock()
 }
 
 // stopPendingTimers 停掉所有还没触发的定时器,并替它们把 timersWG 的计数还上。
@@ -107,13 +164,21 @@ func (p *Parts) forgetTimer(t *time.Timer) {
 // 关键点:Stop 返回 true 表示回调不会再跑,于是 wrapped 里的 Done 永远不会执行。
 // 计数是 Add 在排定时器时加的,所以必须由这里补 Done,否则随后的 timersWG.Wait
 // 会一直挂到 ctx 超时为止(B9 的另一半)。
+//
+// 顺手把表标成已关闭:关停之后再有代码排定时器(重跑回调、漏网的 goroutine),
+// afterFunc 会当场把它停掉并归还计数,而不是留一格永远没人摘的悬位。
 func (p *Parts) stopPendingTimers() {
 	p.timersMu.Lock()
 	pending := p.timers
 	p.timers = nil
+	p.timersClosed = true
 	p.timersMu.Unlock()
-	for _, t := range pending {
-		if t.Stop() {
+	for _, slot := range pending {
+		if slot.t == nil {
+			continue
+		}
+		if slot.t.Stop() {
+			// Stop 抢到在回调之前:这一格的 Done 由这里归还。
 			p.timersWG.Done()
 		}
 	}

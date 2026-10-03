@@ -408,9 +408,19 @@ func feedResponses(p map[string]any, s *sink) error {
 	case "response.function_call_arguments.delta":
 		text, _ := p["delta"].(string)
 		return s.toolArgs("i"+indexKey(p, "output_index"), text)
-	case "response.completed":
+	case "response.completed", "response.incomplete", "response.failed":
 		// 收尾 token 在 JS 侧就被归一:被输出上限截断的一律叫 "length"
 		//(engine 的 finishReason 认这个名字),正常完成叫 "stop"。
+		//
+		// 事件名要认全(整分支评审 BUG-1):responses 线有三个并列的终止事件,
+		// 被 max_output_tokens 截断走的是 **response.incomplete**,上游故障走的是
+		// `response.failed`,而这里过去只有 `response.completed` —— 截断的一轮因此
+		// finish 恒为空串,engine 落 default 报 `stop`:客户端拿到一条腰斩的回答却
+		// 被告知「正常结束」,不会去续写(muse-spark 家族就是 responses 线)。
+		// 三个事件的载荷形状相同(response.status / incomplete_details.reason),
+		// 共用这一支即可;failed 会带着 status:"failed" 落到 default,
+		// finishReasonOf 认不出它 ⇒ 收尾 stop,但 BrokenToolCall/EMPTY 两道判据
+		// 仍然在前面兜住(不在这里发明新的错误路径,没有固件支撑它)。
 		resp, _ := p["response"].(map[string]any)
 		if resp == nil {
 			return nil

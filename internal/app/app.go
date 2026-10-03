@@ -128,10 +128,13 @@ type Parts struct {
 	// ctx(生产里是 main 的信号 ctx)桥接进来。
 	lifeCtx context.Context
 
-	// timersMu 保护 timers。afterFunc 登记,回调与 Shutdown 摘除 ——
-	// 回调跑完必须自己摘掉,否则长时间运行会无限攒定时器指针。
-	timersMu sync.Mutex
-	timers   []*time.Timer
+	// timersMu 保护 timers/timersClosed。afterFunc 登记,回调与 Shutdown 摘除 ——
+	// 回调跑完必须自己摘掉,否则长时间运行会无限攒定时器格(RISK-5)。
+	// timersClosed 由 stopPendingTimers 置位:关停之后再排程的定时器当场被停掉,
+	// 不给 B9 的「自我复活」留悬格。
+	timersMu     sync.Mutex
+	timers       []*timerSlot
+	timersClosed bool
 
 	// ---- 探测轮次状态(probe.go) ----
 	probing         atomic.Bool
@@ -181,8 +184,10 @@ type Parts struct {
 	timersWG    sync.WaitGroup
 }
 
-// egressGeneration 是当前出站代数。三次 SyncOutbounds 成功(app.go 的开机路径与
-// 开场订阅、rebuild.go 的周期重建)各自 +1,读侧只取一次快照。
+// egressGeneration 是当前出站代数。bump 点只有两处:rebuild.go 的周期重建与开场
+// 订阅协程那一发,都在 SyncOutbounds **成功**之后。开机路径的 SyncOutbounds 不
+// bump 不是漏:它跑在监听端口打开之前,缓存必然还是空的,没有东西需要失效
+// (整分支评审 NIT-7 —— 这里原来写的是「三次」,数错了)。
 func (p *Parts) egressGeneration() uint64 { return p.egressGen.Load() }
 
 // noteEgressChanged 在出站集合被换掉之后调用一次。放在「sync 成功」分支里而不是
@@ -412,12 +417,11 @@ func Load(root string) (*Parts, error) {
 			return engine.State{Catalog: catBox.get(), Health: h}
 		},
 		Pool: func() []health.PoolNode {
-			// 顺序是有讲究的:**先**读代数、再用它去取内容。反过来(先取内容、
-			// 后读代数)时,若中间插进一次 Merge,新内容会被记在更新后的代数上 ——
-			// 缓存从此永久不再失效。先读代数最坏只是这一轮用一份旧视图,下一轮
-			// 代数对不上就重建。
-			gen := reg.Generation()
-			return parts.pool.get(gen, func() []health.PoolNode {
+			// 代数交给 poolBox 自己读:它必须**先**读代数、**再**按那个代数取内容,
+			// 反过来的话,若中间插进一次 Merge,新内容会被记在更新后的代数上 ——
+			// 缓存从此永久不再失效(整分支评审确认过这条顺序,并在 RISK-4 之后把
+			// 取内容挪到锁外,顺序就更不能靠调用点侥幸维持)。
+			return parts.pool.get(reg.Generation, func() []health.PoolNode {
 				outs := reg.All()
 				pool := make([]health.PoolNode, 0, len(outs))
 				for _, o := range outs {
@@ -465,7 +469,17 @@ func Load(root string) (*Parts, error) {
 			// client 按 (出站代数, tag) 复用(O3):每次尝试新建一个的话,出口的
 			// 连接池每轮从零开始,而旧 client 的空闲连接没人关 —— 换过一轮出口就
 			// 在进程里攒下一批半开 socket。换代见 noteEgressChanged。
-			return parts.clients.get(parts.egressGeneration(), tag, func() (*http.Client, error) {
+			cache := parts.clients
+			if cache == nil {
+				// 夹具手搓 Parts{} 时没有缓存:照常造 client,只是不复用。
+				// 生产路径永远走不到这里(Load 在字面量里就装配好了)。
+				d, err := host.Dialer(tag)
+				if err != nil {
+					return nil, err
+				}
+				return httpclient.NewStreamClient(d, streamIdleTimeout), nil
+			}
+			return cache.get(parts.egressGeneration, tag, func() (*http.Client, error) {
 				d, err := host.Dialer(tag)
 				if err != nil {
 					return nil, err

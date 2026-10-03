@@ -1079,6 +1079,146 @@ func TestNonStreamingReplyMarksSawText(t *testing.T) {
 	}
 }
 
+// TestResponsesIncompleteEventIsRecognized 是整分支评审的 BUG-1:responses 线被
+// 输出上限截断时,真实上游发的是**独立终止事件** `response.incomplete`(带
+// status:"incomplete" 与 incomplete_details.reason),而投影层的 switch 只认
+// `response.completed` —— 于是 finish 保持空串,engine 的 finishReasonOf("") 落
+// default ⇒ 客户端收到 `finish_reason:"stop"` 的一条腰斩回答,不会去续写。
+// `response.failed` 同理被无声丢掉。分支体里的映射早就是对的,只是走不到。
+//
+// 对照组把旧固件的形状也钉住(completed + status:"incomplete" —— 真实上游不会发
+// 这种组合,但既然已经测过它,就让它继续测得对)。
+func TestResponsesIncompleteEventIsRecognized(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame string
+		want  string
+	}{
+		{"incomplete 事件",
+			`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`,
+			"length"},
+		{"failed 事件",
+			`{"type":"response.failed","response":{"status":"failed","error":{"type":"server_error","message":"boom"}}}`,
+			"failed"},
+		{"completed 事件", `{"type":"response.completed","response":{"status":"completed"}}`, "stop"},
+		{"completed 带 incomplete status(旧形状)",
+			`{"type":"response.completed","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`,
+			"length"},
+	}
+	for _, tc := range tests {
+		f := newFakeUpstream(t, func(n int) (int, string, string) {
+			return 200, "text/event-stream", sseBody(
+				`{"type":"response.output_text.delta","delta":"partial"}`, tc.frame)
+		})
+		a := newAdapter(f.srv.URL, f.srv.Client(), "muse-spark-1.3-contributor-free")
+		res, err := a.Complete(context.Background(), Request{
+			Messages: []messages.Message{{Role: "user", Content: "hi"}}, Stream: true,
+		}, collect(&strings.Builder{}))
+		if err != nil {
+			t.Fatalf("%s: Complete: %v", tc.name, err)
+		}
+		if res.Finish != tc.want {
+			t.Errorf("%s: Finish = %q, want %q", tc.name, res.Finish, tc.want)
+		}
+	}
+}
+
+// TestReplayIdleTimeoutIsATimeout 是整分支评审的 BUG-2:`exchange` 把 readReply /
+// 拨号错误过一层 idleOrPassthrough 翻成 TIMEOUT,`replay` 两条路都没过。于是
+// stale-reasoning 重放期间出口卡死时,engine 拿到的是裸 ErrIdleTimeout(或回落成
+// 原始 400 的判决)⇒ 归入 SERVER:不在 retryOn 也不在 cooldownOn —— 卡死的出口
+// 既不会被换掉也不会被冷却。这正是 idleOrPassthrough 注释里写明不能犯的事
+// (「同一个出口会被反复选中,B1 的另一半」)。
+func TestReplayIdleTimeoutIsATimeout(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		if n == 0 {
+			return 400, "application/json", `{"error":{"message":"Reasoning item rs_9 not found"}}`
+		}
+		// 重放那一发:收下连接但永远不发头 —— 出口卡死的形状。
+		time.Sleep(2 * time.Second)
+		return 200, "application/json", `{}`
+	})
+	// 空闲截止只有 60ms:头阶段超时由 httpclient 的 idleTransport 取消请求。
+	a := newAdapter(f.srv.URL, httpclient.NewStreamClient(nil, 60*time.Millisecond),
+		"muse-spark-1.3-contributor-free")
+
+	req := Request{Messages: []messages.Message{{Role: "user", Content: "hi"}}, Stream: true}
+	body, err := a.build(req)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	renames := upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
+	body["previous_response_id"] = "resp_stale"
+	input, _ := body["input"].([]any)
+	body["input"] = append(input, map[string]any{"type": "reasoning", "summary": []any{}})
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	tu := &turn{req: req, body: body, payload: payload, renames: renames, t0: time.Now()}
+	_, err = a.exchange(context.Background(), tu, newSink(collect(&strings.Builder{}), renames))
+	if err == nil {
+		t.Fatal("want a failure when the replay stalls")
+	}
+	failure, ok := err.(errors.Failure)
+	if !ok {
+		t.Fatalf("err = %#v, want errors.Failure", err)
+	}
+	if failure.Code != check.CodeTimeout {
+		t.Fatalf("重放期卡死被归成 %q, want TIMEOUT:SERVER 既不重试也不冷却,出口会被反复选中", failure.Code)
+	}
+	if !failure.Retryable {
+		t.Fatal("TIMEOUT 必须可重试")
+	}
+}
+
+// TestUnreadable401BodyStaysACredentialFailure 是整分支评审的 BUG-3:本仓库自己在
+// errors.go 里写着「401 是明确的凭证问题,把它降级成『可重试』会让一个配置错误
+// 变成扫全池的慢失败」。R18 给 classifyErrorBody 加的「读不全就改判 TRANSPORT」
+// 只对**判决依赖文案**的状态码成立(403 要靠文案区分 FreeTier 配额);401 的判决
+// 与 body 无关,却被一起升级 ⇒ 引擎按 attemptCap=20、无墙钟扫全池并冷却 20 个
+// 出口,客户端最后只看到 502,连「凭证错了」都丢了。
+func TestUnreadable401BodyStaysACredentialFailure(t *testing.T) {
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 401, "application/json", `{"error":{"type":"authentication_error","message":"bad key"}}`
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+	_, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}}, Stream: true,
+	}, collect(&strings.Builder{}))
+	if err == nil {
+		t.Fatal("want a failure")
+	}
+	failure, ok := err.(errors.Failure)
+	if !ok {
+		t.Fatalf("err = %#v", err)
+	}
+	if failure.Code != check.CodeCredential || failure.Retryable {
+		t.Fatalf("401 被判成 %q(retryable=%v), want 不可重试的凭证判决", failure.Code, failure.Retryable)
+	}
+
+	// 同一判决在「body 读不全」时也必须保持不变:401 不依赖文案。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "4000")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"type":"auth`)
+	}))
+	t.Cleanup(srv.Close)
+	a2 := newAdapter(srv.URL, srv.Client(), "big-pickle")
+	_, err = a2.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}}, Stream: true,
+	}, collect(&strings.Builder{}))
+	failure2, ok := err.(errors.Failure)
+	if !ok {
+		t.Fatalf("截断的 401 没有产出 Failure: %#v", err)
+	}
+	if failure2.Code != check.CodeCredential || failure2.Retryable {
+		t.Fatalf("截断的 401 被升级成 %q(retryable=%v):一个配置错误会变成扫全池的慢失败",
+			failure2.Code, failure2.Retryable)
+	}
+}
+
 // TestUnreadableErrorBodyIsRetriedAsTransport 钉住 R18:非 2xx 的 body 读失败时,
 // 旧代码把错误连同「文案没读到」这件事一起丢了。403 的 FreeTier 判据依赖 body
 // 文本 —— 文本没了就退化成不可重试的凭证错误,本应换出口的 403 变成对客户端的

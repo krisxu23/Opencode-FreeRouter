@@ -96,7 +96,16 @@ type Registry struct {
 	// writeFile 是落盘接缝,生产路径就是 persistence.WriteJSONFile。它存在的唯一
 	// 理由是把 R15 的纪律(锁内只取快照、写盘在锁外)变成可断言的事实:测试把写盘
 	// 卡住,再去看池子读取能不能照常返回。没有这个接缝就只能拿计时采样赌磁盘。
-	writeFile func(file string, v any, indent bool) error
+	// flushMu 只串「写盘」这一段(不碰 r.mu,所以 R15 的收益原样保留:读路径不会
+	// 被写盘挡住)。配套的 flushSeq/writtenSeq 补上 R15 留下的洞:把写挪到锁外
+	// 之后,「先取快照」与「先落盘」不再同序 —— 晚到的旧快照会把新快照盖掉,而
+	// 这一份文件带着连败计数与墓碑,被盖一次就是被淘汰的节点在下次启动复活
+	// (整分支评审 RISK-6;可达窗口:开场订阅的 Flush 不在 rebuildMu 内)。
+	// 序号在取快照时发号(持 r.mu),写盘前比对:低于已落盘序号就直接丢弃。
+	flushMu    sync.Mutex
+	flushSeq   uint64
+	writtenSeq uint64
+	writeFile  func(file string, v any, indent bool) error
 	// generation 每次**成员关系**变化 +1(Load/Merge/RetainOnly/EnforceCap/Remove)。
 	// 它存在的唯一理由是让调用方能安全缓存「池子的派生视图」(O10:候选池 + 每 tag
 	// 一次 CountryOf 的四级正则扫描,过去每请求重算一次,池上限 8000)。
@@ -474,16 +483,38 @@ func (r *Registry) Len() int {
 // 锁的边界(R15):锁内只生成快照,序列化与原子写都在锁外 —— 实测
 // node-registry.json 有 1.1MB,每请求的候选池读取走 All()(同一把锁的 RLock),
 // 持锁跨过写盘就等于每轮 rebuild/probe 给所有在途请求加几十毫秒的排队。
-// health.Persist 从一开始就是这个写法,这里是同一条纪律。代价是落盘的那份
-// 快照可能在写出去之前又被后面的改动超越 —— 与 JS 单线程里「先改完再写」的
-// 语义等价,下一次 Flush 会把它补上。
+// health.Persist 从一开始就是这个写法,这里是同一条纪律。
+//
+// 代价与它的补法:落盘的那份快照可能在写出去之前被后面的改动超越。超越本身无害
+// (下一次 Flush 会补上),**乱序落盘**才有害 —— 旧快照后写就会把新状态盖掉,所以
+// 每次取快照发一个单调序号,写盘在 flushMu 内比对序号,落后的一路直接丢弃。
 func (r *Registry) Flush() error {
 	r.mu.Lock()
 	snap := r.snapshotLocked()
+	r.flushSeq++
+	seq := r.flushSeq
 	r.mu.Unlock()
+	return r.writeSnapshot(seq, snap)
+}
+
+// writeSnapshot 按序号落一份快照:序号不领先于已落盘的那一份就直接丢弃。
+//
+// 这一层单独出来是因为它才是 RISK-6 的实质:「锁内取快照、锁外写盘」之后,谁先取
+// 快照与谁先拿到写权不再同序,晚到的旧快照会把新状态盖掉,而这文件里躺着连败计数
+// 与墓碑 —— 被盖一次就等于被淘汰的节点在下次启动复活。写段由 flushMu 串行(读
+// 路径不碰它,R15 的收益不变),序号比较负责丢弃过期快照。
+//
+// 丢弃**不是**失败:盘上现在是更新的状态,所以返回 nil。
+func (r *Registry) writeSnapshot(seq uint64, snap diskFile) error {
+	r.flushMu.Lock()
+	defer r.flushMu.Unlock()
+	if seq <= r.writtenSeq {
+		return nil
+	}
 	if err := r.writeFile(r.file, snap, true); err != nil {
 		return fmt.Errorf("registry: %w", err)
 	}
+	r.writtenSeq = seq
 	return nil
 }
 

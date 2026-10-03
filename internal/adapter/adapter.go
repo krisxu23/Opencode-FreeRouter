@@ -193,6 +193,15 @@ func classifyErrorBody(status int, raw []byte, readErr error, retryAfter int64) 
 	if readErr == nil || f.Retryable {
 		return f
 	}
+	// 只有**判决依赖 body 文案**的那条改判才成立(整分支评审 BUG-3)。401 的判决
+	// 只看状态码(errors.go:`case status == 401 || status == 403` 之前是 403 的
+	// freeRe 文案判据),读全也不会改变它;把它升级成可重试的 TRANSPORT 恰好违反
+	// 本仓库写在 errors.go 里的那条纪律 ——「401 是明确的凭证问题,把它降级成
+	// 『可重试』会让一个配置错误变成扫全池的慢失败」:引擎会按 attemptCap=20、
+	// 无墙钟把整个池子扫一遍并冷却 20 个出口,而客户端最后只看到 502。
+	if status == http.StatusUnauthorized {
+		return f
+	}
 	return errors.Failure{Code: check.CodeTransport, Status: status,
 		Message:   "our-free-model: upstream error body unreadable: " + readErr.Error(),
 		Retryable: true}
@@ -228,6 +237,15 @@ func (a *Adapter) replay(ctx context.Context, t *turn, s *sink, status int, raw 
 	}
 	resp, err := a.deps.Client.Do(httpReq)
 	if err != nil {
+		// 重放那一发**卡死**时必须先认空闲截止(整分支评审 BUG-2):回落成原始
+		// 400 的判决(SERVER,不可重试、不冷却)等于把「这个出口不回话了」记成
+		// 「请求本身有问题」,同一个卡死的出口下一轮还会被选中 —— exchange 里
+		// 同一条翻译写在 Client.Do 的失败分支上,replay 漏了。
+		if stderrors.Is(err, httpclient.ErrIdleTimeout) {
+			return s.result(), errors.Failure{Code: check.CodeTimeout, Message: err.Error(), Retryable: true}
+		}
+		// 其余传输失败回落**原始** 400 的分类:第二条重试连不上,不改变第一条
+		// 失败的形状。
 		return s.result(), errors.Classify(status, raw, retryAfter)
 	}
 	defer resp.Body.Close()
@@ -237,7 +255,9 @@ func (a *Adapter) replay(ctx context.Context, t *turn, s *sink, status int, raw 
 			errors.RetryAfter(resp.Header.Get("Retry-After")))
 	}
 	if err := a.readReply(resp, retry, s); err != nil {
-		return s.result(), err
+		// 与 exchange 同一层翻译:重放期间的空闲截止同样是 TIMEOUT(retryOn +
+		// cooldownOn),不是 SERVER。
+		return s.result(), idleOrPassthrough(err)
 	}
 	return s.result(), nil
 }

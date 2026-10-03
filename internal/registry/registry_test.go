@@ -76,6 +76,87 @@ func TestGenerationTracksMembershipOnly(t *testing.T) {
 	}
 }
 
+// TestFlushGuardDropsAnOlderSnapshot 是整分支评审的 RISK-6:R15 把「序列化 + 原子
+// 写」挪到 r.mu 之外之后,谁先取快照与谁先拿到写权不再同序。晚到的旧快照会把新
+// 状态盖掉,而这文件里躺着连败计数与墓碑 —— 被盖一次就等于被淘汰的节点在下次
+// 启动复活(阶段 2 约束 9)。可达:开场订阅协程的 reg.Flush() 不在 rebuildMu 内,
+// 托盘 Reload / 面板 Refresh 的 Rebuild 能从那个窗口并发进来。
+//
+// 乱序本身是调度竞态,没法用挂起钩子确定性制造(第一版尝试这么做,结果与新加的
+// flushMu 互相 deadlock —— 旧写持着写锁,主线程的新 Flush 永久等待,而这正是
+// flushMu 串行化生效的证明)。所以这里按不变量测:把两份快照按**有害的顺序**直接
+// 交给写段,旧的那一份必须被丢弃。
+func TestFlushGuardDropsAnOlderSnapshot(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "node-registry.json")
+	r := NewRegistry(file)
+
+	// alloc 复刻 Flush 的前半段:持 r.mu 取快照并领序号。
+	alloc := func() (uint64, diskFile) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.flushSeq++
+		return r.flushSeq, r.snapshotLocked()
+	}
+
+	r.Merge([]parse.Outbound{ob("a")})
+	seqOld, snapOld := alloc()
+	r.Merge([]parse.Outbound{ob("a"), ob("b")})
+	seqNew, snapNew := alloc()
+	if seqOld >= seqNew {
+		t.Fatalf("序号必须单调:old=%d new=%d", seqOld, seqNew)
+	}
+
+	// 有害顺序:新快照先落盘,旧快照后到。
+	if err := r.writeSnapshot(seqNew, snapNew); err != nil {
+		t.Fatalf("newer write: %v", err)
+	}
+	if err := r.writeSnapshot(seqOld, snapOld); err != nil {
+		t.Fatalf("older write must be dropped, not fail: %v", err)
+	}
+	if got := entriesOnDisk(t, file); len(got) != 2 {
+		t.Fatalf("盘上剩 %d 条(%v):晚到的旧快照把新状态盖掉了", len(got), keysOf(got))
+	}
+
+	// 正序仍然照常落盘(守卫不是「只写一次」)。
+	r.Merge([]parse.Outbound{ob("a"), ob("b"), ob("c")})
+	seqThird, snapThird := alloc()
+	if err := r.writeSnapshot(seqThird, snapThird); err != nil {
+		t.Fatalf("third write: %v", err)
+	}
+	if got := entriesOnDisk(t, file); len(got) != 3 {
+		t.Fatalf("正序落盘失效: %d 条", len(got))
+	}
+	// 走生产入口也必须写出去(序号在 Flush 内部领)。
+	if err := r.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := entriesOnDisk(t, file); len(got) != 3 {
+		t.Fatalf("Flush 之后盘上 %d 条, want 3", len(got))
+	}
+}
+
+func entriesOnDisk(t *testing.T, file string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("解析落盘文件: %v (%s)", err, raw)
+	}
+	entries, _ := doc["entries"].(map[string]any)
+	return entries
+}
+
+func keysOf(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // TestFlushWritesTheFileOutsideTheLock 钉住 R15:锁内只生成快照,序列化与原子写
 // 都在锁外。实测 node-registry.json 有 1.1MB,而每请求的候选池读取走的是同一把
 // 锁的 RLock —— 持锁跨写盘等于每轮 rebuild/probe 给所有在途请求加几十毫秒排队。
