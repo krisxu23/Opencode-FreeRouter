@@ -1219,6 +1219,48 @@ func TestUnreadable401BodyStaysACredentialFailure(t *testing.T) {
 	}
 }
 
+// TestEveryWireGetsAPlaceholderWhenHistoryProjectsToNothing 是整分支评审补记的
+// R6:一条历史被投影全部丢掉时(`messages.go` 的空 content 会 `continue`,持久
+// 历史里的纯 system 轮、全空正文都会走到这里),payload 的 messages 数组是空的,
+// 上游回 400;`errors.Classify` 的 default 把 400 判成 SERVER,而 SERVER 在
+// engine 的 retryOn 里 ⇒ 同一颗必然失败的请求被真实重发 20 次才变成 503。
+// responses 线早就有占位轮(那段注释还在),messages 与 chat 两条线没有。
+func TestEveryWireGetsAPlaceholderWhenHistoryProjectsToNothing(t *testing.T) {
+	cases := []struct {
+		name  string
+		model string
+		key   string
+	}{
+		{"chat 线", "big-pickle", "messages"},
+		{"messages 线", "union-alpha", "messages"},
+		{"responses 线(已有守卫,当对照组)", "muse-spark-1.3-contributor-free", "input"},
+	}
+	for _, tc := range cases {
+		a := newAdapter("http://127.0.0.1:1", http.DefaultClient, tc.model)
+		payload, err := a.build(Request{
+			// 一条会被投影全部丢掉的轮:正文为空。
+			Messages: []messages.Message{{Role: "user", Content: ""}},
+			Stream:   true,
+		})
+		if err != nil {
+			t.Fatalf("%s: build: %v", tc.name, err)
+		}
+		// 三条线的 payload 值是各自的强类型切片,判「有没有占位轮」按线上形状判:
+		// 过一遍 JSON 再看数组长度。
+		raw, err := json.Marshal(payload[tc.key])
+		if err != nil {
+			t.Fatalf("%s: marshal %s: %v", tc.name, tc.key, err)
+		}
+		var list []any
+		if err := json.Unmarshal(raw, &list); err != nil {
+			t.Fatalf("%s: %s 不是数组: %s", tc.name, tc.key, raw)
+		}
+		if len(list) == 0 {
+			t.Fatalf("%s: 空 %s 发给上游只会换来 400,然后被当 5xx 重试 20 次(R6)", tc.name, tc.key)
+		}
+	}
+}
+
 // TestUnreadableErrorBodyIsRetriedAsTransport 钉住 R18:非 2xx 的 body 读失败时,
 // 旧代码把错误连同「文案没读到」这件事一起丢了。403 的 FreeTier 判据依赖 body
 // 文本 —— 文本没了就退化成不可重试的凭证错误,本应换出口的 403 变成对客户端的

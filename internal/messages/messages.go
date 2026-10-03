@@ -514,19 +514,45 @@ func ToResponseInput(messages []Message, resolve ResolveImage) ([]ResponseItem, 
 // 一次,三条线同时覆盖。
 func RepairToolPairing(messages []Message) []Message {
 	answered := map[string]bool{}
+	// callsPresent:历史里真的出现过这个调用。它把「孤儿回答」与「比自己的调用
+	// 晚到/早到的回答」区分开 —— 前者丢,后者不能丢(R5)。
+	callsPresent := map[string]bool{}
 	for _, m := range messages {
 		if m.Role == roleTool && m.ToolCallID != "" {
 			answered[m.ToolCallID] = true
+			continue
+		}
+		if m.Role == roleAssistant {
+			for _, c := range m.ToolCalls {
+				callsPresent[c.ID] = true
+			}
 		}
 	}
 	keptCalls := map[string]bool{}
+	// pending 按住「抢在自己调用之前到达」的结果,等调用被写出去时紧跟其后。
+	// 旧实现在这里直接丢弃它,而调用因为 answered 已在预扫为真而被保留 —— 产物
+	// 正好是本函数声称要消灭的形状:tool_use 后面没有 tool_result,上游 400,
+	// 并且拖死该会话之后的每一轮(R5)。
+	pending := map[string][]Message{}
 	out := make([]Message, 0, len(messages))
+	flushPending := func(ids []ToolCall) {
+		for _, c := range ids {
+			if waiting, ok := pending[c.ID]; ok {
+				out = append(out, waiting...)
+				delete(pending, c.ID)
+			}
+		}
+	}
 	for _, m := range messages {
 		if m.Role == roleTool {
-			// 调用先于自己的结果出现,这里 keptCalls 必已可解析
+			if !callsPresent[m.ToolCallID] {
+				continue // 没有调用配它的回答:摘掉(原有语义)
+			}
 			if keptCalls[m.ToolCallID] {
 				out = append(out, m)
+				continue
 			}
+			pending[m.ToolCallID] = append(pending[m.ToolCallID], m)
 			continue
 		}
 		if m.Role != roleAssistant {
@@ -551,6 +577,7 @@ func RepairToolPairing(messages []Message) []Message {
 			// 什么都没被摘(含纯文本轮)时原样保留;无调用无文本的空轮丢弃
 			if len(kept) > 0 || hasText {
 				out = append(out, m)
+				flushPending(kept)
 			}
 			continue
 		}
@@ -568,6 +595,7 @@ func RepairToolPairing(messages []Message) []Message {
 		copied := m
 		copied.ToolCalls = kept
 		out = append(out, copied)
+		flushPending(kept)
 	}
 	return out
 }

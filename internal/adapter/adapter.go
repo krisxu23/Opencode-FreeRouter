@@ -328,6 +328,15 @@ func (a *Adapter) build(req Request) (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(shape.Messages) == 0 {
+			// 历史被投影全部丢掉时空 messages 会被上游拒 400;400 落进
+			// errors.Classify 的 default ⇒ SERVER,而 SERVER 在 engine 的 retryOn
+			// 里 ⇒ 同一颗注定失败的请求被真实重发 20 次才变成 503(R6)。
+			// responses 线早就有这一层占位轮(上面的 input 守卫),这里补齐两条。
+			// "text" 是 messages 包内部 blockText 常量的线上形状。
+			shape.Messages = []messages.ClaudeMessage{{Role: "user",
+				Content: []messages.ClaudeBlock{{Type: "text", Text: "..."}}}}
+		}
 		payload = map[string]any{
 			"model":      a.deps.Model,
 			"messages":   shape.Messages,
@@ -342,6 +351,10 @@ func (a *Adapter) build(req Request) (map[string]any, error) {
 		chat, _, err := messages.ToChatMessages(repaired, nil)
 		if err != nil {
 			return nil, err
+		}
+		if len(chat) == 0 {
+			// 同 R6:空 messages 数组换 400,400 被当 5xx 重试满 20 次。
+			chat = []messages.ChatMessage{{Role: "user", Content: "..."}}
 		}
 		payload = map[string]any{
 			"model":      a.deps.Model,

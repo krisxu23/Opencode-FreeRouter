@@ -279,6 +279,31 @@ func TestUnknownRoleIsRejected(t *testing.T) {
 
 // ---- 对照 tests/messages.test.js 补漏 ----
 
+// TestRepairToolPairingReunitesAResultThatArrivesFirst 钉住整分支评审补记的 R5:
+// tool 结果出现在它自己的 assistant 调用**之前**时,旧实现把结果丢掉(那一刻
+// keptCalls 还是空)、却保留调用(answered 早在预扫里为真)—— 于是产物正好是
+// 本函数声称要消灭的那个形状:tool_use 后面没有 tool_result,上游 400,并且拖死
+// 该会话之后的每一轮。
+//
+// 既保留信息又修好次序的做法只有一个:把结果按住,等它的调用出现时紧跟其后。
+func TestRepairToolPairingReunitesAResultThatArrivesFirst(t *testing.T) {
+	out := RepairToolPairing([]Message{
+		{Role: "user", Content: "read the file"},
+		{Role: "tool", ToolCallID: "call_1", Content: "contents"},
+		{Role: "assistant", Content: "sure", ToolCalls: []ToolCall{
+			{ID: "call_1", Name: "read", Arguments: json.RawMessage(`{"path":"a.txt"}`)}}},
+	})
+	if len(out) != 3 {
+		t.Fatalf("该是 3 条(user, assistant, tool),实得 %d: %s", len(out), rawJSON(t, out))
+	}
+	if out[1].Role != "assistant" || len(out[1].ToolCalls) != 1 {
+		t.Fatalf("调用轮被改动: %+v", out[1])
+	}
+	if out[2].Role != "tool" || out[2].ToolCallID != "call_1" || out[2].Content != "contents" {
+		t.Fatalf("结果没有紧跟到自己的调用之后: %+v", out[2])
+	}
+}
+
 func TestRepairToolPairingKeepsAnsweredPairs(t *testing.T) {
 	out := RepairToolPairing([]Message{
 		{Role: "user", Content: "read the file"},
