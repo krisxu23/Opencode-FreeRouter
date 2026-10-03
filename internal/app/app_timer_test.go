@@ -64,9 +64,12 @@ func TestAfterFuncNilSeamDoesNotRetain(t *testing.T) {
 func TestStopPendingTimersClosesTheLedger(t *testing.T) {
 	p := &Parts{}
 	var mu sync.Mutex
-	ran := 0
-	// 0 延时:回调立刻跑或被 Stop 拦下都是合法结局,所以只断言不变量。
-	p.afterFunc(0, func() { mu.Lock(); ran++; mu.Unlock() })
+	ranAfterClose := 0
+	// 第一发用 0 延时:它跑没跑都合法(可能由回调自己归还计数,也可能被 Stop 拦下),
+	// 所以**不对它做任何计数断言**。上一版把两发定时器共用一个计数器,断言就退化成
+	// 「赌 0 延时那一发没赶上」—— 本地 8 次挂 2 次,推到 CI 上必挂(gates 的
+	// Go tests 步骤)。三条不变量各自独立测,不靠时序侥幸。
+	p.afterFunc(0, func() {})
 	p.stopPendingTimers()
 
 	p.timersMu.Lock()
@@ -83,17 +86,19 @@ func TestStopPendingTimersClosesTheLedger(t *testing.T) {
 		t.Fatal("关停后的 timersWG 没有配平")
 	}
 
-	p.afterFunc(time.Hour, func() {})
+	// 关停之后再排程:实现走的是 closed 早退分支 —— 连 timer 都不创建,所以
+	// 「回调不会执行」是确定的,不是概率。
+	p.afterFunc(time.Hour, func() { mu.Lock(); ranAfterClose++; mu.Unlock() })
 	p.timersMu.Lock()
 	n = len(p.timers)
 	p.timersMu.Unlock()
 	if n != 0 {
 		t.Fatalf("已关停的登记表又收了 %d 格:关停后排程必须当场拦掉", n)
 	}
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(120 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
-	if ran != 0 {
-		t.Fatal("关停之后排的定时器照样跑了(B9 的自我复活换了个形式)")
+	if ranAfterClose != 0 {
+		t.Fatalf("关停之后排的定时器跑了 %d 次(B9 的自我复活换了个形式)", ranAfterClose)
 	}
 }

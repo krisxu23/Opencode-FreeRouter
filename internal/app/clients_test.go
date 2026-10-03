@@ -148,11 +148,16 @@ func TestExitClientCacheBuildsOutsideTheLock(t *testing.T) {
 		if cl == nil {
 			t.Fatal("n2 返回了 nil client")
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(3 * time.Second):
+		// 预算给到 3s:CI 的 Windows runner 会跟别的作业抢 CPU,500ms 是给自己埋 flake。
 		t.Fatal("取另一个出口被卡住了:build 在缓存锁内跑")
 	}
 	close(release)
-	<-n1
+	select {
+	case <-n1:
+	case <-time.After(3 * time.Second):
+		t.Fatal("被卡住的那发没有返回")
+	}
 }
 
 // TestExitClientCacheDiscardsAStaleBuild 是同一条改动的另一半:构建期间发生了换代,
@@ -180,7 +185,17 @@ func TestExitClientCacheDiscardsAStaleBuild(t *testing.T) {
 	gen.Store(2)
 	close(release)
 
-	cl := <-got
+	cl := func() *http.Client {
+		// 有界等待:实现在换代风暴里若把重试写成无界循环,这里必须报错而不是
+		// 挂到整个包的超时才被发现。
+		select {
+		case c := <-got:
+			return c
+		case <-time.After(5 * time.Second):
+			t.Fatal("get 没有返回(构建期间换代那条路径没走到终止)")
+			return nil
+		}
+	}()
 	if cl == nil {
 		t.Fatal("换代后必须仍然拿到一个 client(重试出新代的那一份)")
 	}
