@@ -166,12 +166,28 @@ type Parts struct {
 	limitsFetchedAt int64
 	limitsStale     bool
 
+	// ---- 出口 client 缓存(clients.go) ----
+	// egressGen 在每次 SyncOutbounds 成功后 +1:一条 client 里绑的是当时
+	// host.Dialer(tag) 给出的拨号闭包,出站换了之后它就是把请求拨到一条已撤下
+	// 的出站上的旧路径。clients 按 (代数, tag) 复用并回收空闲连接(O3)。
+	egressGen atomic.Uint64
+	clients   *exitClientCache
+	pool      poolBox
+
 	// ---- 测试接缝(status.go):非 nil 时替换真实时钟与定时器 ----
 	clockFn     func() time.Time
 	afterFuncFn func(time.Duration, func()) *time.Timer
 	waitFn      func(time.Duration) <-chan time.Time
 	timersWG    sync.WaitGroup
 }
+
+// egressGeneration 是当前出站代数。三次 SyncOutbounds 成功(app.go 的开机路径与
+// 开场订阅、rebuild.go 的周期重建)各自 +1,读侧只取一次快照。
+func (p *Parts) egressGeneration() uint64 { return p.egressGen.Load() }
+
+// noteEgressChanged 在出站集合被换掉之后调用一次。放在「sync 成功」分支里而不是
+// 调用点之前:一次失败的 SyncOutbounds 什么都没换,不该让全部出口的连接池白丢。
+func (p *Parts) noteEgressChanged() { p.egressGen.Add(1) }
 
 // defaultSettings mirrors src/store.js:99-149 SETTINGS_INITIAL.
 //
@@ -396,12 +412,19 @@ func Load(root string) (*Parts, error) {
 			return engine.State{Catalog: catBox.get(), Health: h}
 		},
 		Pool: func() []health.PoolNode {
-			outs := reg.All()
-			pool := make([]health.PoolNode, 0, len(outs))
-			for _, o := range outs {
-				pool = append(pool, health.PoolNode{Tag: o.Tag, Country: parse.CountryOf(o.Tag)})
-			}
-			return pool
+			// 顺序是有讲究的:**先**读代数、再用它去取内容。反过来(先取内容、
+			// 后读代数)时,若中间插进一次 Merge,新内容会被记在更新后的代数上 ——
+			// 缓存从此永久不再失效。先读代数最坏只是这一轮用一份旧视图,下一轮
+			// 代数对不上就重建。
+			gen := reg.Generation()
+			return parts.pool.get(gen, func() []health.PoolNode {
+				outs := reg.All()
+				pool := make([]health.PoolNode, 0, len(outs))
+				for _, o := range outs {
+					pool = append(pool, health.PoolNode{Tag: o.Tag, Country: parse.CountryOf(o.Tag)})
+				}
+				return pool
+			})
 		},
 		Settings: func() engine.Settings {
 			// 必须读活值:面板上保存的 effortLevel / defaultMaxTokens 会写进
@@ -431,10 +454,6 @@ func Load(root string) (*Parts, error) {
 			})
 		},
 		Dialer: func(tag string) (*http.Client, error) {
-			d, err := host.Dialer(tag)
-			if err != nil {
-				return nil, err
-			}
 			// One connection pool per exit: sharing http.DefaultTransport's
 			// idle connections would let one exit's socket be reused for
 			// another exit's request.
@@ -442,7 +461,17 @@ func Load(root string) (*Parts, error) {
 			// 流式回合用的是空闲死线而不是整请求死线（B1）：一次正常的回复
 			// 可以吐 40 秒以上，20s 的整请求死线会在第 20 秒把它腰斩。JS 权威
 			// 是 300s 空闲（archive/node/src/http.js:103/:185，每块续期）。
-			return httpclient.NewStreamClient(d, streamIdleTimeout), nil
+			//
+			// client 按 (出站代数, tag) 复用(O3):每次尝试新建一个的话,出口的
+			// 连接池每轮从零开始,而旧 client 的空闲连接没人关 —— 换过一轮出口就
+			// 在进程里攒下一批半开 socket。换代见 noteEgressChanged。
+			return parts.clients.get(parts.egressGeneration(), tag, func() (*http.Client, error) {
+				d, err := host.Dialer(tag)
+				if err != nil {
+					return nil, err
+				}
+				return httpclient.NewStreamClient(d, streamIdleTimeout), nil
+			})
 		},
 		AdapterDeps: adapter.Deps{
 			Base: upstream.UpstreamBase,
@@ -483,6 +512,7 @@ func Load(root string) (*Parts, error) {
 		limitsFetchedAt: bootFetchedAt,
 		limitsRows:      len(bootOverlay),
 		settingsStore:   store,
+		clients:         newExitClientCache(exitClientLimit),
 		cancel:          cancel,
 		// B9:生命周期根 context。它的 cancel 就是 p.cancel,所以
 		// Shutdown 取消它 = 所有后台定时器与重跑回调同时失去根。
@@ -543,6 +573,10 @@ func Load(root string) (*Parts, error) {
 			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
 		}
 		syncAdded, syncRemoved, serr := host.SyncOutbounds(reg.All())
+		if serr == nil {
+			// 出站换了代:旧代 client 里绑的是上一代的拨号闭包(O3)。
+			parts.noteEgressChanged()
+		}
 		if dropped > 0 {
 			logger.Warn(fmt.Sprintf("[app] 订阅里有 %d 个节点 sing-box 无法使用（非法 uuid / 不认的 cipher / 未知传输），未入池", dropped))
 		}

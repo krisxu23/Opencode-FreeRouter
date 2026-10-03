@@ -4,6 +4,7 @@
 package forward
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -261,6 +262,22 @@ type toolEnvelope struct {
 type sseStream struct {
 	w       *writer
 	started bool
+	// buf/enc 是每帧复用的序列化缓冲(O14)。一条流可以吐几百个增量帧,过去
+	// marshalNoEscape 每帧新建一个 bytes.Buffer 与一个 json.Encoder,再把结果
+	// 拷进第三个缓冲里 —— 全在热路径上。
+	buf bytes.Buffer
+	enc *json.Encoder
+}
+
+// newSSEStream 建一条 SSE 输出流。enc 绑在流自己的 buf 上,所以它必须在 sseStream
+// 已经落位之后才能构造(字段地址要稳定)。
+func newSSEStream(w *writer) *sseStream {
+	s := &sseStream{w: w}
+	s.enc = json.NewEncoder(&s.buf)
+	// 与 marshalNoEscape 同一理由:json 默认把 < > & 转成 \u003c 之类,而
+	// JSON.stringify 不转;模型输出里出现 </script> 是常事。
+	s.enc.SetEscapeHTML(false)
+	return s
 }
 
 func (s *sseStream) ensure() {
@@ -281,16 +298,23 @@ func (s *sseStream) ensure() {
 
 func (s *sseStream) send(event any) {
 	s.ensure()
-	raw, err := marshalNoEscape(event)
-	if err != nil {
+	s.buf.Reset()
+	if err := s.enc.Encode(event); err != nil {
+		// 序列化失败一个字节都没写出去:与旧实现(先 marshal 再写)同样原子。
 		return
 	}
 	// 与 js :183-185 的 `data: ${JSON.stringify(event)}\n\n` 逐字节一致。
-	buf := make([]byte, 0, len(raw)+8)
-	buf = append(buf, "data: "...)
-	buf = append(buf, raw...)
-	buf = append(buf, '\n', '\n')
-	_, _ = s.w.Write(buf)
+	// Encoder 在值后面补了一个换行,JSON.stringify 不会 —— 去掉它,自己补 "\n\n",
+	// 于是 Content-Length 意义上的字节序列与旧实现完全相同。
+	payload := s.buf.Bytes()
+	payload = payload[:len(payload)-1]
+	if _, err := s.w.Write([]byte("data: ")); err != nil {
+		return
+	}
+	if _, err := s.w.Write(payload); err != nil {
+		return
+	}
+	_, _ = s.w.Write([]byte("\n\n"))
 	s.w.Flush()
 }
 
@@ -375,7 +399,7 @@ func (s *Server) chatCompletionOnce(w *writer, r *http.Request, body map[string]
 }
 
 func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[string]any, model, id string, created int64) {
-	stream := &sseStream{w: w}
+	stream := newSSEStream(w)
 	skeleton := chunkFrame{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{Role: "assistant", Content: ptr("")}}},

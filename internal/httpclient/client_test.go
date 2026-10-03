@@ -12,6 +12,18 @@ import (
 	"time"
 )
 
+// TestTransportKeepsEightIdleConnectionsPerHost 钉住 O3:MaxIdleConns 只限**总量**,
+// 而每主机的空闲上限是 Go 的默认值 2。一个出口背后就是同一个 host,所以高并发下
+// 每个出口只能复用两条空闲连接 —— 第三条起新建、用完丢掉,握手成本按请求数累加。
+// transport 本来就是按出口建的(一个 client 一个池),总量与每主机的上限应当一致。
+func TestTransportKeepsEightIdleConnectionsPerHost(t *testing.T) {
+	tr := transport(nil)
+	if tr.MaxIdleConnsPerHost != tr.MaxIdleConns {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 与 MaxIdleConns(%d) 一致(Go 默认 2)",
+			tr.MaxIdleConnsPerHost, tr.MaxIdleConns)
+	}
+}
+
 func TestClientUsesTheInjectedDialer(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))

@@ -739,3 +739,59 @@ func TestPickSweepsExpiredStickyRows(t *testing.T) {
 		t.Fatalf("会话连败计数 = %d, want 0:行删了计数也要跟着删,否则同样的键还漏着", failKept)
 	}
 }
+
+// TestNodeViewMergeIntoMatchesJSONShape 钉住 O2 的替换前提:/api/status 过去对
+// **每个节点**做一次 json.Marshal + json.Unmarshal(每 5 秒一轮,池上限 8000),
+// 手写 map 的前提是逐键复刻 encoding/json 的输出 —— 包括每个 omitempty 的省略
+// 条件(row 上面的注释记过哪三个字段恒出现、哪三个键在 JS 里是 undefined 因此
+// 被丢掉)。判据因此不是「看起来对」,而是「手写结果与走一遍 JSON 的结果相等」。
+func TestNodeViewMergeIntoMatchesJSONShape(t *testing.T) {
+	views := []NodeView{
+		{},
+		{row: row{State: StateAlive, LatencyMS: 12, LatencyMin: 11, ExitIP: "1.1.1.1", ExitCountry: "US"}},
+		{row: row{State: StateDead, LatencyMS: 400, LatencyMin: 400, ExitIPAt: 5, GeoMismatch: true,
+			LastProbeAt: 6, Tier: TierB, LastQuotaAt: 7}, CoolingUntil: 8, CoolingFailures: 2},
+	}
+	for i, v := range views {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var viaJSON map[string]any
+		if err := json.Unmarshal(b, &viaJSON); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		viaMerge := map[string]any{"tag": "t", "country": "US"}
+		v.MergeInto(viaMerge)
+		delete(viaMerge, "tag")
+		delete(viaMerge, "country")
+		// 比的是**序列化后**的字节,不是 map 本身:走一遍 JSON 的数值会退化成
+		// float64,而手写保持 int64 —— Go 侧类型不同,喂给前端的 JSON 完全相同,
+		// 而后者才是 /api/status 的契约。(用 reflect.DeepEqual 比 map 会把这条
+		// 无关差异判成不等 —— 第一次跑就是这样抓出来的。)
+		left, err := json.Marshal(viaJSON)
+		if err != nil {
+			t.Fatalf("marshal viaJSON: %v", err)
+		}
+		right, err := json.Marshal(viaMerge)
+		if err != nil {
+			t.Fatalf("marshal viaMerge: %v", err)
+		}
+		if string(left) != string(right) {
+			t.Fatalf("case %d: 走 JSON = %s, 手写 = %s", i, left, right)
+		}
+	}
+	// 顺手钉住一个更容易写错的点:omitempty 的键必须**缺席**,而不是带零值出现。
+	fresh := map[string]any{}
+	NodeView{}.MergeInto(fresh)
+	for _, key := range []string{"exitIpAt", "lastProbeAt", "tier", "lastQuotaAt", "coolingUntil", "coolingFailures"} {
+		if _, has := fresh[key]; has {
+			t.Fatalf("%s 应当缺席(JS 侧是 undefined,JSON.stringify 会丢掉这个键),却出现 %v", key, fresh[key])
+		}
+	}
+	for _, key := range []string{"state", "latencyMs", "latencyMin", "exitIp", "exitCountry", "geoMismatch"} {
+		if _, has := fresh[key]; !has {
+			t.Fatalf("%s 必须恒出现(即使为零值),面板按它取数", key)
+		}
+	}
+}

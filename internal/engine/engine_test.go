@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"freerouter/internal/adapter"
 	"freerouter/internal/catalog"
@@ -1012,6 +1013,29 @@ func TestModelRowsHidesModelsWithNoBExit(t *testing.T) {
 	}
 	if rows[0].Object != "model" || rows[0].OwnedBy != "lite-gateway" || rows[0].Created == 0 {
 		t.Fatalf("Row 形状不对: %+v", rows[0])
+	}
+}
+
+// TestModelRowsCreatedIsStableAcrossCalls 钉住 O4:`created` 过去每次调用都取一次
+// time.Now(),于是同一份列表在两次轮询之间"刚更新过" —— 按 created 做缓存判断的
+// 客户端会反复认为是新数据。它真正表达的是「这份目录何时被本进程见过」,应当是
+// 进程启动时的一次性取值。
+func TestModelRowsCreatedIsStableAcrossCalls(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) { return 200, "text/event-stream", sseChat("ok") })
+	first := f.eng.ModelRows()
+	if len(first) == 0 {
+		t.Fatal("夹具目录里应有可列出的 free-lane 模型")
+	}
+	if first[0].Created <= 0 {
+		t.Fatalf("created = %d, want 一个正的时间戳", first[0].Created)
+	}
+	// 必须跨秒才分得出「每次取值」与「启动时取值」;Windows 时钟粒度粗,睡足 1.1s。
+	time.Sleep(1100 * time.Millisecond)
+	for i, row := range f.eng.ModelRows() {
+		if row.Created != first[0].Created {
+			t.Fatalf("created 跨调用漂移: %d vs %d(O4)", row.Created, first[0].Created)
+		}
+		_ = i
 	}
 }
 

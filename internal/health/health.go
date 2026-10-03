@@ -100,6 +100,41 @@ type NodeView struct {
 	CoolingFailures int   `json:"coolingFailures,omitempty"`
 }
 
+// MergeInto 把这个观测行逐键写进调用方的 map(O2)。
+//
+// /api/status 过去对**每个节点**做一次 json.Marshal 加一次 json.Unmarshal,只为
+// 把行合并进已经带着 tag/country 的 map —— 每 5 秒一轮、池上限 8000 个节点。
+// 手写这份 map 的前提是逐键复刻 encoding/json 的输出:row 上面那段注释记过哪
+// 三个字段恒出现(即使为零值,JS 的对象字面量没有"省略"这回事)、哪三个是
+// omitempty(JS 侧是 undefined,序列化时整个键丢掉),cooling 两项同理。
+// 两者的相等性由 TestNodeViewMergeIntoMatchesJSONShape 钉住,不是「看起来一样」。
+func (v NodeView) MergeInto(row map[string]any) {
+	row["state"] = string(v.State)
+	row["latencyMs"] = v.LatencyMS
+	row["latencyMin"] = v.LatencyMin
+	row["exitIp"] = v.ExitIP
+	if v.ExitIPAt != 0 {
+		row["exitIpAt"] = v.ExitIPAt
+	}
+	row["exitCountry"] = v.ExitCountry
+	row["geoMismatch"] = v.GeoMismatch
+	if v.LastProbeAt != 0 {
+		row["lastProbeAt"] = v.LastProbeAt
+	}
+	if v.Tier != TierNone {
+		row["tier"] = string(v.Tier)
+	}
+	if v.LastQuotaAt != 0 {
+		row["lastQuotaAt"] = v.LastQuotaAt
+	}
+	if v.CoolingUntil != 0 {
+		row["coolingUntil"] = v.CoolingUntil
+	}
+	if v.CoolingFailures != 0 {
+		row["coolingFailures"] = v.CoolingFailures
+	}
+}
+
 // sticky is a session pinned to an egress IP, not to a node: the prompt cache
 // is accounted per egress (0% hit rate under random rotation vs 99.8% under a
 // fixed one), and the pool is heavily clustered, so "same IP, different node"
@@ -127,6 +162,13 @@ type cooling struct {
 type ttftRow struct {
 	Samples []int64
 	At      int64
+	// median/hasMedian 是写入时算好的中位数(O12)。rankLocked 对**每个候选**都要
+	// 读一次 TTFT,而池上限 8000 —— 过去那里每次都拷一遍 ≤8 个样本再排序,一次
+	// Pick 就是上千次小排序。排序结果只取决于样本集合,而样本集合只在本函数改写
+	// 时变,所以在写的一侧算一次就够。样本不足最低数量时 hasMedian 为 false,
+	// 读侧的「样本数」与「新鲜度」两道判据原样保留。
+	median    int64
+	hasMedian bool
 }
 
 // Health is the whole scheduling state. Every exported method takes h.mu;
@@ -262,29 +304,46 @@ func (h *Health) NoteTtft(nodeKey string, ms int64) {
 	if len(samples) > ttftSamples {
 		samples = samples[len(samples)-ttftSamples:]
 	}
-	h.ttft[nodeKey] = &ttftRow{Samples: samples, At: time.Now().UnixMilli()}
+	row := &ttftRow{Samples: samples, At: time.Now().UnixMilli()}
+	if len(samples) >= ttftMinSamples {
+		row.median, row.hasMedian = medianOf(samples)
+	}
+	h.ttft[nodeKey] = row
 }
 
-// ttftLatencyLocked 这个节点当前该用于排序的延迟(ms);false = 没有够新的
-// TTFT 样本。(src/health.js:181-196)
-// 样本数与新鲜度都在这里把关,rank 不需要知道中位数窗口的存在。样本 <3 只用
-// 探测延迟 —— 1 个样本的延迟不是延迟,只是噪声。偶数个样本取中间均值并 Round,
-// 让快照值与面板显示一致(同一个值算两遍不该差 0.0001)。
-func (h *Health) ttftLatencyLocked(nodeKey string, now int64) (int64, bool) {
-	r, ok := h.ttft[nodeKey]
-	if !ok || len(r.Samples) < ttftMinSamples {
+// medianOf 排序取中位数:奇数个取中间,偶数个取中间两个的均值并 Round —— 与
+// TtftSnapshot 面板显示的是同一个数(同一个值算两遍不该差 0.0001)。排序在**副本**
+// 上做,调用方的样本切片要保持插入序(那是「最近 8 次」的窗口语义)。
+func medianOf(samples []int64) (int64, bool) {
+	if len(samples) < ttftMinSamples {
 		return 0, false
 	}
-	if now-r.At > ttftFresh {
-		return 0, false
-	}
-	sorted := append([]int64(nil), r.Samples...)
+	sorted := append([]int64(nil), samples...)
 	slices.Sort(sorted)
 	mid := len(sorted) >> 1
 	if len(sorted)%2 == 1 {
 		return sorted[mid], true
 	}
 	return int64(math.Round(float64(sorted[mid-1]+sorted[mid]) / 2)), true
+}
+
+// ttftLatencyLocked 这个节点当前该用于排序的延迟(ms);false = 没有够新的
+// TTFT 样本。(src/health.js:181-196)
+// 样本数与新鲜度都在这里把关,rank 不需要知道中位数窗口的存在。样本 <3 只用
+// 探测延迟 —— 1 个样本的延迟不是延迟,只是噪声。
+//
+// 中位数取 NoteTtft 写入时算好的那份(O12):这里被 rankLocked 对**每个候选**
+// 调一次,过去每次都要「拷 ≤8 个样本 + 排序」,一次 Pick 就是上千次小排序。
+// 数值与原来逐字相同(medianOf 就是当年内联的那四行)。
+func (h *Health) ttftLatencyLocked(nodeKey string, now int64) (int64, bool) {
+	r, ok := h.ttft[nodeKey]
+	if !ok || !r.hasMedian {
+		return 0, false
+	}
+	if now-r.At > ttftFresh {
+		return 0, false
+	}
+	return r.median, true
 }
 
 // TtftView 是 ttftSnapshot 的行形状(面板/测试观测用)。(src/health.js:198-206)
@@ -792,6 +851,13 @@ func IsRestrictedModel(model string) bool {
 // (src/health.js:548-558) 只有 gated 模型可能是:非受限模型(big-pickle)每个
 // A 出口都能服务,忘了传 model 就会把整个目录藏起来 —— 非受限模型必须返回
 // false。
+//
+// 状态要说清楚(O13 之后):/v1/models 过去逐行调它,而它对受限模型的每一次调用
+// 都要扫一遍 h.nodes ⇒ 目录行数 × 池子大小。那个循环现在自己把 GatedUsable()
+// 提到循环外,本函数因此**只剩单模型问答的语义**(pick_test 钉着这三档行为)。
+// 它不是面板在读的那格(那走 NodeSnapshot 的 tier),留着是因为「这个模型现在
+// 可服务吗」是调用方最可能问 health 的问题 —— 如果 T16 评审认为它就是该删,
+// 删法是把 pick_test 的三条断言改成直接问 GatedUsable。
 func (h *Health) UnavailableEverywhere(model string) bool {
 	if !IsRestrictedModel(model) {
 		return false

@@ -30,8 +30,13 @@ var ErrIdleTimeout = stderrors.New("httpclient: stream idle past its deadline")
 // http.DefaultTransport 的理由见 NewClient 的注释。
 func transport(d Dialer) *http.Transport {
 	tr := &http.Transport{
-		DialContext:           d,
-		MaxIdleConns:          8,
+		DialContext:  d,
+		MaxIdleConns: 8,
+		// 每主机的空闲上限必须显式给(Go 默认 2,O3):一个出口背后就是同一个
+		// host,2 条意味着高并发下第三条起新建、用完即弃,握手成本按请求数累加。
+		// transport 本来就是按出口建的(一个 client 一个池),所以每主机的上限
+		// 与总量取同一个数才是这里的语义。
+		MaxIdleConnsPerHost:   8,
 		IdleConnTimeout:       60 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,

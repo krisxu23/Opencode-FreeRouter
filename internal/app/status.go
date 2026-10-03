@@ -379,15 +379,10 @@ func (p *Parts) Status() any {
 			"latencyMs": -1,
 		}
 		if view, ok := snap[o.Tag]; ok {
-			b, err := json.Marshal(view)
-			if err == nil {
-				var m map[string]any
-				if json.Unmarshal(b, &m) == nil {
-					for k, v := range m {
-						row[k] = v
-					}
-				}
-			}
+			// O2:这里从前对每个节点做一次 Marshal + Unmarshal(每 5 秒一轮,
+			// 池上限 8000 个节点 = 一万六千次 JSON 往返),只为把行并进 map。
+			// MergeInto 逐键复刻 json 的输出,相等性钉在 health 包的测试里。
+			view.MergeInto(row)
 		}
 		nodes = append(nodes, row)
 	}

@@ -145,6 +145,11 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	// 出站集合没变就不刷新目录:目录刷新会打一次上游,而「什么都没变」
 	// 是稳态下最常见的情况(每 6 小时一次重建)。
 	added, removed, syncErr := p.Host.SyncOutbounds(p.Registry.All())
+	if syncErr == nil {
+		// 出站集合被换掉:旧代 client 里绑的拨号闭包指向的是已经被撤下的出站
+		// (O3)。失败的 sync 什么都没换,不能白丢一整批连接池。
+		p.noteEgressChanged()
+	}
 	// B11:两路失败都要冒泡 —— 订阅拉不到、出站热插失败。注册表本身已经
 	// 按「沿用历史节点」降级处理过,调用方拿到的是「这轮重建有没有全须全尾
 	// 地成功」,面板据此给 toast,托盘据此给提示。

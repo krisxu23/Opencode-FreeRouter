@@ -97,6 +97,20 @@ type Registry struct {
 	// 理由是把 R15 的纪律(锁内只取快照、写盘在锁外)变成可断言的事实:测试把写盘
 	// 卡住,再去看池子读取能不能照常返回。没有这个接缝就只能拿计时采样赌磁盘。
 	writeFile func(file string, v any, indent bool) error
+	// generation 每次**成员关系**变化 +1(Load/Merge/RetainOnly/EnforceCap/Remove)。
+	// 它存在的唯一理由是让调用方能安全缓存「池子的派生视图」(O10:候选池 + 每 tag
+	// 一次 CountryOf 的四级正则扫描,过去每请求重算一次,池上限 8000)。
+	// NoteFail 不涨它 —— 连败计数不改变池子里有哪些节点,派生视图也就没变。
+	generation uint64
+}
+
+// Generation 是当前成员关系代数。缓存方按它判新旧:代数没变就可以直接用缓存的
+// 视图,不必知道池子具体动了哪一条。调用方必须**先读代数、再取内容**(见 app 的
+// pool 缓存),否则可能在两次读之间被 Merge 抢过去,把新代的内容配到旧代上。
+func (r *Registry) Generation() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.generation
 }
 
 // NewRegistry 返回空池,**不读盘**;显式 Load()(与 JS initRegistry 在进程
@@ -125,6 +139,7 @@ func (r *Registry) Load() error {
 		if errors.Is(err, fs.ErrNotExist) {
 			r.entries = map[string]*entry{}
 			r.tombstones = map[string]*tombstone{}
+			r.generation++
 			return nil
 		}
 		return fmt.Errorf("registry: 载入 %s: %w", r.file, err)
@@ -168,6 +183,7 @@ func (r *Registry) Load() error {
 	}
 	r.entries = entries
 	r.tombstones = tombs
+	r.generation++
 	return nil
 }
 
@@ -219,6 +235,9 @@ func (r *Registry) Merge(outs []parse.Outbound) int {
 		existing.LastSeenAt = now
 		existing.Outbound = o
 		seen[key] = true
+	}
+	if added > 0 {
+		r.generation++ // 只有真的进了新 tag 才算换了成员关系(O10)
 	}
 	return added
 }
@@ -319,7 +338,10 @@ func (r *Registry) RetainOnly(alive []string, opts RetainOpts) []string {
 		dropped = append(dropped, tag)
 	}
 	r.pruneTombstonesLocked() // JS :246-253
-	sort.Strings(dropped)     // Go map 无序;JS 的 removedTags 按池内插入序,这里退化成字典序(调用方只按 tag 清理,顺序无语义)
+	if len(dropped) > 0 {
+		r.generation++
+	}
+	sort.Strings(dropped) // Go map 无序;JS 的 removedTags 按池内插入序,这里退化成字典序(调用方只按 tag 清理,顺序无语义)
 	return dropped
 }
 
@@ -384,6 +406,9 @@ func (r *Registry) EnforceCap(cap int) int {
 		delete(r.entries, x.tag)
 		removed++
 	}
+	if removed > 0 {
+		r.generation++
+	}
 	return removed
 }
 
@@ -396,6 +421,7 @@ func (r *Registry) Remove(tag string) bool {
 		return false
 	}
 	delete(r.entries, tag)
+	r.generation++
 	return true
 }
 

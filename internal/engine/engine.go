@@ -830,6 +830,12 @@ func shortTag(tag string) string {
 	return string(runes)
 }
 
+// bootUnix 是本进程启动的那一刻(O4)。/v1/models 的 created 用它,而不是每次调用
+// 各取一次 time.Now():后者让同一份列表在两次轮询之间"刚更新过",按 created 做
+// 缓存判断的客户端会反复认为是新数据。它表达的是「这份目录被本进程见到的时间」,
+// 那本来就是一个进程生命周期内的常量。
+var bootUnix = time.Now().Unix()
+
 // ModelRows 是 /v1/models 的行。上游 issue #3:在所有已探测的存活出口上都测得
 // 地区受限的模型,不再对外列出(面板仍展示并标记,便于观察 region 矩阵恢复)。
 // free-lane 过滤是 Go 版的防御性补充:Build 已经过滤过,这里再挡一道手工拼进
@@ -839,13 +845,23 @@ func (e *Engine) ModelRows() []Row {
 		return nil
 	}
 	snapshot := e.deps.State()
-	created := time.Now().Unix()
+	// O13:「有没有任何一个 B 出口」在这一整轮里是常量,而 GatedUsable() 每次都要
+	// 扫一遍 h.nodes(池上限 8000)。过去它藏在目录行的循环里 ⇒ /v1/models 每请求
+	// 付 catalog × nodes 次扫描,拿到的还是同一个答案。
+	gatedUsable := snapshot.Health.GatedUsable()
 	rows := make([]Row, 0, len(snapshot.Catalog))
 	for _, entry := range snapshot.Catalog {
-		if !catalog.IsFreeLane(entry.ID) || snapshot.Health.UnavailableEverywhere(entry.ID) {
+		if !catalog.IsFreeLane(entry.ID) {
 			continue
 		}
-		rows = append(rows, Row{ID: entry.ID, Object: "model", Created: created, OwnedBy: "lite-gateway"})
+		// 判据与 health.UnavailableEverywhere 逐字相同(单模型问答的那个 API),
+		// 只是这里必须**在循环外**取 GatedUsable(O13):它对受限模型的每一次
+		// 调用都要扫一遍 h.nodes,放在循环里就是 catalog × pool 次全表扫描,
+		// 而这 `/v1/models` 一轮里答案根本不会变。
+		if health.IsRestrictedModel(entry.ID) && !gatedUsable {
+			continue
+		}
+		rows = append(rows, Row{ID: entry.ID, Object: "model", Created: bootUnix, OwnedBy: "lite-gateway"})
 	}
 	return rows
 }

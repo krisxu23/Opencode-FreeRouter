@@ -141,11 +141,17 @@ func (h *Health) Pick(req PickRequest) *Picked {
 		want = append(want, group)
 	}
 	byGroup := map[string][]*ranked{}
+	// rankedAll 是为了不再排第二遍(O11):过去这里把整池 rank 一遍、按分组丢弃,
+	// 选定分组全落空时又把整池**重新 rank 一遍** —— 每次 Pick 白付约 2×池子次数的
+	// rank,而 rank 里还要查出口 IP 信任窗口、配额记号与 TTFT 中位数。第一趟的
+	// 结果就是第二趟要的结果:同一个纯函数、同一批 now/busy/quotaIps。
+	rankedAll := make([]*ranked, 0, len(req.Pool))
 	for _, node := range req.Pool {
 		r := h.rankLocked(node, req, busy, quotaIps, now)
 		if r == nil {
 			continue
 		}
+		rankedAll = append(rankedAll, r)
 		group := parse.BucketOf(r.country)
 		if !seen[group] {
 			continue
@@ -183,19 +189,13 @@ func (h *Health) Pick(req PickRequest) *Picked {
 	// 选定分组全部落空:仍然优先给一个可用池内节点而不是直接失败 —— 错国家的
 	// 好答案胜过没有答案。直连在这里永远不是候选;受限模型已在 rank 里滤掉非 B。
 	// (src/health.js:1044-1048)
-	any := make([]*ranked, 0, len(req.Pool))
-	for _, node := range req.Pool {
-		if r := h.rankLocked(node, req, busy, quotaIps, now); r != nil {
-			any = append(any, r)
-		}
-	}
-	if len(any) > 0 {
-		sortRanked(any)
-		lastOrder = any
+	if len(rankedAll) > 0 {
+		sortRanked(rankedAll)
+		lastOrder = rankedAll
 		if len(lastOrder) > 8 {
 			lastOrder = lastOrder[:8]
 		}
-		return withOrder(any[0])
+		return withOrder(rankedAll[0])
 	}
 	return withOrder(nil)
 }

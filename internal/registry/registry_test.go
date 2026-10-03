@@ -16,6 +16,66 @@ func ob(tag string) parse.Outbound {
 	return parse.Outbound{Tag: tag, Type: "vless", Server: tag, ServerPort: 443}
 }
 
+// TestGenerationTracksMembershipOnly 钉住 O10 缓存的正确性前提:代数必须在**成员
+// 关系**变化的每一条路径上涨,在不改变成员的路径上不涨。涨漏一条 = 调用方的派生
+// 视图里永久留着一个已淘汰的节点(engine 会一直把它当候选);白涨一次只是多算一遍。
+func TestGenerationTracksMembershipOnly(t *testing.T) {
+	r := newReg(t)
+	base := r.Generation()
+
+	r.Merge([]parse.Outbound{ob("a"), ob("b")})
+	if g := r.Generation(); g == base {
+		t.Fatal("新增 tag 必须涨代数")
+	}
+	base = r.Generation()
+	r.Merge([]parse.Outbound{ob("a")}) // 重复身份:成员没变
+	if g := r.Generation(); g != base {
+		t.Fatalf("重复合并也涨了代数: %d -> %d", base, g)
+	}
+	r.NoteFail("a", time.Now()) // 连败不改变成员
+	if g := r.Generation(); g != base {
+		t.Fatalf("NoteFail 不该涨代数: %d -> %d", base, g)
+	}
+	if dropped := r.RetainOnly([]string{"a"}, RetainOpts{MaxFails: 1}); len(dropped) != 1 {
+		t.Fatalf("RetainOnly dropped = %v, want 一条", dropped)
+	}
+	if g := r.Generation(); g == base {
+		t.Fatal("淘汰必须涨代数:被淘汰的节点不能留在缓存的候选池里")
+	}
+	base = r.Generation()
+	r.Merge([]parse.Outbound{ob("c"), ob("d"), ob("e")})
+	if g := r.Generation(); g == base {
+		t.Fatal("Merge 新节点后应涨代数")
+	}
+	base = r.Generation()
+	if r.EnforceCap(2) == 0 {
+		t.Fatal("EnforceCap 应当有驱逐")
+	}
+	if g := r.Generation(); g == base {
+		t.Fatal("驱逐必须涨代数(O10 的缓存正是靠这一条失效)")
+	}
+	base = r.Generation()
+	// EnforceCap 已经按加入时间挤掉过最旧的几条,这里从现存池子里取一条来验
+	// Remove(前面的步骤会随淘汰变化,写死 tag 名会把测试写成对淘汰顺序的断言)。
+	left := r.All()
+	if len(left) == 0 {
+		t.Fatal("池子被前面的步骤清空了,无法验证 Remove")
+	}
+	if !r.Remove(left[0].Tag) {
+		t.Fatalf("Remove(%q) = false", left[0].Tag)
+	}
+	if g := r.Generation(); g == base {
+		t.Fatal("Remove 必须涨代数")
+	}
+	base = r.Generation()
+	if err := r.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if g := r.Generation(); g == base {
+		t.Fatal("Load 换掉了整张表,必须涨代数")
+	}
+}
+
 // TestFlushWritesTheFileOutsideTheLock 钉住 R15:锁内只生成快照,序列化与原子写
 // 都在锁外。实测 node-registry.json 有 1.1MB,而每请求的候选池读取走的是同一把
 // 锁的 RLock —— 持锁跨写盘等于每轮 rebuild/probe 给所有在途请求加几十毫秒排队。
@@ -425,16 +485,16 @@ func TestLoadAppliesTheJSGuards(t *testing.T) {
 	doc := map[string]any{
 		"entries": map[string]any{
 			"good": map[string]any{
-				"outbound":   map[string]any{"tag": "good", "type": "vless", "server": "h", "server_port": 443, "username": "u1"},
-				"addedAt":    fresh, "lastSeenAt": fresh, "fails": 2, "lastFailAt": fresh,
+				"outbound": map[string]any{"tag": "good", "type": "vless", "server": "h", "server_port": 443, "username": "u1"},
+				"addedAt":  fresh, "lastSeenAt": fresh, "fails": 2, "lastFailAt": fresh,
 			},
 			"mismatch": map[string]any{
-				"outbound":  map[string]any{"tag": "other", "type": "vless", "server": "h", "server_port": 443},
-				"addedAt":   fresh, "lastSeenAt": fresh, "fails": 9, "lastFailAt": 0,
+				"outbound": map[string]any{"tag": "other", "type": "vless", "server": "h", "server_port": 443},
+				"addedAt":  fresh, "lastSeenAt": fresh, "fails": 9, "lastFailAt": 0,
 			},
 			"zerofails": map[string]any{
-				"outbound":  map[string]any{"tag": "zerofails", "type": "vless", "server": "h", "server_port": 443},
-				"addedAt":   fresh, "lastSeenAt": fresh, "fails": 0, "lastFailAt": 0,
+				"outbound": map[string]any{"tag": "zerofails", "type": "vless", "server": "h", "server_port": 443},
+				"addedAt":  fresh, "lastSeenAt": fresh, "fails": 0, "lastFailAt": 0,
 			},
 		},
 		"tombstones": map[string]any{

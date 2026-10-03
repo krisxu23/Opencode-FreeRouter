@@ -458,6 +458,13 @@ func (a *Adapter) feed(t *turn, chunk []byte, status int, s *sink) error {
 	prior := s.acc
 	// ScanUsage 折叠顶层 usage(chat 线的双拼写 + cache 细节)与 claude 文本
 	// 增量检测;三条线的嵌套落点与合并缺口在下面各线的补充里修。
+	//
+	// O14 的一半**不做**：同一帧确实被解了两遍(上面一次进 map 供 carriesDelta 与
+	// 三条线的投影用,这里一次进带指针的结构体)。合并不是免费的 —— B4/R14 依赖
+	// `*int64` 区分「键缺席」与「显式 0」,而 map 里读出来只有 any,那条区分要么
+	// 在 map 侧重写一遍、要么丢掉编译期的字段约束。两趟解码都是 O(帧大小),帧本身
+	// 被 SSE 上限钉在 8MB 内、常态只有几百字节;相比之下把判据写坏的代价是面板用量
+	// 与出口粘性定档整体失真 —— B4/R14 正是这类缺陷。
 	stream.ScanUsage(chunk, &s.acc, &s.first, t.t0)
 	switch a.deps.Wire {
 	case upstream.WireChat:
