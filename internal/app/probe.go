@@ -16,11 +16,14 @@
 // 绝不堆积。热区与冷区可并发运行,worker 预算对半封顶(96/32,合计不超过
 // 现行 128 并发的实测峰值)。
 //
-// 两个安全闸门贯穿所有 pass:
-//   - 事故滑窗:热区 pass 的通过率跌破地板(≥20 样本且 <10% 通过)说明
-//     探测通道本身坏了 —— ProbeDirect 区分「本机断网」与「上游闸门故障」,
-//     两种情况都整轮丢弃结果并冻结冷区删除(冷区的降档删除必须看到
-//     lastHotOK 才执行),直到下一个健康的热区 pass 解锁。
+// 两个安全闸门贯穿所有 pass(判据分档 —— 1.3.2 定稿):
+//   - 热区事故地板:复检**幸存者**时通过率跌破地板(≥20 样本且 <10% 通过)
+//     说明通道坏了 —— 上一轮刚证活的节点不该成批同时死光。整轮丢弃并冻结
+//     冷区删除(lastHotOK),直到下一个健康的热区 pass 解锁。
+//   - 首探零通关闸:首探测的是来路不明的新节点,通过率天然个位数(2026-10-04
+//     现场:1010 个新节点 5%–6% 通过是正常形状),地板判据会把每一轮首探都
+//     误杀 —— 热区只出不进缩到十几个。首探只在「零通关 **且** 直连也不可达」
+//     时丢弃;有通关或零通关但直连正常都照常应用。
 //   - 取消丢弃:pass 中途 ctx 取消(关停)→ 整轮结果丢弃(与 C2 同理)。
 package app
 
@@ -212,14 +215,17 @@ func (p *Parts) collectPassItems(tags []string, opts nodeprobe.ProbeOptions) []n
 	return items
 }
 
-// applyAccidentGuard 是热区/首探 pass 的事故判决:通过率跌破地板说明探测通道
-// 本身坏了。ProbeDirect 区分「本机断网」与「上游闸门故障」——两种情况都整轮
-// 丢弃结果(成功的少数量也不应用:一个把 95% 存活节点判死的 pass 里,那 5% 的
-// 「成功」同样不可信)。冻结只在这里做**一处**:清 lastHotOK —— 冷区删除的
-// 闸门读的就是这个位,清掉即暂停,直到下一次健康的热区 pass 重新置真。过去
-// 事故轮什么都不清:上一次健康 pass 留下的 true 会继续放行删除,包注释承诺
-// 的「事故冻结滑窗」实际是空头支票(通道坏了的那一刻起,冷区照删不误)。
-func (p *Parts) applyAccidentGuard(ctx context.Context, sum *PassSummary, label string, tested, alive int) bool {
+// applyAccidentGuard 是**热区** pass 的事故判决:复检对象的通过率跌破地板
+// 说明探测通道本身坏了(上一轮刚证活的节点不该成批同时死光)。ProbeDirect 在
+// 日志里区分「本机断网」与「上游闸门故障」——两种情况都整轮丢弃结果(成功的
+// 少数量也不应用:一个把 95% 存活节点判死的 pass 里,那 5% 的「成功」同样
+// 不可信)。冻结只在这里做**一处**:清 lastHotOK —— 冷区删除的闸门读的就是
+// 这个位,清掉即暂停,直到下一次健康的热区 pass 重新置真。
+//
+// 本判据**只适用于热区**:复检的是幸存者,地板才有意义。首探的对象来路不明、
+// 通过率天然个位数,误用本判据会把每一轮首探都杀光(1.3.2 修正;首探的通道
+// 故障判据见 applyFirstProbeGuard)。
+func (p *Parts) applyAccidentGuard(ctx context.Context, sum *PassSummary, tested, alive int) bool {
 	if tested < probeAccidentMin || float64(alive)/float64(tested) >= probeAliveFloor {
 		return false
 	}
@@ -229,22 +235,19 @@ func (p *Parts) applyAccidentGuard(ctx context.Context, sum *PassSummary, label 
 		reason = "本机断网（直连也不可达）"
 	}
 	p.lastHotOK.Store(false)
-	logger.Error(fmt.Sprintf("探测通道疑似故障（%s）：%s %d 个节点仅 %d 个通过（%.0f%% < %.0f%% 地板）— 本轮结果整体丢弃，冷区删除冻结",
-		reason, label, tested, alive, float64(alive)/float64(tested)*100, probeAliveFloor*100))
+	logger.Error(fmt.Sprintf("探测通道疑似故障（%s）：热区 %d 个节点仅 %d 个通过（%.0f%% < %.0f%% 地板）— 本轮结果整体丢弃，冷区删除冻结",
+		reason, tested, alive, float64(alive)/float64(tested)*100, probeAliveFloor*100))
 	sum.Accident = true
 	sum.Skipped = true
 	return true
 }
 
-// runProbeItems 是 pass 的公共执行段:并发探测 → 取消丢弃 → 事故闸门。
-// 返回 (结果, 事故)。items 为空时结果为 nil、事故为 false。ok 语义:
-// 结果为 nil 且事故为 false = 无事可做;调用方拿到 accident=true 时必须
-// 原样把判决带进自己的 PassSummary(过去事故标记写在本函数的局部 sum 里,
-// 随返回值一起被丢掉 —— 调用方的 sum.Accident 恒为 false,测试与面板都
-// 看不到事故轮)。
-func (p *Parts) runProbeItems(ctx context.Context, items []nodeprobe.Item, label string, max int) ([]nodeprobe.Result, bool) {
+// runProbeItems 是 pass 的公共执行段:并发探测 → 取消丢弃。**不在此处判事故**
+// —— 事故判据分档不同(热区看地板、首探看零通关),混在这里会让首探拿热区判据
+// 误杀自己。返回 (结果, 通关数);取消或空批时 results 为 nil,调用方原样收场。
+func (p *Parts) runProbeItems(ctx context.Context, items []nodeprobe.Item, max int) ([]nodeprobe.Result, int) {
 	if len(items) == 0 {
-		return nil, false
+		return nil, 0
 	}
 	// 并发预算 = max(设置值, 按节点数摊),封顶到该档。设置值必须被消费:
 	// 面板上挂着「探测并发」却谁都不读它 = 展示值与事实不符(第五轮审计同型)。
@@ -253,7 +256,7 @@ func (p *Parts) runProbeItems(ctx context.Context, items []nodeprobe.Item, label
 	if ctx.Err() != nil {
 		// C2 同理:取消的一轮不产生任何结论。
 		logger.Info("probe pass: 已取消（关停）— 整轮结果丢弃")
-		return nil, false
+		return nil, 0
 	}
 	alive := 0
 	for _, r := range results {
@@ -261,11 +264,32 @@ func (p *Parts) runProbeItems(ctx context.Context, items []nodeprobe.Item, label
 			alive++
 		}
 	}
-	var sum PassSummary
-	if p.applyAccidentGuard(ctx, &sum, label, len(items), alive) {
-		return nil, true
+	return results, alive
+}
+
+// applyFirstProbeGuard 是首探通道的事故判据(1.3.2 定稿,替代过去误用的热区
+// 地板)。首探测的是**来路不明的新节点**,通过率天然个位数(2026-10-04 现场:
+// 1010 个新节点三轮各 5%–6% 通过 —— 与 1.2.x 的 8% 全量基线同形状)。热区地板
+// 套在这里会把每一轮首探都误判成通道故障、整轮丢弃:新节点永远拿不到健康行、
+// 永远进不了热区,热区只出不进地缩到十几个(用户现场日志实锤的病灶)。
+//
+// 首探合法的通道故障信号只有一个:**零通关,且本机直连也不可达**。有通关 = 通道
+// 活着(结果照常应用,死的新节点进冷区,由 lastHotOK 删除闸保护);零通关但直连
+// 正常 = 这批订阅节点真的全是死的,同样是合法观测,照常应用。只有两者同时落空
+// 才丢弃整轮 —— 与 1.2.x 的 ProbeDirect 语义逐字同口径。
+func (p *Parts) applyFirstProbeGuard(ctx context.Context, sum *PassSummary, tested, alive int) bool {
+	if alive > 0 || tested == 0 {
+		return false
 	}
-	return results, false
+	derr := p.Prober.ProbeDirect(ctx, probeDirectTimeoutMS)
+	if derr == nil {
+		return false // 零通关但直连正常:这批新节点确实全死,判决照常落地
+	}
+	logger.Error(fmt.Sprintf("探测通道疑似故障（首探 %d 个新节点零通关，且本机直连也不可达：%v）— 本轮结果整体丢弃，下一拍重探",
+		tested, derr))
+	sum.Accident = true
+	sum.Skipped = true
+	return true
 }
 
 // hotPass 复检热区(alive)节点。keep alive 节点在 60s 级别的新鲜度:这是
@@ -300,18 +324,16 @@ func (p *Parts) hotPass(ctx context.Context) PassSummary {
 		sum.MS = p.nowMS() - started
 		return sum
 	}
-	results, accident := p.runProbeItems(ctx, items, "热区", hotWorkersMax)
-	if accident {
-		// 事故判决必须原样进本 pass 的 summary(面板/测试读 sum.Accident),
-		// 且一个结果都不应用:上一行已整轮丢弃。lastHotOK 已由 applyAccidentGuard
-		// 清成 false —— 冻结冷区删除正是这道闸的语义。
-		sum.Accident = true
-		sum.Skipped = true
+	results, alive := p.runProbeItems(ctx, items, hotWorkersMax)
+	if results == nil {
+		// 取消的一轮:什么都不应用,原样收场。
 		sum.MS = p.nowMS() - started
 		return sum
 	}
-	if results == nil {
-		// 取消的一轮:什么都不应用,原样收场。
+	if p.applyAccidentGuard(ctx, &sum, len(items), alive) {
+		// 事故判决必须原样进本 pass 的 summary(面板/测试读 sum.Accident),
+		// 且一个结果都不应用:判据已整轮丢弃。lastHotOK 已由判据清成 false ——
+		// 冻结冷区删除正是这道闸的语义。
 		sum.MS = p.nowMS() - started
 		return sum
 	}
@@ -459,16 +481,14 @@ func (p *Parts) firstProbePass(ctx context.Context) PassSummary {
 		sum.MS = p.nowMS() - started
 		return sum
 	}
-	results, accident := p.runProbeItems(ctx, items, "首探", hotWorkersMax)
-	if accident {
-		// 首探通道同样吃事故闸:新节点在坏通道上被判死会白丢一整批首探
-		// 判决(它们会带着 dead 行进冷区挨三轮删除)。丢弃,下一拍重探。
-		sum.Accident = true
-		sum.Skipped = true
+	results, alive := p.runProbeItems(ctx, items, hotWorkersMax)
+	if results == nil {
 		sum.MS = p.nowMS() - started
 		return sum
 	}
-	if results == nil {
+	if p.applyFirstProbeGuard(ctx, &sum, len(items), alive) {
+		sum.Accident = true
+		sum.Skipped = true
 		sum.MS = p.nowMS() - started
 		return sum
 	}

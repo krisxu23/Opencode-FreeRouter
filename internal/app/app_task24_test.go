@@ -332,6 +332,77 @@ func TestProbeNowAccidentNeedsCollapseToo(t *testing.T) {
 // TestHotPassDemotesButNeverDeletes 钉热区 pass 的边界:连续失败只降档
 // (连续 2 轮失败 → 冷区),删除是冷区 sweep 的专属判决 —— 热区本身一个
 // 节点都不许从注册表里消失。
+// TestFirstProbeLowPassRateIsNotAnAccident 是 2026-10-04 现场病灶的反向钉:
+// 1010 个新订阅节点的首探只通过 5% 是**正常形状**(1.2.x 全量基线 8%),热区
+// 地板(10%)误套到首探上后,每轮 2.5 分钟的实测结果被整轮丢弃 —— 新节点永远
+// 拿不到健康行、永远进不了热区,热区只出不进缩到十几个。首探的通道故障判据
+// 是「零通关且直连不可达」;有通关就必须照常应用,活节点由此进入热区。
+func TestFirstProbeLowPassRateIsNotAnAccident(t *testing.T) {
+	p := newProbeParts(t, 20) // 全部无健康行 → 全部走首探
+	fp := p.Prober.(*fakeProber)
+	// 19/20 失败(5% 通过,低于热区地板 10%)—— 现场形状。
+	fp.failedTags = map[string]bool{}
+	for i := 1; i < 20; i++ {
+		fp.failedTags[fmt.Sprintf("n%d", i)] = true
+	}
+	sum := p.firstProbePass(context.Background())
+	if sum.Accident || sum.Skipped {
+		t.Fatalf("首探 accident=%v skipped=%v, want 全 false —— 5%% 通过率是新池常态,不是通道故障(结果整轮丢弃的复发)", sum.Accident, sum.Skipped)
+	}
+	// 判决必须落地:n0 有 alive 行(进热区),19 个死的进冷区等删除闸裁决。
+	snap := p.Health.NodeSnapshot()
+	if v := snap["n0"]; v.State != health.StateAlive {
+		t.Fatalf("n0 = %v, want alive(唯一的通关者必须进入热区)", v.State)
+	}
+	for i := 1; i < 20; i++ {
+		if v := snap[fmt.Sprintf("n%d", i)]; v.State != health.StateDead {
+			t.Fatalf("n%d = %v, want dead(死的新节点照常进冷区)", i, v.State)
+		}
+	}
+}
+
+// TestFirstProbeZeroAliveWithDeadDirectIsDropped 钉首探通道故障的正判据:
+// 零通关 **且** 本机直连也不可达 → 通道坏了,整轮丢弃(不给新节点记死)。
+// 对照面(零通关但直连正常 = 这批真的全死,照常应用)由
+// TestFirstProbeZeroAliveAppliesWhenDirectOK 钉。
+func TestFirstProbeZeroAliveWithDeadDirectIsDropped(t *testing.T) {
+	p := newProbeParts(t, 20)
+	fp := p.Prober.(*fakeProber)
+	fp.failedTags = map[string]bool{}
+	for i := 0; i < 20; i++ {
+		fp.failedTags[fmt.Sprintf("n%d", i)] = true
+	}
+	fp.directErr = fmt.Errorf("dial: connection refused") // 直连也挂
+	sum := p.firstProbePass(context.Background())
+	if !sum.Accident || !sum.Skipped {
+		t.Fatalf("首探 accident=%v skipped=%v, want 全 true(零通关+直连挂 = 通道故障)", sum.Accident, sum.Skipped)
+	}
+	if snap := p.Health.NodeSnapshot(); len(snap) != 0 {
+		t.Fatalf("丢弃的一轮写了 %d 行健康状态, want 0(取消/事故轮不产生任何结论)", len(snap))
+	}
+}
+
+// TestFirstProbeZeroAliveAppliesWhenDirectOK 钉判据的另一半:零通关但直连
+// 正常 = 这批订阅节点真的全是死的,是**合法观测**,判决照常落地 —— 否则
+// 一个纯死订阅会让首探永远空转(每 30s 全量重测再丢弃,死循环)。
+func TestFirstProbeZeroAliveAppliesWhenDirectOK(t *testing.T) {
+	p := newProbeParts(t, 20)
+	fp := p.Prober.(*fakeProber)
+	fp.failedTags = map[string]bool{}
+	for i := 0; i < 20; i++ {
+		fp.failedTags[fmt.Sprintf("n%d", i)] = true
+	}
+	// directErr 为 nil:直连正常。
+	sum := p.firstProbePass(context.Background())
+	if sum.Accident || sum.Skipped {
+		t.Fatalf("首探 accident=%v skipped=%v, want 全 false(零通关+直连正常 = 合法观测)", sum.Accident, sum.Skipped)
+	}
+	snap := p.Health.NodeSnapshot()
+	if len(snap) != 20 {
+		t.Fatalf("健康行 = %d, want 20(全部 dead 入冷区,等删除闸裁决)", len(snap))
+	}
+}
+
 // TestColdDeletionFreezesWhenHotUnhealthy 钉删除闸的**负向**路径:冷区节点
 // 连败数满,但 lastHotOK=false(事故冻结,或删除闸从未被健康热区打开)时,
 // 一个都不许删 —— 这正是「探测通道坏了的时候,冷区连续失败是通道的锅,不是
