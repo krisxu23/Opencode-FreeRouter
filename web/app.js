@@ -1036,7 +1036,7 @@
   const FIELD_LABEL = {
     subUrls:'订阅链接', probeEnabled:'自动探测', effortLevel:'思考强度',
     defaultMaxTokens:'输出上限', probeWorkers:'探测并发', probeIntervalMin:'探测周期',
-    maxWallClockMs:'墙钟上限',
+    maxWallClockMs:'墙钟上限', exitConcurrency:'单出口并发上限',
   }
   function dirtyKeys() {
     const keys = []
@@ -1098,7 +1098,14 @@
     if (s.lanes) DATA.lanes = s.lanes
     /* F5：probing 位以服务端为准 —— 异步受理后，前端本地的乐观值只活到
        下一次 /api/status 轮询（5s）；探测完成/失败也由这里复位按钮。 */
-    if (typeof s.probing === 'boolean') S.probing = s.probing
+    if (typeof s.probing === 'boolean') {
+      /* 探测完成的沿:异步受理后完成信号只有服务端 probing 位这一处 */
+      if (S.probing && !s.probing) {
+        toast('探测完成', 'ok')
+        refreshLogs()
+      }
+      S.probing = s.probing
+    }
   }
   /* W18：轮询的时序保护。慢的旧响应回来时，新一轮可能已经落地 —— 不做保护
      会把 5 秒前的旧快照覆盖上去(显示回跳)。单调 seq：响应落地前比对发起时

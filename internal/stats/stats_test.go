@@ -6,6 +6,7 @@ package stats
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -347,5 +348,31 @@ func TestLoadReplacesStateNotMerges(t *testing.T) {
 	s.Record(Record{At: time.Now().UnixMilli(), Model: "m", OK: true, Output: 1})
 	if got := len(s.Snapshot().Samples); got != 1 {
 		t.Fatalf("Record 后 len(Samples) = %d, 期望 1", got)
+	}
+}
+
+func TestExitsAreCappedToTheTopByReq(t *testing.T) {
+	// P5:Exits 是全仓唯一的无界增长面(出口 tag 随订阅 churn 无限换代)。
+	// 淘汰按 req 保 top:活跃出口不会被挤掉,历史出口自然沉底。
+	old := exitsMax
+	exitsMax = 8
+	defer func() { exitsMax = old }()
+
+	s := New("")
+	for i := 0; i < 100; i++ {
+		s.Record(Record{Model: "m", Exit: fmt.Sprintf("exit-%03d", i), OK: true})
+	}
+	// exit-000 多记一笔,成为 top;exit-099 仍是 1 req,垫底被挤。
+	s.Record(Record{Model: "m", Exit: "exit-000", OK: true})
+
+	snap := s.Snapshot()
+	if len(snap.Exits) != 8 {
+		t.Fatalf("Exits = %d 行, want 上限 8", len(snap.Exits))
+	}
+	if _, ok := snap.Exits["exit-000"]; !ok {
+		t.Fatal("req 最高的出口被挤掉了")
+	}
+	if _, ok := snap.Exits["exit-099"]; ok {
+		t.Fatal("垫底出口应被淘汰")
 	}
 }

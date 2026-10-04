@@ -96,8 +96,6 @@ const (
 type block struct {
 	index int
 	kind  int
-	// text 是正文/推理块的累积值(只为与 JS 形状对齐,投影层的判定不读它)。
-	text string
 	// args 是 tool-call 块拼齐中的参数。
 	args string
 	id   string
@@ -174,7 +172,8 @@ func (s *sink) text(key, delta string) error {
 	}
 	s.sawText = true
 	b := s.slot(key, blockText)
-	b.text += delta
+	// 不再累积块文本(P5 审计最大单点):b.text 全仓零读者,1MB 回答 ≈500 帧
+	// 的整串拷贝全是白付;正文由 engine 侧的 strings.Builder 攒,这里只发增量。
 	return s.emit(Delta{Kind: DeltaText, Index: b.index, Text: delta})
 }
 
@@ -184,7 +183,6 @@ func (s *sink) reasoning(key, delta string) error {
 	}
 	s.sawReasoning = true
 	b := s.slot(key, blockReasoning)
-	b.text += delta
 	return s.emit(Delta{Kind: DeltaReasoning, Index: b.index, Text: delta})
 }
 

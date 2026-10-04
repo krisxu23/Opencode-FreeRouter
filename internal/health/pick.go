@@ -224,7 +224,7 @@ func (h *Health) Pick(req PickRequest) *Picked {
 // 只重排、不排除。
 func (h *Health) rankLocked(node PoolNode, req PickRequest, busy map[string]int, quotaIps map[string]bool, now int64) *ranked {
 	r, hasRow := h.nodes[node.Tag]
-	if !h.nodeUsableLocked(node.Tag) {
+	if !h.nodeUsableLocked(node.Tag, now) {
 		return nil
 	}
 	gated := hasRow && r.Tier == TierB
@@ -381,7 +381,7 @@ func (h *Health) busyExitIpsLocked(ownSticky string) map[string]int {
 		if ownSticky != "" && hit.NodeKey == ownSticky {
 			continue
 		}
-		if !h.nodeUsableLocked(hit.NodeKey) {
+		if !h.nodeUsableLocked(hit.NodeKey, now) {
 			continue
 		}
 		ip := hit.ExitIP

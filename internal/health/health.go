@@ -181,13 +181,16 @@ type ttftRow struct {
 // file 只存路径,Load/Persist 各做一次带类型的读写;cooling/sticky/busy/ttft
 // 一律不落盘,row 的十个字段就是落盘全集。
 type Health struct {
-	mu     sync.RWMutex
-	file   string
-	nodes  map[string]row
-	sticky map[string]*sticky
-	busy   map[string]*busy
-	cool   map[string]*cooling
-	ttft   map[string]*ttftRow
+	mu    sync.RWMutex
+	file  string
+	nodes map[string]row
+	// quotaTags 是 LastQuotaAt>0 的行索引:quotaMarkedExitIpsLocked 从「每次
+	// Pick 扫全池」变「扫少数中招者」(P3);行删除后的残留由该函数懒清理。
+	quotaTags map[string]struct{}
+	sticky    map[string]*sticky
+	busy      map[string]*busy
+	cool      map[string]*cooling
+	ttft      map[string]*ttftRow
 	// stickyFail counts consecutive pre-content failures on the session's
 	// sticky exit. A node can be alive on the probe and still fail every real
 	// turn on transport; without this fuse one session re-hits the same dead
@@ -201,6 +204,7 @@ func NewHealth(file string) *Health {
 	h := &Health{
 		file:       file,
 		nodes:      map[string]row{},
+		quotaTags:  map[string]struct{}{},
 		sticky:     map[string]*sticky{},
 		busy:       map[string]*busy{},
 		cool:       map[string]*cooling{},
@@ -251,6 +255,13 @@ func (h *Health) Load() error {
 		nodes[key] = r
 	}
 	h.nodes = nodes
+	// P3b:按盘上数据重建配额记号索引(重启后 Pick 的配额降级不丢)。
+	h.quotaTags = map[string]struct{}{}
+	for key, r := range h.nodes {
+		if r.LastQuotaAt > 0 {
+			h.quotaTags[key] = struct{}{}
+		}
+	}
 	return nil
 }
 
@@ -636,6 +647,10 @@ func (h *Health) NoteQuota(nodeKey string) {
 	}
 	r.LastQuotaAt = time.Now().UnixMilli()
 	h.nodes[nodeKey] = r
+	if h.quotaTags == nil {
+		h.quotaTags = map[string]struct{}{}
+	}
+	h.quotaTags[nodeKey] = struct{}{}
 }
 
 // quotaMarkedLocked 这个节点自己的配额记号还新鲜吗?(src/health.js:402-406)
@@ -656,9 +671,13 @@ func (h *Health) quotaMarkedLocked(nodeKey string, now int64) bool {
 //
 // 反过来(只标节点)在第一种读法下是静默失效,所以不对称的代价偏向这边。
 func (h *Health) quotaMarkedExitIpsLocked(now int64) map[string]bool {
+	// P3:过去每次 Pick 扫全池(h.nodes,上限 8000)只为找 LastQuotaAt!=0 的
+	// 少数中招行 —— 现在只走索引;行已删/记号已过期的残留在这里懒清理
+	// (调用方持写锁,删除安全)。
 	out := map[string]bool{}
-	for key := range h.nodes {
+	for key := range h.quotaTags {
 		if !h.quotaMarkedLocked(key, now) {
+			delete(h.quotaTags, key)
 			continue
 		}
 		if ip := h.exitIpOfLocked(key, now); ip != "" {
@@ -675,10 +694,10 @@ func (h *Health) NodeUsable(nodeKey string) bool {
 	// 写锁:过期的冷却条目在这里顺手删除。
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.nodeUsableLocked(nodeKey)
+	return h.nodeUsableLocked(nodeKey, time.Now().UnixMilli())
 }
 
-func (h *Health) nodeUsableLocked(nodeKey string) bool {
+func (h *Health) nodeUsableLocked(nodeKey string, now int64) bool {
 	if h.healthOfLocked(nodeKey) == StateDead {
 		return false
 	}
@@ -687,7 +706,9 @@ func (h *Health) nodeUsableLocked(nodeKey string) bool {
 		return true
 	}
 	// 过期顺手删除,避免冷却表随节点标签流转无限增长(src/health.js:433-434)。
-	if c.Until <= time.Now().UnixMilli() {
+	// now 由调用方传入:rank 热路径上每节点自取一次 time.Now() 在 Windows 上
+	// 不是免费的(2100 节点 = 2100 次系统调用级取时),调用方手里就有同一时刻。
+	if c.Until <= now {
 		delete(h.cool, nodeKey)
 		return true
 	}
@@ -1137,7 +1158,7 @@ func (h *Health) sameExitNodeLocked(exitIP, excludeKey string) string {
 		if h.exitIpOfLocked(key, now) != exitIP {
 			continue
 		}
-		if !h.nodeUsableLocked(key) {
+		if !h.nodeUsableLocked(key, now) {
 			continue
 		}
 		state := 1
@@ -1180,7 +1201,7 @@ func (h *Health) ExitForSession(session string) string {
 		delete(h.stickyFail, session)
 		return ""
 	}
-	if h.nodeUsableLocked(hit.NodeKey) {
+	if h.nodeUsableLocked(hit.NodeKey, now) {
 		return hit.NodeKey
 	}
 	ip := hit.ExitIP

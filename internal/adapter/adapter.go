@@ -478,6 +478,13 @@ func (a *Adapter) readJSON(raw []byte, status int, retryAfter int64, t *turn, s 
 	if err := a.feed(t, raw, status, s); err != nil {
 		return err
 	}
+	// 终止原因也要补:feedChat 在 delta==nil 时提前 continue(读不到
+	// finish_reason),feedClaude/feedResponses 按 type 分派对整包体 no-op ——
+	// 截断的整包回答过去被判 FinishStop,客户端拿到 "stop"/"completed" 的
+	// 腰斩回答不会续写(H1/BUG-1 同症状的第三扇门)。
+	if token := finishOfFullBody(p, a.deps.Wire); token != "" {
+		s.setFinish(token)
+	}
 	if text := fullTextOf(p, a.deps.Wire); text != "" {
 		if !s.first {
 			s.first = true
@@ -740,10 +747,13 @@ func feedClaudeUsage(p map[string]any, prior stream.Usage, acc *stream.Usage) {
 	}
 }
 
-// feedResponsesUsage 修 responses 线的 usage 盲区:response.completed 的 usage
-// 挂在 response 下,ScanUsage 的顶层折叠看不到它(js feedResponses:221-236)。
+// feedResponsesUsage 修 responses 线的 usage 盲区:usage 挂在 response 下,
+// ScanUsage 的顶层折叠看不到它(js feedResponses:221-236)。completed 与
+// incomplete 都要认 —— 被截断的轮次上游发的是独立终止事件 incomplete,载荷
+// 同形且带 usage;只认 completed 的话,恰恰是最该记账的长输出截断轮
+// (muse-spark 家族)usage 恒 0,RecordUsage/NoteStickyUsage 全部漏账。
 func feedResponsesUsage(p map[string]any, acc *stream.Usage) {
-	if p["type"] != "response.completed" {
+	if p["type"] != "response.completed" && p["type"] != "response.incomplete" {
 		return
 	}
 	resp, _ := p["response"].(map[string]any)
@@ -873,4 +883,42 @@ func snippet(raw []byte) string {
 // 用于「多读一个字节都算违约」的场合。
 func readAllPrefix(r io.Reader, limit int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, limit))
+}
+
+// finishOfFullBody 从非流式整包里读终止原因(feed 只处理 delta 形状,这是它的
+// 非流式补集):chat 的 choices[].finish_reason、claude 的顶层 stop_reason、
+// responses 的顶层 status + incomplete_details —— 映射与 feedResponses 流式
+// 分支同一套(reason=max_output_tokens → "length")。空串与 "stop" 同价
+// (engine.finishReasonOf 的 default 分支)。
+func finishOfFullBody(p map[string]any, wire upstream.Wire) string {
+	switch wire {
+	case upstream.WireChat:
+		token := ""
+		choices, _ := p["choices"].([]any)
+		for _, choice := range choices {
+			cm, ok := choice.(map[string]any)
+			if !ok {
+				continue
+			}
+			if s, ok := cm["finish_reason"].(string); ok && s != "" {
+				token = s
+			}
+		}
+		return token
+	case upstream.WireMessages:
+		s, _ := p["stop_reason"].(string)
+		return s
+	default: // responses:整包就是 response 对象本身(流式才包在 response 键下)
+		status, _ := p["status"].(string)
+		details, _ := p["incomplete_details"].(map[string]any)
+		reason, _ := details["reason"].(string)
+		switch {
+		case reason == "max_output_tokens":
+			return "length"
+		case status == "completed":
+			return "stop"
+		default:
+			return status
+		}
+	}
 }

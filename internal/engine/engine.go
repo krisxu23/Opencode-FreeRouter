@@ -349,6 +349,12 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 	attempt := 0
 	for {
 		attempt++
+		// 客户端取消的快速生效点:排队/慢出口场景下,上一发还在途时客户端
+		// 已离开 —— 不在这里拦,下一发拨号/请求照发,出口 quota 照扣。
+		if err := ctx.Err(); err != nil {
+			tr.record("客户端离开", "")
+			return Outcome{}, errors.Failure{Code: check.CodeAborted, Message: "client gone: " + err.Error()}
+		}
 		attemptStartedAt := nowMS()
 		if attempt > attemptCap {
 			// 放弃路径也必须打汇总 —— 这正是「只限次数、不设墙钟」这个决定
@@ -418,7 +424,6 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			}
 			return Outcome{}, errors.Failure{Code: codeOrServer(lastFailure), Status: 503, Message: message}
 		}
-		snapshot.Health.NoteSticky(session, picked.NodeKey, withinTurn)
 		// 出口车道闸门(magpie lanes):同一出口 IP 最多 ExitConcurrency 个
 		// 在途,超出的排队等槽 —— 排队不是失败,不换出口、不记错误。排队
 		// 时不占在途 busyIP 计数(那是发给上游后的量),轮到才取 IP。
@@ -431,10 +436,17 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			var ok bool
 			releaseLane, ok = e.exitLanes.acquire(ctx, exitIP, settings.ExitConcurrency)
 			if !ok {
-				// 客户端在排队时离开了:这一轮作废,什么都没发出去。
+				// 客户端在排队时离开了:这一轮作废,什么都没发出去。两个账
+				// 必须在这里补:(a) NoteSticky 挪到 acquire 成功之后 —— 排队
+				// 即取消的会话不该被钉到一个从未发出过请求的出口上白拿 30min
+				// 粘性;(b) 「每请求恰一条 Route」的不变量在六条 record 路径
+				// 之外不能有旁路。
+				tr.record("客户端离开(车道排队)", "")
 				return Outcome{}, ctx.Err()
 			}
 		}
+		// sticky 在车道闸门之后落钉:只有真正拿到出口的轮次才配改会话粘性。
+		snapshot.Health.NoteSticky(session, picked.NodeKey, withinTurn)
 		// 在途计数拿 IP 当令牌,acquire 时取一次、release 还同一个
 		// (engine.js:269/:312)。不能在 release 时重新解析 IP:探测轮可能
 		// 在这个请求跑着的时候把节点量到另一个 IP,那样会还错对象、把另一个
@@ -522,7 +534,12 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 				if startedSticky != "" && picked.NodeKey == startedSticky {
 					snapshot.Health.NoteStickyFailure(session)
 				}
-				return Outcome{}, *failure
+				// 与 cap/墙钟/池子扫完三条放弃路径同一状态码:这是「轮换耗尽」,
+				// Failure 没带 Status 会让转发层落到 500,调用方的重试策略
+				// 在同一类失败上分叉。
+				exhausted := *failure
+				exhausted.Status = 503
+				return Outcome{}, exhausted
 			}
 			excluded[picked.NodeKey] = true
 			lastFailure = failure
@@ -754,16 +771,21 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 		// 被判可重试继续换出口 —— 「出口切换只在首字节前」的承诺被打破,
 		// 客户端还会收到两帧 usage。失败轮的 usage 同样不可信,直接不发。
 		if err2 := emit(Chunk{Kind: ChunkUsage, Usage: res.Usage}); err2 != nil {
+			// 写失败 = 客户端已断开。必须用 Aborted(不在 retryOn):usage 不算
+			// 内容,CodeServer 会让分支 A 换出口重试一整次,重试在首个增量处
+			// 才被 stream.failed() 掐断 —— 白烧一次上游请求。
 			materialize()
 			return out, finish, sawContent,
-				&errors.Failure{Code: check.CodeServer, Message: err2.Error()}
+				&errors.Failure{Code: check.CodeAborted, Message: "client gone: " + err2.Error()}
 		}
 	}
 	if err2 := emit(Chunk{Kind: ChunkFinish, Finish: finish}); err2 != nil {
-		// 收尾帧都发不出去 = 客户端已走,按出内容后的失败收场。
+		// 收尾帧都发不出去 = 客户端已走。usage-only 轮(无内容块)上
+		// sawContent=false,CodeServer 会进分支 A 白烧一整轮;统一 Aborted:
+		// 有内容时分支 C 照旧(轮换本来就不发生),无内容时立即收场。
 		materialize()
 		return out, finish, sawContent,
-			&errors.Failure{Code: check.CodeServer, Message: err2.Error()}
+			&errors.Failure{Code: check.CodeAborted, Message: "client gone: " + err2.Error()}
 	}
 	materialize()
 	return out, finish, sawContent, nil

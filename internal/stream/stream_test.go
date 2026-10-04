@@ -326,3 +326,12 @@ func TestScanUsageAcceptsFloatLiterals(t *testing.T) {
 		t.Fatalf("In=%d Out=%d CacheRead=%d, want 1200/5/34(disjoint-count 减缓存)", acc.In, acc.Out, acc.CacheRead)
 	}
 }
+
+func TestScanUsageDetectsContentBlockStart(t *testing.T) {
+	// L7:Anthropic 的块挂在 content_block 键下;旧实现读 content,恒不命中
+	// (TTFT 由 carriesDelta 兜住所以没露出过症状)。
+	acc := &Usage{}
+	if !ScanUsage([]byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`), acc, new(bool), time.Now()) {
+		t.Fatal("content_block_start 应判为内容")
+	}
+}

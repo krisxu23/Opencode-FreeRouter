@@ -123,6 +123,14 @@ func (t *idleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if headerTimer != nil {
 		headerTimer.Stop()
 	}
+	if err == nil && headerExpired.Load() {
+		// 头在 idle 截止的同一 tick 到达:Stop 返回 false,回调已把 ctx
+		// cancel —— 不在这里拦,body 的每次 Read 都会死在 "context canceled",
+		// 被 adapter 归成 EMPTY/SERVER 而不是 TIMEOUT(不进 cooldownOn,
+		// 坏出口不冷却)。与 exchange 侧「空闲截止先于 ctx 检查」同一裁决。
+		cancel()
+		return nil, ErrIdleTimeout
+	}
 	if err != nil {
 		cancel()
 		// 头阶段的超时在底层看起来是 context canceled（我们自己取消的），

@@ -432,20 +432,7 @@ func Load(root string) (*Parts, error) {
 		State: func() engine.State {
 			return engine.State{Catalog: catBox.get(), Health: h}
 		},
-		Pool: func() []health.PoolNode {
-			// 代数交给 poolBox 自己读:它必须**先**读代数、**再**按那个代数取内容,
-			// 反过来的话,若中间插进一次 Merge,新内容会被记在更新后的代数上 ——
-			// 缓存从此永久不再失效(整分支评审确认过这条顺序,并在 RISK-4 之后把
-			// 取内容挪到锁外,顺序就更不能靠调用点侥幸维持)。
-			return parts.pool.get(reg.Generation, func() []health.PoolNode {
-				outs := reg.All()
-				pool := make([]health.PoolNode, 0, len(outs))
-				for _, o := range outs {
-					pool = append(pool, health.PoolNode{Tag: o.Tag, Country: parse.CountryOf(o.Tag)})
-				}
-				return pool
-			})
-		},
+		Pool: func() []health.PoolNode { return parts.poolNodes() },
 		Settings: func() engine.Settings {
 			// 必须读活值:面板上保存的 effortLevel / defaultMaxTokens 会写进
 			// 同一份 settings,热路径每请求取一次(B2/B3)。过去 EffortLevel
@@ -785,10 +772,10 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 			p.cancel()
 		}
 		p.stopPendingTimers()
-		// 面板服务先关:面板动作(探测/刷新)以请求 ctx 运行,不掐断连接它们
-		// 会跑完整轮(数分钟)才返回,下面的 wait 就要把退出拖住那么久。Close
-		// 会取消在途 handler 的 ctx,探测轮随即中止(probe.go 的取消守卫整轮
-		// 丢弃,健康表原样保留)。
+		// 面板服务先关:不再接受新请求、掐断以 r.Context() 运行的只读在途
+		// 请求。注意面板**动作**(探测/刷新)跑在 lifeCtx 上,让它们止步的是
+		// 上面的 p.cancel() —— 探测轮在取消后由 probe.go 的守卫整轮丢弃,
+		// 重建由 rebuild.go 的关停短路在 SyncOutbounds/Persist 之前收住。
 		if p.Panel != nil {
 			_ = p.Panel.Close()
 		}
@@ -939,4 +926,24 @@ func portOf(ln net.Listener) int {
 		return tcp.Port
 	}
 	return 0
+}
+
+// poolNodes 是注册表 → 候选池(Tag + Country)的投影,按注册表代数缓存。
+// 代数必须**先**读、**再**按那个代数取内容,反过来的话,若中间插进一次
+// Merge,新内容会被记在更新后的代数上 —— 缓存从此永久不再失效(整分支
+// 评审确认过这条顺序)。
+//
+// engine 的 Pool 回调与 /api/status 共用这一份:第五轮 P2 审计抓到 Status 每
+// 5s 对全池重跑 CountryOf 的四级识别(~30 条 (?i) 正则,10-40ms/tick 的纯
+// CPU + 2MB 级垃圾),而同代缓存就在同一个结构体里 —— 典型的「缓存就在
+// 旁边还要付钱」。
+func (p *Parts) poolNodes() []health.PoolNode {
+	return p.pool.get(p.Registry.Generation, func() []health.PoolNode {
+		outs := p.Registry.All()
+		pool := make([]health.PoolNode, 0, len(outs))
+		for _, o := range outs {
+			pool = append(pool, health.PoolNode{Tag: o.Tag, Country: parse.CountryOf(o.Tag)})
+		}
+		return pool
+	})
 }

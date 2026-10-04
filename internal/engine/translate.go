@@ -202,7 +202,10 @@ func rawJSONOf(v any) json.RawMessage {
 	case nil:
 		return json.RawMessage("{}")
 	case string:
-		if x == "" {
+		// 非法 JSON 文本的历史 arguments 会让 payload 的 Marshal 在 compact
+		// 校验时失败 → build 失败 → 每个出口毫秒级死在同一处,扫满 attemptCap
+		// 才 503。与缺失同价退 {},让上游的 400 去告诉调用方参数有问题。
+		if x == "" || !json.Valid([]byte(x)) {
 			return json.RawMessage("{}")
 		}
 		return json.RawMessage(x)

@@ -1452,3 +1452,18 @@ func TestAttemptCapCodesAreAllRetryable(t *testing.T) {
 		}
 	}
 }
+
+func TestRawJSONOfRejectsInvalidJSONText(t *testing.T) {
+	// L8:非法 JSON 文本的历史 arguments 会让 payload 的 Marshal 在 compact
+	// 校验时失败 → build 失败 → 每个出口毫秒级死在同一处,扫满 attemptCap
+	// 才 503。与缺失同价退 {},让上游的 400 去告诉调用方参数有问题。
+	if got := string(rawJSONOf("not json")); got != "{}" {
+		t.Fatalf("非法 JSON 文本应退 {}: %q", got)
+	}
+	if got := string(rawJSONOf(`{"q":1}`)); got != `{"q":1}` {
+		t.Fatalf("合法文本应原样直通: %q", got)
+	}
+	if got := string(rawJSONOf(nil)); got != "{}" {
+		t.Fatalf("nil 应退 {}: %q", got)
+	}
+}

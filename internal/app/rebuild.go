@@ -122,6 +122,13 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	} else {
 		p.subFetchRetries = 0
 	}
+	// 关停窗口短路:面板动作跑在 lifeCtx 上,让它们止步的是 p.cancel() ——
+	// Shutdown 注释里「Panel.Close 取消在途动作」对它们不成立(Close 只取消
+	// 以 r.Context() 运行的请求)。SyncOutbounds/Flush/Persist 都不看 ctx,
+	// 不在这里拦:托盘退出会被大池热插拖住几十秒,退出后仍在写盘。
+	if err := ctx.Err(); err != nil {
+		return errors.Join(fetchErr, err)
+	}
 	if len(picked) == 0 {
 		// 订阅一个都没成:沿用注册表里的历史节点,池子原样保留。清空池子
 		// 会把一次网络抖动升级成「网关没有出口」。
@@ -158,6 +165,11 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	// B11:两路失败都要冒泡 —— 订阅拉不到、出站热插失败。注册表本身已经
 	// 按「沿用历史节点」降级处理过,调用方拿到的是「这轮重建有没有全须全尾
 	// 地成功」,面板据此给 toast,托盘据此给提示。
+	// 热插进行中关停的第二道闸:上面那道拦不住「SyncOutbounds 已在跑」的
+	// 窗口,后续的 PruneStale/Persist 同样不该在退出流程里继续写盘。
+	if err := ctx.Err(); err != nil {
+		return errors.Join(fetchErr, err)
+	}
 	rebuildErr := errors.Join(fetchErr, syncErr)
 	p.setRebuildResult(added, removed, dropped, rebuildErr)
 	if syncErr != nil {
@@ -388,7 +400,7 @@ func (p *Parts) fetchIDs(ctx context.Context, d httpclient.Dialer, timeoutMS int
 	if err != nil {
 		return nil
 	}
-	client := httpclient.NewClient(d, time.Duration(timeoutMS)*time.Millisecond)
+	client := httpclient.NewOneShotClient(d, time.Duration(timeoutMS)*time.Millisecond) // 每 shot 即弃,不留 idle 连接
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil

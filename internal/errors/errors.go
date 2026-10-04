@@ -58,7 +58,7 @@ var (
 	// 请求全部报「无健康出口」,且只能等下一轮粗探(≥5 分钟)自愈。
 	// 结构化的 type == "RegionError" 仍是首选判据(任何状态码都认),文案判据
 	// 只保留完整短语,并在 Classify 里额外要求 4xx。
-	regionRe = regexp.MustCompile(`(?i)not available in your country|not available in this region`)
+	regionRe = regexp.MustCompile(`(?i)not available in your country|not available in (?:this|your) region|unsupported region`)
 	quotaRe  = regexp.MustCompile(`(?i)usage limit|rate limit`)
 	freeRe   = regexp.MustCompile(`(?i)freetier|free.?tier`)
 	modelRe  = regexp.MustCompile(`(?i)model is unavailable|not supported`)
@@ -104,7 +104,9 @@ func Classify(status int, body []byte, retryAfterMS int64) Failure {
 	// 配额分支必须在凭证分支之前:文案是 "usage limit" 的 403 是配额拒绝,
 	// 换出口恰恰是正确的应对(src/errors.js:47)。
 	case status == 429 || typ == "FreeUsageLimitError" || typ == "GoUsageLimitError" ||
-		status == 402 || quotaRe.MatchString(flat) || strings.Contains(flat, "insufficient"):
+		status == 402 || quotaRe.MatchString(flat) ||
+		strings.Contains(flat, "insufficient funds") || strings.Contains(flat, "insufficient quota") ||
+		strings.Contains(flat, "insufficient credits"):
 		// GoUsageLimitError 是配额分支的第二个类型名(dsh harness 仓库 2026-10
 		// 实测:它以 403 且文案不含 "usage limit" 的形状出现,漏认会掉进下面的
 		// 凭证分支变成不可重试的慢失败;自带 retry-after ≈600s)。402 与

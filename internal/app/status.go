@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +23,6 @@ import (
 	"freerouter/internal/health"
 	"freerouter/internal/logger"
 	"freerouter/internal/panel"
-	"freerouter/internal/parse"
 	"freerouter/internal/stats"
 	"freerouter/internal/upstream"
 )
@@ -455,7 +455,7 @@ func (p *Parts) Status() any {
 		okValue = lastOK
 	}
 
-	outs := p.Registry.All()
+	outs := p.poolNodes()
 	singbox := map[string]any{
 		"running": true, // 零端口架构:sing-box 与本进程同生死,进程在即 running
 		"pid":     os.Getpid(),
@@ -510,7 +510,7 @@ func (p *Parts) Status() any {
 	for _, o := range outs {
 		row := map[string]any{
 			"tag":       o.Tag,
-			"country":   parse.CountryOf(o.Tag),
+			"country":   o.Country, // poolNodes 缓存里已算好(CountryOf 四级识别不再每 tick 全池重跑)
 			"state":     string(health.StateUnknown),
 			"latencyMs": -1,
 		}
@@ -588,7 +588,7 @@ func (p *Parts) usageView() map[string]any {
 	if !ok {
 		todayBucket = stats.Bucket{}
 	}
-	byExit := snap.Exits
+	byExit := topBuckets(snap.Exits, 20)
 	if byExit == nil {
 		byExit = map[string]stats.Bucket{}
 	}
@@ -858,6 +858,11 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 			if n < 0 {
 				n = 0
 			}
+			// 30 天封顶:这不是 数学溢出防御(engine 拿它做纯 int64 毫秒比较),
+			// 而是语义防御 —— 一个 1e15 的「墙钟」等效不限,用户却以为设了限。
+			if n > 30*24*60*60*1000 {
+				return nil, fmt.Errorf("app: 设置 maxWallClockMs 不能超过 30 天")
+			}
 			clean[key] = n
 		}
 	}
@@ -895,4 +900,31 @@ func (p *Parts) LimitsView() panel.LimitsView {
 	p.limitsMu.Lock()
 	defer p.limitsMu.Unlock()
 	return panel.LimitsView{Rows: p.limitsRows, Stale: p.limitsStale}
+}
+
+// topBuckets 按 req 降序取前 n 行:面板只渲染 top 20,全量下发会让 /api/status
+// 的 payload 随历史出口数单调膨胀(出口 tag 是整条 URI,一行就要几百字节)。
+func topBuckets(all map[string]stats.Bucket, n int) map[string]stats.Bucket {
+	if len(all) <= n {
+		return all
+	}
+	type kv struct {
+		k   string
+		req int64
+	}
+	rows := make([]kv, 0, len(all))
+	for k, b := range all {
+		rows = append(rows, kv{k, b.Req})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].req != rows[j].req {
+			return rows[i].req > rows[j].req
+		}
+		return rows[i].k < rows[j].k
+	})
+	out := make(map[string]stats.Bucket, n)
+	for _, e := range rows[:n] {
+		out[e.k] = all[e.k]
+	}
+	return out
 }

@@ -422,16 +422,19 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"rows": rows})
 
 	case method == http.MethodPost && path == "/api/probe":
-		if s.deps.Actions.ProbeNow != nil {
-			// force is what the button means: probe now, do not answer from
-			// the result cache. Without it a click right after an automatic
-			// round would be a no-op.
-			if err := s.deps.Actions.ProbeNow(r.Context(), true); err != nil {
-				// 动作失败走纯文本:前端把非 2xx body 原样塞进 toast,JSON
-				// 会显示成一坨(与 PUT /api/settings 的 400 同理)。
-				writeText(w, http.StatusInternalServerError, err.Error())
-				return
-			}
+		if s.deps.Actions.ProbeNow == nil {
+			// 未装配静默假成功最误导:测试/误配路径要能一眼看出来。
+			writeText(w, http.StatusNotImplemented, "probe action is not wired")
+			return
+		}
+		// force is what the button means: probe now, do not answer from
+		// the result cache. Without it a click right after an automatic
+		// round would be a no-op. 异步受理下唯一的同步错误是 already-running:
+		// 那是客户端冲突(409),不是服务端故障 —— 500 会诱导调用方把
+		// 「别重试」当故障去重试。
+		if err := s.deps.Actions.ProbeNow(r.Context(), true); err != nil {
+			writeText(w, http.StatusConflict, err.Error())
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 

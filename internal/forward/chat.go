@@ -255,12 +255,24 @@ type responsesEvent struct {
 // 会读不到定位键(协议审计 M2)。function_call 增量多带一个值为 0 的键是
 // 无害噪音,一致性优先。
 type responsesDeltaEvent struct {
-	Type         string            `json:"type"`
-	ItemID       string            `json:"item_id"`
-	OutputIndex  int               `json:"output_index"`
-	ContentIndex int               `json:"content_index"`
-	Delta        string            `json:"delta,omitempty"`
-	Part         *responsesContent `json:"part,omitempty"`
+	Type         string `json:"type"`
+	ItemID       string `json:"item_id"`
+	OutputIndex  int    `json:"output_index"`
+	ContentIndex int    `json:"content_index"`
+	Delta        string `json:"delta,omitempty"`
+	// done 事件的终值字段:公开 schema 里 output_text.done 叫 **text**、
+	// function_call_arguments.done 叫 **arguments**、reasoning_summary_text.done
+	// 叫 **text** —— delta 是增量事件的字段名,终值放它上面,按公开 schema
+	// 读终值的严格客户端会拿到 undefined。
+	Text      string            `json:"text,omitempty"`
+	Arguments string            `json:"arguments,omitempty"`
+	Part      *responsesContent `json:"part,omitempty"`
+}
+
+// summaryText 是 reasoning 项 summary 数组的元素形状(公开 API)。
+type summaryText struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 // responsesItem 是流式 output_item.added/done 里的 item 形状(与 responsesOutput
@@ -1001,15 +1013,23 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 				Part: &responsesContent{Type: "output_text", Text: text},
 			})
 			sse.sendEvent("response.output_text.done", responsesDeltaEvent{
-				Type: "response.output_text.done", ItemID: it.itemID, OutputIndex: it.outIdx, Delta: text,
+				Type: "response.output_text.done", ItemID: it.itemID, OutputIndex: it.outIdx, Text: text,
 			})
 			finalOutput = append(finalOutput, responsesOutput{
 				Type: "message", Role: "assistant",
 				Content: []responsesContent{{Type: "output_text", Text: text}},
 			})
 		case "reasoning":
-			done.Summary = []any{}
-			finalOutput = append(finalOutput, responsesOutput{Type: "reasoning", Summary: []any{}})
+			// 流出去的推理文本要在自己的收尾里带全:过去 done/completed 的
+			// summary 恒为空数组 —— 按 item.done 重建(而非按 delta 累积)的
+			// 客户端会丢掉全部推理。reasoning_summary_text.done 同理补上。
+			sum := []any{summaryText{Type: "summary_text", Text: it.text.String()}}
+			sse.sendEvent("response.reasoning_summary_text.done", responsesDeltaEvent{
+				Type: "response.reasoning_summary_text.done", ItemID: it.itemID,
+				OutputIndex: it.outIdx, Text: it.text.String(),
+			})
+			done.Summary = sum
+			finalOutput = append(finalOutput, responsesOutput{Type: "reasoning", Summary: sum})
 		case "function_call":
 			args := it.text.String()
 			if args == "" {
@@ -1024,7 +1044,7 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 		if it.kind == "function_call" {
 			sse.sendEvent("response.function_call_arguments.done", responsesDeltaEvent{
 				Type: "response.function_call_arguments.done", ItemID: it.itemID,
-				OutputIndex: it.outIdx, Delta: done.Arguments,
+				OutputIndex: it.outIdx, Arguments: done.Arguments,
 			})
 		}
 		sse.sendEvent("response.output_item.done", responsesEvent{

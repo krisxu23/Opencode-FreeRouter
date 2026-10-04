@@ -900,7 +900,30 @@ func CountryOf(tag string) string {
 }
 
 // BucketOf 国家码 → 出口地区分组（美日港台韩新/欧洲/其他）；空码归"其他"。
+// bucketCache 预展开「2 字节 ASCII 国家码 → 分组」的查询表:BucketOf 在 Pick
+// 的 rank 热路径上每节点调一次,[]rune + ToUpper + 线性扫 groups 的分配占了
+// BenchmarkPick 3412 allocs/op 的大头(P3)。
+var bucketCache = func() map[string]string {
+	m := make(map[string]string, len(groups)+len(euCCs))
+	for _, g := range groups {
+		m[g] = g
+	}
+	for cc := range euCCs {
+		m[cc] = "EU"
+	}
+	return m
+}()
+
 func BucketOf(cc string) string {
+	// 快径:2 字节纯 ASCII 码(真实池里的绝对主流)。大小写不敏感与原实现
+	// 一致;查不中(既非分组也非已知 EU 成员)按 OTHER,同样与原实现一致。
+	if len(cc) == 2 && isASCIIAlpha(cc) {
+		code := string([]byte{upperASCII(cc[0]), upperASCII(cc[1])})
+		if b, ok := bucketCache[code]; ok {
+			return b
+		}
+		return "OTHER"
+	}
 	r := []rune(strings.ToUpper(cc))
 	if len(r) > 2 {
 		r = r[:2]
@@ -915,6 +938,23 @@ func BucketOf(cc string) string {
 		return "EU"
 	}
 	return "OTHER"
+}
+
+func isASCIIAlpha(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+func upperASCII(c byte) byte {
+	if c >= 'a' && c <= 'z' {
+		return c - 32
+	}
+	return c
 }
 
 // FilterByGroups 按所选分组过滤出站。语义：

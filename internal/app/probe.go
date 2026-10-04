@@ -347,13 +347,19 @@ func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) 
 	zeroAlive := summary.Tested > 0 && len(aliveTags) == 0
 	accident := (ratioHit && collapse) || zeroAlive
 	summary.Accident = accident
-	if ratioHit {
-		logger.Error(fmt.Sprintf("探测源疑似事故：上一轮存活的 %d 个节点本轮掉了 %d 个（%.0f%% > %.0f%%）— 本轮不淘汰任何节点，保留现有池子",
+	// 日志必须与 accident 的双条件判决同门:过去挂在 ratioHit 上,「换血但
+	// 规模未塌方」的每一轮都打 Error「不淘汰任何节点」而实际照常淘汰 ——
+	// 运行日志已抓到同轮矛盾(2026-10-03 19:53 ERROR 与「淘汰 1941」同现)。
+	if accident && ratioHit {
+		logger.Error(fmt.Sprintf("探测源疑似事故：上一轮存活的 %d 个节点本轮掉了 %d 个（%.0f%% > %.0f%%）且存活塌方 — 本轮不淘汰任何节点，保留现有池子",
 			len(prevAlive), lostAlive,
 			float64(lostAlive)/float64(len(prevAlive))*100, probeAccidentRate*100))
-	} else if zeroAlive {
+	} else if accident && zeroAlive {
 		logger.Error(fmt.Sprintf("探测源疑似事故：本轮实测 %d 个节点 0 个通关（直连门已通过，说明不是本机断网）— 本轮不淘汰任何节点，保留现有池子",
 			summary.Tested))
+	} else if ratioHit {
+		logger.Info(fmt.Sprintf("探测存活换血 %.0f%%（超过 %.0f%%）但规模未塌方，判定非事故 — 本轮照常执行淘汰",
+			float64(lostAlive)/float64(len(prevAlive))*100, probeAccidentRate*100))
 	}
 
 	// 计败:本轮真的测出结论、又没通关的节点各记一次。缓存跳过的不在此列 ——
@@ -568,7 +574,10 @@ func (p *Parts) probeTierModel(ctx context.Context, tag string) string {
 	}) {
 		req.Header.Set(name, value)
 	}
-	client := httpclient.NewClient(d, time.Duration(tierProbeTimeoutMS)*time.Millisecond)
+	// OneShotClient:每 shot 一个全新 Transport,keep-alive 会留一条 idle 连接
+	// 挂满 60s —— 一轮 B 档几十到几百 shot 就是同量级的瞬时 fd 尖峰(nodeprobe
+	// 侧的同类问题已修,这里是最后一处漏网)。
+	client := httpclient.NewOneShotClient(d, time.Duration(tierProbeTimeoutMS)*time.Millisecond)
 	resp, err := client.Do(req)
 	if err != nil {
 		return ""

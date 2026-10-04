@@ -1435,3 +1435,55 @@ func TestDecoyToolsAreInjectedOnEveryWire(t *testing.T) {
 		}
 	}
 }
+
+func TestResponsesIncompleteFoldsUsage(t *testing.T) {
+	// B2:被 max_output_tokens 截断的轮次上游发独立的 response.incomplete,
+	// 载荷与 completed 同形且带 usage —— 过去只认 completed,恰恰是最该记账
+	// 的长输出截断轮 usage 恒 0。
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseBody(
+			`{"type":"response.output_text.delta","output_index":0,"delta":"partial"}`,
+			`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":99,"input_tokens_details":{"cached_tokens":4}}}}`,
+			`[DONE]`,
+		)
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "muse-spark-1.3-contributor-free")
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if !res.HasUsage {
+		t.Fatal("incomplete 轮的 usage 必须入账")
+	}
+	// disjoint-count:In = 10 - 4(缓存)
+	if res.Usage.In != 6 || res.Usage.Out != 99 || res.Usage.CacheRead != 4 {
+		t.Fatalf("usage = %+v, want In 6 / Out 99 / CacheRead 4", res.Usage)
+	}
+	if res.Finish != "length" {
+		t.Fatalf("finish = %q, want length(feedResponses 的截断映射)", res.Finish)
+	}
+}
+
+func TestNonStreamingJSONCarriesFinishReason(t *testing.T) {
+	// B3:整包回退路径过去丢 finish_reason(feedChat 在 delta==nil 时提前
+	// continue,claude/responses 按 type 分派对整包体 no-op)—— 截断的整包
+	// 回答被判 FinishStop,客户端拿到 "stop" 的腰斩回答不会续写。
+	f := newFakeUpstream(t, func(n int) (int, string, string) {
+		return 200, "application/json",
+			`{"choices":[{"message":{"role":"assistant","content":"half"},"finish_reason":"length"}],"usage":{"prompt_tokens":3,"completion_tokens":9}}`
+	})
+	a := newAdapter(f.srv.URL, f.srv.Client(), "big-pickle")
+	res, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   false,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if res.Finish != "length" {
+		t.Fatalf("finish = %q, want length(整包的 finish_reason 必须折进 Result)", res.Finish)
+	}
+}

@@ -186,3 +186,31 @@ func TestClassifyBareErrorObjectIsThePayloadToo(t *testing.T) {
 		t.Fatalf("Code = %q, want credential (envelope wins wholesale)", f.Code)
 	}
 }
+
+func TestRegionVariantsAreRecognizedOn4xx(t *testing.T) {
+	// v1.2.3 收紧 regionRe 消灭了 5xx 投毒链,但把 4xx 的真实变体也漏掉了:
+	// "not available in your region"/"unsupported region" 过去会落进 403
+	// 凭证分支变成不可重试的硬失败。
+	for _, body := range []string{
+		`{"error":{"message":"not available in your region","type":"RegionError"}}`,
+		`{"error":{"message":"unsupported region"}}`,
+	} {
+		f := Classify(403, []byte(body), 0)
+		if f.Code != check.CodeRegion || !f.Retryable {
+			t.Fatalf("body %s → %v, want REGION 可重试", body, f)
+		}
+	}
+}
+
+func TestInsufficientNarrowsToBillingPhrases(t *testing.T) {
+	// 裸 "insufficient" 子串过宽:基础设施文案(如 insufficient disk space)
+	// 会从 SERVER 偏移到 QUOTA。收窄到计费短语后,5xx 基础设施失败回到原判。
+	f := Classify(500, []byte(`{"error":{"message":"insufficient disk space on worker"}}`), 0)
+	if f.Code == check.CodeQuota {
+		t.Fatalf("disk space 不该算配额: %v", f)
+	}
+	f = Classify(402, []byte(`{"error":{"message":"Insufficient account funds"}}`), 0)
+	if f.Code != check.CodeQuota || !f.Retryable {
+		t.Fatalf("402 计费拒绝应归 quota 可重试: %v", f)
+	}
+}

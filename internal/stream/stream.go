@@ -142,10 +142,12 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"delta"`
-		Content []struct {
+		// content_block_start 的 content_block 是**对象**不是数组 —— 解到
+		// 切片会让整帧 Unmarshal 失败,连 usage 一起丢。
+		ContentBlock struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
-		} `json:"content"`
+		} `json:"content_block"`
 		// 四个计数都用指针 + float64:指针是因为 js 的 `??` 判的是 undefined,
 		// Go 的零值分不出「字段缺失」与「上游显式发了 0」,没有这层区分 B4 的
 		// 两种拼写就没法按 `prompt_tokens ?? input_tokens` 择一;float64 是因为
@@ -223,7 +225,9 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 	switch {
 	case env.Type == "content_block_delta" && env.Delta.Type == "text_delta":
 		isContent = true
-	case env.Type == "content_block_start" && len(env.Content) > 0 && env.Content[0].Type == "text":
+	// Anthropic 的块挂在 content_block 键下(旧实现读 content,恒不命中,
+	// 是一条死分支 —— TTFT 由 carriesDelta 兜住所以没露出过症状)。
+	case env.Type == "content_block_start" && env.ContentBlock.Type == "text":
 		isContent = true
 	}
 	if isContent && !*firstContentSeen {

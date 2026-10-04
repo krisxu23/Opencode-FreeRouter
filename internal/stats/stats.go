@@ -15,6 +15,7 @@ package stats
 import (
 	"errors"
 	"io/fs"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 )
 
 const (
+
 	// sampleWindowMS is how old a sample may be and still survive a trim.
 	sampleWindowMS = 24 * 3600 * 1000
 	// defaultSampleMax caps how many samples are retained.
@@ -32,6 +34,10 @@ const (
 	// keys recordUsage writes (src/index.js:1032 does the same).
 	msPerDay = 86400000
 )
+
+// exitsMax 是按出口聚合桶的数量上限(stats.Record 的 P5 淘汰)。var 而不是
+// const 只为让测试能调小,理由与 sampleMax 相同。
+var exitsMax = 512
 
 // sampleMax is the count cap. It is a var rather than a const only so a test
 // can lower it: the time window (src/index.js:196-199) runs *only* when the
@@ -231,6 +237,31 @@ func (s *Stats) Record(r Record) {
 		x.In += r.Input
 		x.Out += r.Output
 		s.snap.Exits[r.Exit] = x
+		// Exits 是全仓唯一的无界增长面:出口 tag 随订阅 churn 无限换代,而
+		// Days(90 天)/Samples(24h+2000) 都有上限。按 req 保 top exitsMax ——
+		// 活跃出口请求多不会被挤掉,历史出口随新出口进入自然沉底。淘汰在
+		// Record 的锁内做:只 prune 落盘副本的话,内存 map 仍会无限涨。
+		if len(s.snap.Exits) > exitsMax {
+			type exitReq struct {
+				k   string
+				req int64
+			}
+			all := make([]exitReq, 0, len(s.snap.Exits))
+			for k, b := range s.snap.Exits {
+				all = append(all, exitReq{k, b.Req})
+			}
+			sort.Slice(all, func(i, j int) bool {
+				if all[i].req != all[j].req {
+					return all[i].req > all[j].req
+				}
+				return all[i].k < all[j].k
+			})
+			fresh := make(map[string]Bucket, exitsMax)
+			for _, e := range all[:exitsMax] {
+				fresh[e.k] = s.snap.Exits[e.k]
+			}
+			s.snap.Exits = fresh
+		}
 	}
 
 	s.snap.Requests++
