@@ -444,10 +444,17 @@ func (h *Health) MarkPassSuccess(nodeKey string) {
 // MarkPassFail 记一轮 pass 失败(或一次数据面连通性失败),推进双档状态机:
 //   - 热区(alive)连续 2 轮失败 → 降冷区(State=dead,streak 归零重数);
 //   - 冷区(dead)连续 3 轮失败 → 返回 "delete",由调用方执行彻底删除
-//     (注册表条目 + 健康行,零记录)。allowDelete=false(数据面失败)时不
-//     触发删除 —— 删除是冷区 pass 的专属判决。
+//     (注册表条目 + 健康行,零记录)。
 //
-// unknown 语义不变:调用方对 unknown/未测节点不调本方法。行不存在返回 ""。
+// allowDelete=false 的两类调用者(数据面 transport/timeout 失败、冻结期的
+// 冷区 pass)对**冷区行连计数都不推进**:删除判决必须数满 3 次「闸门开着、
+// 亲眼看到」的冷区失败 —— 通道坏了期间照常 ++streak 的话,解锁的那一刻,
+//
+//	outage 期间积满的连败会立刻把一批节点删掉,冻结只剩延迟执行、没有挡住
+//
+// 任何判决(「通道抖三下 = 白删一池子」从后门回来)。数据面失败打在冷区行
+// 上同样不该计数:它的降档责任在热区侧已经付过,或留给下一轮 sweep 重数。
+// alive 行的计数与降档不受本位影响。行不存在返回 ""。
 func (h *Health) MarkPassFail(nodeKey string, allowDelete bool) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -456,10 +463,15 @@ func (h *Health) MarkPassFail(nodeKey string, allowDelete bool) string {
 	if !ok {
 		return ""
 	}
-	r.Streak++
 	switch r.State {
 	case StateDead:
-		if allowDelete && r.Streak >= coldDeleteAfter {
+		if !allowDelete {
+			// 冻结期间/数据面信号:不计数、不删除,行原样(连 LastProbeAt
+			// 也不刷 —— 这一轮对冷区行没有可记的结论)。
+			return ""
+		}
+		r.Streak++
+		if r.Streak >= coldDeleteAfter {
 			delete(h.nodes, nodeKey)
 			return "delete"
 		}
@@ -467,6 +479,7 @@ func (h *Health) MarkPassFail(nodeKey string, allowDelete bool) string {
 		h.nodes[nodeKey] = r
 		return ""
 	default: // alive(热区)
+		r.Streak++
 		if r.Streak >= hotDemoteAfter {
 			r.State = StateDead
 			r.Streak = 0 // 降档重数:冷区的 3 次从进冷区起算

@@ -269,23 +269,38 @@ func TestProbeNowDoesNotEvictOnAccident(t *testing.T) {
 	}
 	sum := p.hotPass(context.Background())
 	if sum.Accident {
-		t.Fatalf("accident = true, want false (掉 14/20 但存活 6 未塌到 1/4,双条件不满足)")
+		t.Fatalf("accident = true, want false (通过率 30%% > 10%% 地板,换血不是通道故障;事故判定见 CollapseToo)")
+	}
+	// 地板之上照常推进:14 个失败节点里,连续 2 轮才降冷,这一轮是第 1 败,
+	// streak=1、全部仍 alive。
+	snap := p.Health.NodeSnapshot()
+	if v := snap["n6"]; v.State != health.StateAlive || v.Streak != 1 {
+		t.Fatalf("n6 = %+v, want alive streak=1(14 个失败节点照常计 streak)", v)
 	}
 }
 
 func TestProbeNowAccidentNeedsCollapseToo(t *testing.T) {
 	// 1.3.0 事故判据:热区 pass 的**通过率跌破 10% 地板**(样本 ≥20)才是通道
 	// 故障 —— 上一轮比率对比与绝对塌方双条件被这条更直的信号取代(旧双条件在
-	// 真实池的「换血」形状下每轮误触发,见第五轮审计)。20 个热区节点只剩 1 个
-	// 通过(5% < 10%)= 事故轮:结果整体丢弃,一个状态都不推进。
+	// 真实池的「换血」形状下每轮误触发,见第五轮审计)。
 	p := newProbeParts(t, 20)
 	for i := 0; i < 20; i++ {
 		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
 	}
 	fp := p.Prober.(*fakeProber)
+
+	// 先跑一轮**全绿**的热区 pass:它把 lastHotOK 置真(健康结束的证明),
+	// 给下面的事故轮一个可以被「主动清回 false」的起点 —— 否则测试从 false
+	// 起步,分不清「冻结真的清了它」和「本来就是 false、什么都没发生」。
 	fp.failedTags = map[string]bool{}
+	if h := p.hotPass(context.Background()); h.Accident || !p.lastHotOK.Load() {
+		t.Fatalf("前置健康轮应 accident=false 且 lastHotOK=true,实得 accident=%v ok=%v",
+			h.Accident, p.lastHotOK.Load())
+	}
+
+	// 事故轮:20 个热区只剩 1 个通过(5% < 10% 地板)。
 	for i := 1; i < 20; i++ {
-		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 掉 19(95%),通过率 5% < 10% 地板
+		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 掉 19(95%)
 	}
 	sum := p.hotPass(context.Background())
 	if !sum.Accident {
@@ -305,17 +320,66 @@ func TestProbeNowAccidentNeedsCollapseToo(t *testing.T) {
 			t.Fatalf("n%d 被事故轮推进成 %v, want alive(整轮丢弃)", i, v.State)
 		}
 	}
-	// 冻结不变量的硬核对:事故轮不算「热区健康结束」—— lastHotOK 必须保持
-	// false(冷区删除闸从此刻起关闭,直到下一次健康的热区 pass 重新打开)。
-	// 夹具里 MarkProbe 不是 pass,本轮又是事故,所以这里只可能是 false。
+	// 冻结不变量的硬核对:上一轮健康 pass 已把 lastHotOK 置真,事故轮必须
+	// 把它**清回 false** —— 冷区删除从此刻暂停,直到下一次健康的热区 pass。
+	// 这是包注释承诺的「事故冻结滑窗」;旧实现什么都不清,上一次 true 会
+	// 继续放行删除,通道坏了的那一刻起冷区照删不误。
 	if p.lastHotOK.Load() {
-		t.Fatal("事故轮把 lastHotOK 置真了 —— 删除冻结闸被事故轮自己解开,冻结语义失效")
+		t.Fatal("事故轮没有清 lastHotOK —— 冻结闸失效,冷区删除仍被上一次健康轮放行")
+	}
+}
+
+// TestHotPassDemotesButNeverDeletes 钉热区 pass 的边界:连续失败只降档
+// (连续 2 轮失败 → 冷区),删除是冷区 sweep 的专属判决 —— 热区本身一个
+// 节点都不许从注册表里消失。
+// TestColdDeletionFreezesWhenHotUnhealthy 钉删除闸的**负向**路径:冷区节点
+// 连败数满,但 lastHotOK=false(事故冻结,或删除闸从未被健康热区打开)时,
+// 一个都不许删 —— 这正是「探测通道坏了的时候,冷区连续失败是通道的锅,不是
+// 节点的罪」。正向路径(闸门开着就删)由 DeletedAfterConsecutiveColdRounds
+// 钉;两条合起来才把 deletionsAllowed 这一个布尔钉死。
+func TestColdDeletionFreezesWhenHotUnhealthy(t *testing.T) {
+	p := newProbeParts(t, 2)
+	fp := p.Prober.(*fakeProber)
+	fp.failedTags = map[string]bool{"n0": true}
+	// n0 直接建在冷区(MarkProbe dead),不经过任何热区 pass —— lastHotOK
+	// 从未被置真,删除闸天生是冻结的。
+	p.Health.MarkProbe("n0", deadResult())
+	p.Health.MarkProbe("n1", aliveResult("198.51.100.9"))
+
+	for round := 1; round <= 5; round++ {
+		sum := p.coldPass(context.Background())
+		if sum.Deleted != 0 {
+			t.Fatalf("round %d 在冻结闸下删了 %d 个节点, want 0", round, sum.Deleted)
+		}
+	}
+	if !p.Registry.Has("n0") {
+		t.Fatal("冻结期间冷区连败数满也被删了 —— deletionsAllowed 没有生效")
+	}
+	// 冻结期间**连败不计数**(coldPass 注释承诺的「下一轮再算」,1.3.0 修正
+	// 了实现与注释的矛盾:旧实现冻结期照样 ++streak,解锁那一刻积满的连败会
+	// 立刻放行删除 —— 冻结只剩延迟,没挡住任何判决)。
+	if snap := p.Health.NodeSnapshot(); snap["n0"].Streak != 0 {
+		t.Fatalf("冻结期积了 streak=%d, want 0(解锁后必须重新数满 3)", snap["n0"].Streak)
+	}
+	// 打开闸门:跑一轮健康的热区 pass 解锁,再 sweep **三轮**才删 ——
+	// n0 不在热区(它是 dead),n1 全绿 → lastHotOK=true;failedTags 保留
+	// n0,冷区每轮都真实失败。
+	p.hotPass(context.Background()) // n1 全绿 → lastHotOK=true
+	if !p.lastHotOK.Load() {
+		t.Fatal("健康热区 pass 必须打开删除闸")
+	}
+	for round := 1; round <= 2; round++ {
+		sum := p.coldPass(context.Background())
+		if sum.Deleted != 0 {
+			t.Fatalf("解锁后第 %d 轮就删了, want 等 streak 数满 3", round)
+		}
+	}
+	if sum := p.coldPass(context.Background()); sum.Deleted != 1 || p.Registry.Has("n0") {
+		t.Fatalf("解锁后第 3 轮应删除 n0: deleted=%d has=%v", sum.Deleted, p.Registry.Has("n0"))
 	}
 }
 
 func TestHotPassDemotesButNeverDeletes(t *testing.T) {
-	// 1.3.0:热区 pass 只降档(连续 2 轮失败 → 冷区),删除是冷区 sweep 的
-	// 专属判决。这里验证热区本身不删东西。
 	p := newProbeParts(t, 10)
 	fp := p.Prober.(*fakeProber)
 	fp.failedTags = map[string]bool{}
