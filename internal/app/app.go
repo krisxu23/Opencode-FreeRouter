@@ -61,19 +61,24 @@ const bootJoinTimeout = 5 * time.Second
 // file loads with no translation table at all. app reads the file once and
 // hands narrow copies to each part; no part re-reads it.
 type Settings struct {
-	ForwardPort      int      `json:"forwardPort"`
-	PanelPort        int      `json:"panelPort"`
-	SubURLs          []string `json:"subUrls"`
-	Countries        []string `json:"countries"`
-	Enabled          bool     `json:"enabled"`
-	ProbeEnabled     bool     `json:"probeEnabled"`
-	ProbeWorkers     int      `json:"probeWorkers"`
-	ProbeIntervalMin int      `json:"probeIntervalMin"`
-	EffortLevel      string   `json:"effortLevel"`
-	DefaultMaxTokens any      `json:"defaultMaxTokens"`
-	MaxAttempts      int      `json:"maxAttempts"`
-	MaxWallClockMS   int64    `json:"maxWallClockMs"`
-	ForwardKey       string   `json:"forwardKey"`
+	ForwardPort  int      `json:"forwardPort"`
+	PanelPort    int      `json:"panelPort"`
+	SubURLs      []string `json:"subUrls"`
+	Countries    []string `json:"countries"`
+	Enabled      bool     `json:"enabled"`
+	ProbeEnabled bool     `json:"probeEnabled"`
+	ProbeWorkers int      `json:"probeWorkers"`
+	// ProbeIntervalMin 是 1.2.x 的「探测周期」,1.3.0 起被 hot/cold 双档间隔
+	// 取代:字段保留只为旧 settings.json 能无感加载,运行时不再读取。
+	ProbeIntervalMin   int    `json:"probeIntervalMin"`
+	RefreshIntervalMin int    `json:"refreshIntervalMin"`
+	HotIntervalSec     int    `json:"hotIntervalSec"`
+	ColdIntervalSec    int    `json:"coldIntervalSec"`
+	EffortLevel        string `json:"effortLevel"`
+	DefaultMaxTokens   any    `json:"defaultMaxTokens"`
+	MaxAttempts        int    `json:"maxAttempts"`
+	MaxWallClockMS     int64  `json:"maxWallClockMs"`
+	ForwardKey         string `json:"forwardKey"`
 	// ExitConcurrency 是同一出口 IP 的最大在途请求数(magpie lanes 闸门)。
 	// <=0 表示不限。排队不占在途计数、不算失败。
 	ExitConcurrency int `json:"exitConcurrency"`
@@ -139,13 +144,21 @@ type Parts struct {
 	timers       []*timerSlot
 	timersClosed bool
 
-	// ---- 探测轮次状态(probe.go) ----
-	probing         atomic.Bool
-	probeRerunMu    sync.Mutex
-	probeRerun      bool
-	probeRerunForce bool
-	tierGate        *gate.Gate
-	tierBuckets     tierChains
+	// ---- 持续健康监测(probe.go,1.3.0 双档 pass) ----
+	// 三档 pass 各自的 running 位:热/冷可并发(worker 预算 96/32 对半),
+	// 同档自身用 CAS 防重入。lastHotOK 是事故滑窗的冻结闸:最近一次热区
+	// pass 健康结束才允许冷区删除(探测通道坏了时,冷区「连续失败」是通道
+	// 的锅不是节点的罪)。三个 nudge 通道让面板按钮/重建补探立即触发对应
+	// pass,缓冲 1、非阻塞 —— 已有待处理时合并。
+	hotRunning   atomic.Bool
+	coldRunning  atomic.Bool
+	firstRunning atomic.Bool
+	lastHotOK    atomic.Bool
+	hotNudge     chan struct{}
+	coldNudge    chan struct{}
+	firstNudge   chan struct{}
+	tierGate     *gate.Gate
+	tierBuckets  tierChains
 
 	// ---- 订阅重建状态(rebuild.go) ----
 	rebuildMu       sync.Mutex
@@ -219,20 +232,23 @@ func (p *Parts) noteEgressChanged() { p.egressGen.Add(1) }
 // never had the key still comes out enabled.
 func defaultSettings() Settings {
 	return Settings{
-		ForwardPort:      3457,
-		PanelPort:        3458,
-		SubURLs:          []string{},
-		Countries:        []string{"US", "JP", "HK", "TW", "KR", "SG"},
-		Enabled:          true,
-		ProbeEnabled:     true,
-		ProbeWorkers:     48,
-		ProbeIntervalMin: 30,
-		EffortLevel:      effort.DefaultLevel,
-		DefaultMaxTokens: nil,
-		MaxAttempts:      20,
-		MaxWallClockMS:   0,
-		ForwardKey:       "",
-		ExitConcurrency:  0, // 不限;面板显式开启后才生效
+		ForwardPort:        3457,
+		PanelPort:          3458,
+		SubURLs:            []string{},
+		Countries:          []string{"US", "JP", "HK", "TW", "KR", "SG"},
+		Enabled:            true,
+		ProbeEnabled:       true,
+		ProbeWorkers:       48,
+		ProbeIntervalMin:   30, // 1.2.x 遗留:运行时不再读取,见字段注释
+		RefreshIntervalMin: 30,
+		HotIntervalSec:     60,
+		ColdIntervalSec:    300,
+		EffortLevel:        effort.DefaultLevel,
+		DefaultMaxTokens:   nil,
+		MaxAttempts:        20,
+		MaxWallClockMS:     0,
+		ForwardKey:         "",
+		ExitConcurrency:    0, // 不限;面板显式开启后才生效
 	}
 }
 
@@ -528,6 +544,9 @@ func Load(root string) (*Parts, error) {
 		Engine:      eng,
 		StatsStore:  statStore,
 		firstFetch:  firstFetch,
+		hotNudge:    make(chan struct{}, 1),
+		coldNudge:   make(chan struct{}, 1),
+		firstNudge:  make(chan struct{}, 1),
 		tierGate:    gate.New(tierGapMS),
 		catalog:     catBox,
 		baselineIDs: baselineIDs,
@@ -588,6 +607,19 @@ func Load(root string) (*Parts, error) {
 		for _, o := range picked {
 			if ok, keep := parse.SanitizeOutbound(o); keep {
 				clean = append(clean, ok)
+			}
+		}
+		// 成员资格跟随订阅(1.3.0):拉取成功后,不在**任何源**里的节点
+		// 删干净(注册表 + 健康行,零记录)。删除判定对原始源算 —— 被
+		// 用户地区选择过滤掉的节点仍在订阅里,不删。
+		present := make(map[string]bool, len(res.Outbounds))
+		for _, o := range res.Outbounds {
+			present[o.Tag] = true
+		}
+		for _, o := range reg.All() {
+			if !present[o.Tag] {
+				_ = reg.Remove(o.Tag)
+				h.Forget(o.Tag)
 			}
 		}
 		// 订阅里被 sing-box 拒收的节点数(非法 uuid / 不认的 cipher / 未知传输)。
@@ -703,17 +735,11 @@ func Load(root string) (*Parts, error) {
 			// 重复;且「用户关页面=探测作废」语义也不对。现在挂 lifeCtx 后台
 			// 跑,POST 立即返回;进度与完成经 /api/status 的 probing 位呈现。
 			// already-running 同步回错,按钮防连点。
+			// 1.3.0:按钮 = 立即触发一轮热区复检 + 冷区扫描(nudge 通道,
+			// 非阻塞合并)。pass 由双循环持续跑,按钮只是「现在就来一轮」。
 			ProbeNow: func(ctx context.Context, force bool) error {
-				if parts.probing.Load() {
-					return fmt.Errorf("probe already running")
-				}
-				parts.timersWG.add()
-				go func() {
-					defer parts.timersWG.done()
-					if _, err := parts.ProbeNow(parts.ctx(), force); err != nil {
-						logger.Info(fmt.Sprintf("[app] 探测未开跑: %v", err))
-					}
-				}()
+				parts.nudgeHot()
+				parts.nudgeCold()
 				return nil
 			},
 			// Refresh/RefreshLimits 的签名没有 ctx:重建自带 180s 总预算,

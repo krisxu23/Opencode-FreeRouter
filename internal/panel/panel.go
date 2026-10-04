@@ -152,16 +152,18 @@ type Boot struct {
 // per-node-port architecture and are gone (a port table, a port base/span and
 // a catch-all port do not exist in a single-process gateway).
 type settingsView struct {
-	SubURLs          any `json:"subUrls"`
-	Countries        any `json:"countries"`
-	ProbeEnabled     any `json:"probeEnabled"`
-	ProbeWorkers     any `json:"probeWorkers"`
-	ProbeIntervalMin any `json:"probeIntervalMin"`
-	EffortLevel      any `json:"effortLevel"`
-	DefaultMaxTokens any `json:"defaultMaxTokens"`
-	MaxWallClockMS   any `json:"maxWallClockMs"`
-	ForwardPort      any `json:"forwardPort"`
-	PanelPort        any `json:"panelPort"`
+	SubURLs            any `json:"subUrls"`
+	Countries          any `json:"countries"`
+	ProbeEnabled       any `json:"probeEnabled"`
+	ProbeWorkers       any `json:"probeWorkers"`
+	RefreshIntervalMin any `json:"refreshIntervalMin"`
+	HotIntervalSec     any `json:"hotIntervalSec"`
+	ColdIntervalSec    any `json:"coldIntervalSec"`
+	EffortLevel        any `json:"effortLevel"`
+	DefaultMaxTokens   any `json:"defaultMaxTokens"`
+	MaxWallClockMS     any `json:"maxWallClockMs"`
+	ForwardPort        any `json:"forwardPort"`
+	PanelPort          any `json:"panelPort"`
 	// ExitConcurrency 必须在白名单里:前端 readSettings() 把它灌进表单、
 	// 每次保存又**无条件**把整个表单 PUT 回来。boot 视图少这一个键 →
 	// 冷启动读到 undefined → 表单显示 0 → 用户改别的字段点保存 → 0 落盘,
@@ -555,17 +557,19 @@ func (s *Server) bootstrap() Boot {
 		Lanes:        lanes,
 		Probing:      probing,
 		Settings: settingsView{
-			SubURLs:          orEmptySlice(cfg["subUrls"]),
-			Countries:        orEmptySlice(cfg["countries"]),
-			ProbeEnabled:     cfg["probeEnabled"],
-			ProbeWorkers:     cfg["probeWorkers"],
-			ProbeIntervalMin: cfg["probeIntervalMin"],
-			EffortLevel:      cfg["effortLevel"],
-			DefaultMaxTokens: cfg["defaultMaxTokens"],
-			MaxWallClockMS:   cfg["maxWallClockMs"],
-			ForwardPort:      cfg["forwardPort"],
-			PanelPort:        cfg["panelPort"],
-			ExitConcurrency:  cfg["exitConcurrency"],
+			SubURLs:            orEmptySlice(cfg["subUrls"]),
+			Countries:          orEmptySlice(cfg["countries"]),
+			ProbeEnabled:       cfg["probeEnabled"],
+			ProbeWorkers:       cfg["probeWorkers"],
+			RefreshIntervalMin: cfg["refreshIntervalMin"],
+			HotIntervalSec:     cfg["hotIntervalSec"],
+			ColdIntervalSec:    cfg["coldIntervalSec"],
+			EffortLevel:        cfg["effortLevel"],
+			DefaultMaxTokens:   cfg["defaultMaxTokens"],
+			MaxWallClockMS:     cfg["maxWallClockMs"],
+			ForwardPort:        cfg["forwardPort"],
+			PanelPort:          cfg["panelPort"],
+			ExitConcurrency:    cfg["exitConcurrency"],
 		},
 		Logs: logs,
 	}

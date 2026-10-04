@@ -371,6 +371,109 @@ func TestSuccessfulProbeCollectsMinLatency(t *testing.T) {
 	}
 }
 
+// TestUpstreamOnlyContract 钉住 1.3.0 持续健康监测探针(UpstreamOnly)的三条
+// 契约。入口必须走 ProbeAll —— UpstreamOnly 的分叉在 probeOne 里,直接调
+// ProbeNode 走的是全三段(含 echo),测不到这条车道。
+//  1. 单发闸门成功即 alive,且 LatencyMin == LatencyMS(只有一发,没有第二
+//     个样本可取 min);
+//  2. **绝不打 echo** —— 出口 IP 是首探(全量三段)的职责;热区 60s 一轮的
+//     频率下打第三方 echo 源会把它打成我们自己的热点。echo 指向一个「敢被
+//     请求就报错」的陷阱服务器,ExitIP 必须为空。
+//  3. 取消的一轮报 unknown 而不是 dead(取消 ≠ 判决)。
+func TestUpstreamOnlyContract(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/gate", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("user-agent"); got != GateProbeUA {
+			t.Errorf("闸门那发必须用主链路 UA, got %q", got)
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	echoTrap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("UpstreamOnly 打了 echo —— 热区 pass 必须单发,echo 是首探的职责")
+	}))
+	t.Cleanup(echoTrap.Close)
+
+	p := NewProber(nil)
+	p.liveness = []string{"http://127.0.0.1:1/live"} // 单发模式不该用到它
+	p.gate = srv.URL + "/gate"
+	p.echo = []string{echoTrap.URL + "/echo"}
+
+	res := p.ProbeAll(context.Background(), []Item{{
+		Tag:     "hot-node",
+		Options: ProbeOptions{TimeoutMS: 3000, Attempts: 2, UpstreamOnly: true},
+	}}, 1)
+	if len(res) != 1 {
+		t.Fatalf("got %d results, want 1", len(res))
+	}
+	r := res[0].Result
+	if r.State != StateAlive {
+		t.Fatalf("State = %q, want alive", r.State)
+	}
+	if r.LatencyMin != r.LatencyMS {
+		t.Errorf("LatencyMin(%d) != LatencyMS(%d): 单发没有第二个样本可取 min", r.LatencyMin, r.LatencyMS)
+	}
+	if r.ExitIP != "" {
+		t.Errorf("ExitIP = %q, want 空: UpstreamOnly 不做 echo", r.ExitIP)
+	}
+
+	// 契约 3:闸门挂起、外层 ctx 取消 → unknown。
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	t.Cleanup(hang.Close)
+	p2 := NewProber(nil)
+	p2.gate = hang.URL + "/gate"
+	p2.echo = nil
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+	res2 := p2.ProbeAll(ctx, []Item{{
+		Tag:     "slow",
+		Options: ProbeOptions{TimeoutMS: 5000, Attempts: 1, UpstreamOnly: true},
+	}}, 1)
+	if res2[0].Result.State != StateUnknown {
+		t.Fatalf("取消轮 State = %q, want unknown(取消 ≠ 判决)", res2[0].Result.State)
+	}
+}
+
+// TestFullProbeDoesUseEcho 是上一条契约 2 的**对照组**:上面那个 echo 陷阱
+// 安静,可能只是因为 echo 根本连不通(夹具假象),而不是 UpstreamOnly 省掉了
+// 它。这里跑**非** UpstreamOnly 的全量三段,echo 指向一个真会应答的源,断言
+// ExitIP 非空 —— 证明 echo 这条路径本身是通的。两边的差异因此只能来自
+// UpstreamOnly 那一个开关,陷阱的沉默才是有效判决。
+func TestFullProbeDoesUseEcho(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/gate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	})
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"ip":"203.0.113.7","country_code":"US"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	p := NewProber(nil)
+	p.liveness = []string{srv.URL + "/gate"}
+	p.gate = srv.URL + "/gate"
+	p.echo = []string{srv.URL + "/echo"}
+
+	res := p.ProbeAll(context.Background(), []Item{{
+		Tag:     "full-node",
+		Options: ProbeOptions{TimeoutMS: 3000, Attempts: 1}, // 无 UpstreamOnly
+	}}, 1)
+	if got := res[0].Result.ExitIP; got != "203.0.113.7" {
+		t.Fatalf("全量三段的 ExitIP = %q, want 203.0.113.7 —— echo 不可达时,UpstreamOnly 那条对照测试的沉默毫无意义", got)
+	}
+}
+
 // hangServer 的 /live 秒回 204，/echo 永远不回（等客户端自己取消）：stage-1
 // 快速通过、echo 挂满预算——这正是会撞上兜底的形状（echo 8s > 兜底余量 5s）。
 func hangServer(t *testing.T) *httptest.Server {

@@ -495,6 +495,17 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 					"(session 形状 / 工具名 / stream 标志),若全池持续出现请核对上游闸门变化;本轮仍按可重试处理")
 			})
 		}
+		// 数据面信号(1.3.0 定稿):真实对话的成功/失败就是最真实的健康探测
+		// —— 零成本、零延迟。成功视同通过一轮健康检测(刷新 alive 并清连败);
+		// transport/timeout 计一次失败(可降冷区)。region/quota/empty 等
+		// 「节点活着但被拒」的判决不参与连通性状态机;删除是冷区 pass 的
+		// 专属判决,数据面失败只降档(allowDelete=false)。
+		switch {
+		case failure == nil:
+			snapshot.Health.MarkPassSuccess(picked.NodeKey)
+		case code == check.CodeTransport || code == check.CodeTimeout:
+			snapshot.Health.MarkPassFail(picked.NodeKey, false)
+		}
 		attemptMS := nowMS() - attemptStartedAt
 		if code == check.CodeRegion {
 			snapshot.Health.NoteRegionError(entry.ID, picked.NodeKey)

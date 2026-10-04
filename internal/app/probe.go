@@ -1,17 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FreeRouter contributors
 //
-// 一个探测轮次决定哪些出口还留在池子里。它单独成文件是因为这一轮有十几条
-// 分支 —— 结果缓存窗口、直连可达闸门、事故判定、B 档流水线 —— 每一条都有
-// 一个会付出代价的失败模式:要么赔上整个池子(WAN 抖十秒给每个节点写 dead
-// 行),要么赔上订阅预算(重复探测一个判决还很新鲜的节点)。
+// 持续健康监测(1.3.0 定稿):节点按健康状态分两档,各自独立成 pass 循环。
+//
+//	热区(alive)  —— 全部并发复检(单发上游探针),整轮完成后等
+//	                hotIntervalSec(默认 60s)再下一轮;失败计 streak,
+//	                连续 2 轮失败降冷区。
+//	冷区(dead)   —— 同样并发扫一遍,完成后等 coldIntervalSec(默认 5min);
+//	                任意通过立即升回热区;连续 3 轮失败 → 彻底删除
+//	                (注册表条目 + 健康行,零记录,墓碑已退役)。
+//	首探          —— 新入池、还没有健康行的节点走全量三段(liveness +
+//	                上游 + echo)+ B 档认证;完成即进入热/冷循环。
+//
+// 间隔从「上一轮完整结束后」起算(用户裁定):一轮耗时多久都无所谓,
+// 绝不堆积。热区与冷区可并发运行,worker 预算对半封顶(96/32,合计不超过
+// 现行 128 并发的实测峰值)。
+//
+// 两个安全闸门贯穿所有 pass:
+//   - 事故滑窗:热区 pass 的通过率跌破地板(≥20 样本且 <10% 通过)说明
+//     探测通道本身坏了 —— ProbeDirect 区分「本机断网」与「上游闸门故障」,
+//     两种情况都整轮丢弃结果并冻结冷区删除(冷区的降档删除必须看到
+//     lastHotOK 才执行),直到下一个健康的热区 pass 解锁。
+//   - 取消丢弃:pass 中途 ctx 取消(关停)→ 整轮结果丢弃(与 C2 同理)。
 package app
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,61 +43,66 @@ import (
 	"freerouter/internal/httpclient"
 	"freerouter/internal/logger"
 	"freerouter/internal/nodeprobe"
-	"freerouter/internal/parse"
-	"freerouter/internal/registry"
 	"freerouter/internal/upstream"
 )
 
-// 常量与 src/index.js 逐行对应。数值来自实测,不是猜的:
 const (
 	tierWorkers = 8  // src/index.js:746
 	tierGapMS   = 60 // src/index.js:750
 
-	probeAccidentRate = 0.5 // src/index.js:795
-	probeAccidentMin  = 20  // src/index.js:796 的 8 在真实池上太小:alive 集只有 50-93 个时,
-	// 固有抖动就能超过 50% 流失(2026-10-03 实测三轮连触发,淘汰被永久压制)——
-	// 样本下限提到 20,并配合 collapse 双条件,见 ProbeNow。
-	probeCacheRatio = 0.5 // src/index.js:816
+	// probeAccidentMin 是事故判定的样本下限,probeAliveFloor 是热区 pass
+	// 的通过率地板。低于地板 = 探测通道本身坏了(本机断网/上游闸门故障),
+	// 不是「60 个节点恰好同时死光」。正常换血在 60s 节奏下的单轮失败率
+	// 远低于这个地板;真实池的冷区 pass 不参与这个判定(死节点的大多数
+	// 失败是常态)。
+	probeAccidentMin = 20
+	probeAliveFloor  = 0.1
 
 	// probeDirectTimeoutMS 是「本机到 liveness 源」这一跳的预算(src/nodeprobe.js:208)。
 	probeDirectTimeoutMS = 8000
 
-	// probeDegradedTimeoutMS 是连败节点(registry.failCount > 0)的降级探测预算:
-	// 一次尝试 + 更短超时。首轮实测 2373 个节点里 2246 个没通关,双次 12s
-	// 超时把单轮拖到 493s,而这些节点只是占着位置,不会因为多等一次就活过来
-	// (src/index.js:927-930)。
-	probeDegradedTimeoutMS = 7000
+	// coldProbeTimeoutMS 是冷区 pass 的单发预算:死节点大多快败(拒连/复位),
+	// 挂死型也只吃 7s —— 冷区 sweep 的总时长靠它兜住。
+	coldProbeTimeoutMS = 7000
+
+	// hotProbeTimeoutMS 是热区 pass 的单发预算(与全量探针的默认超时同值)。
+	hotProbeTimeoutMS = 12000
+
+	// hotWorkersMax / coldWorkersMax 是两个 pass 的并发封顶:合计不超过
+	// 现行全量轮的 128 并发实测峰值(sing-box 拨号 + 上游匿名 GET 的压力
+	// 形状不变)。两档 pass 可并发运行。
+	hotWorkersMax  = 96
+	coldWorkersMax = 32
 
 	// tierProbeTimeoutMS 是 B 档(烧真配额的区域探针)的单次预算(src/index.js:911)。
 	tierProbeTimeoutMS = 20000
+
+	// firstProbeTick 是首探扫描的节拍:新入池的节点最坏等这么久开始全量首探。
+	firstProbeTick = 30 * time.Second
 )
 
 // tierUnavailableRe 复刻 src/probe.js:113-128 stateOf 的「模型侧拒绝」判据。
 var tierUnavailableRe = regexp.MustCompile(`(?i)unavailable|not supported|no such model|unknown model|invalid model`)
 
-// ProbeSummary 是一轮探测的结论。它同时喂给日志行(前端按正则抓)、面板和测试。
-type ProbeSummary struct {
-	Alive     int
-	Scanned   int
-	TierA     int
-	TierB     int
-	NewGated  int
-	Tested    int
-	Cached    int
-	Removed   int
-	Probation int
-	Pool      int
-	MS        int64
-	At        int64
+// PassSummary 是一轮 pass(hot/cold/first)的结论,喂日志行与测试。
+type PassSummary struct {
+	Kind     string // "hot" / "cold" / "first"
+	Scanned  int
+	Alive    int
+	Revived  int
+	Demoted  int
+	Deleted  int
+	NewGated int
+	Tested   int
+	MS       int64
+	At       int64
 
-	Skipped  bool // 探测源不通,整轮跳过
-	Accident bool // 探测源事故(alive 掉一半以上)
-	// SourceAddr 删掉了(审计 O6):它恒被写成 "direct"、从未被读过 —— 零端口架构
-	// 下「这一轮从哪个地址探的」不是一个事实,JS 版的 sourceAddr 同理。
+	Skipped  bool // 探测关闭/另一档在跑/无事可做
+	Accident bool // 探测通道故障,整轮结果丢弃
 }
 
-// Prober 是探测轮次对 nodeprobe 的全部依赖。做成接口是为了让测试注入假实现:
-// 真实探测要打外网,而这一轮的逻辑(缓存、事故、淘汰)必须能在离线环境断言。
+// Prober 是探测对 nodeprobe 的全部依赖。做成接口是为了让测试注入假实现:
+// 真实探测要打外网,而 pass 的逻辑(状态机、事故、删除)必须能在离线环境断言。
 // 生产实现是 *nodeprobe.Prober。
 type Prober interface {
 	ProbeAll(ctx context.Context, items []nodeprobe.Item, workers int) []nodeprobe.Result
@@ -126,340 +147,351 @@ func (t *tierChains) with(key string, fn func()) {
 	fn()
 }
 
-// markRerun 记下「本轮结束后再来一轮」。并发调 ProbeNow 时,后来的调用者不是
-// 排队等锁,而是把意图记在这里 —— 这样连按两次面板按钮不会产生两轮并发探测,
-// 也就不会把同一批节点测两遍、让淘汰判决互相覆盖(src/index.js:831-834)。
-func (p *Parts) markRerun(force bool) {
-	p.probeRerunMu.Lock()
-	p.probeRerun = true
-	p.probeRerunForce = p.probeRerunForce || force
-	p.probeRerunMu.Unlock()
+// probeEnabled 报告面板开关。关掉就所有 pass 都不跑,连日志都不打:这不是
+// 失败,是用户的选择。
+func (p *Parts) probeEnabled() bool {
+	return p.settingsSnapshot().ProbeEnabled
 }
 
-// finishProbeRound 是本轮唯一的出口:清 running 标志,并在有人排队时安排
-// 一秒后的重跑。注释照抄 src/index.js:987-995 —— 本轮探测被取消时不要留
-// 半个池子。
-func (p *Parts) finishProbeRound() {
-	p.probing.Store(false)
-	p.probeRerunMu.Lock()
-	rerun := p.probeRerun
-	rerunForce := p.probeRerunForce
-	p.probeRerun = false
-	p.probeRerunForce = false
-	p.probeRerunMu.Unlock()
-	if !rerun {
-		return
+// nudgeHot / nudgeCold / nudgeFirst 让对应 pass 立即跑一轮(面板按钮、重建
+// 之后的补探)。非阻塞:通道缓冲 1,已有待处理的 nudge 时合并。
+func (p *Parts) nudgeHot() {
+	select {
+	case p.hotNudge <- struct{}{}:
+	default:
 	}
-	p.afterFunc(time.Second, func() {
-		// B9:重跑必须挂在 lifeCtx 上。从前这里写死 context.Background(),
-		// 是四个复活点里唯一连 ctx.Err() 都不查的:关停之后这一秒的定时器
-		// 照样触发,以全新 context 跑完一整轮探测。
-		ctx := p.ctx()
-		if ctx.Err() != nil {
-			return
-		}
-		if _, err := p.ProbeNow(ctx, rerunForce); err != nil {
-			logger.Warn(fmt.Sprintf("[app] 探测重跑失败: %v", err))
-		}
-	})
+}
+func (p *Parts) nudgeCold() {
+	select {
+	case p.coldNudge <- struct{}{}:
+	default:
+	}
+}
+func (p *Parts) nudgeFirst() {
+	select {
+	case p.firstNudge <- struct{}{}:
+	default:
+	}
 }
 
-// cacheWindowMS 是结果缓存窗口:周期的一半,下限两分钟(src/index.js:818-821)。
-//
-// 取一半而不是整周期:窗口等于周期时,now-lastProbeAt 恰好落在边界上,而判据
-// 是 <=,于是每隔一轮就整轮跳过,刷新频率被静默腰斩。下限两分钟是因为
-// probeIntervalMin=5 时半周期只剩 2.5 分钟。
-func (p *Parts) cacheWindowMS() int64 {
-	cycleMin := p.settingsSnapshot().ProbeIntervalMin
-	if cycleMin < 5 {
-		cycleMin = 5 // src/index.js:818 的 Math.max(5, probeIntervalMin)
-	}
-	window := time.Duration(float64(time.Duration(cycleMin)*time.Minute) * probeCacheRatio)
-	if window < 2*time.Minute {
-		window = 2 * time.Minute
-	}
-	return window.Milliseconds()
+// probingActive 供 /api/status 的 probing 位:任意 pass 在跑即为真。
+func (p *Parts) probingActive() bool {
+	return p.hotRunning.Load() || p.coldRunning.Load() || p.firstRunning.Load()
 }
 
-// ProbeNow 跑一轮探测。force=true 跳过结果缓存窗口,每个节点都实测。
-//
-// 返回 error 只有一种情况:已有一轮在跑。其它失败(直连不通、单节点失败)都
-// 表达在 ProbeSummary 里 —— 探测轮次是后台任务,把「外网抖动」升级成调用方
-// 必须处理的 error 只会让面板的按钮弹出一个没人能处理的对话框。
-func (p *Parts) ProbeNow(ctx context.Context, force bool) (ProbeSummary, error) {
-	started := p.nowMS()
-	summary := ProbeSummary{At: started}
+// passWorkers 是单档 pass 的并发预算:设置值与「按节点数摊」取大者,再压到
+// 该档的封顶(热 96 / 冷 32,合计不超现行 128 峰值)。与旧公式的差异只在封顶;
+// **必须读 s.ProbeWorkers** —— 面板上挂着「探测并发」却不消费它,就是展示值
+// 与事实不符的老毛病(第五轮审计同型)。自动档 (n+3)/4 与旧 probeWorkers 的
+// 「按节点数摊」公式逐字相同,setting 只抬高、不压低它。
+func passWorkers(n, setting, max int) int {
+	w := (n + 3) / 4
+	if setting > w {
+		w = setting
+	}
+	if w > max {
+		w = max
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
 
-	cur := p.settingsSnapshot()
-	if !cur.ProbeEnabled {
-		// 面板关掉探测就整轮不跑,连日志都不打:这不是失败,是用户的选择。
-		return summary, nil
-	}
-	if p.Prober == nil {
-		return summary, stderrors.New("app: 探测实现未装配")
-	}
-	if !p.probing.CompareAndSwap(false, true) {
-		p.markRerun(force)
-		return ProbeSummary{}, stderrors.New("probe already running")
-	}
-	defer p.finishProbeRound()
-
-	pool := p.Registry.All()
-	summary.Scanned = len(pool)
-	summary.Pool = len(pool)
-	if len(pool) == 0 {
-		return summary, nil
-	}
-
-	// 结果缓存窗口内的节点跳过实测,但缓存里 alive 的节点仍要计入本轮存活:
-	// 漏了这一步,事故判定会把「因为新鲜所以没测」误当成「掉线」,于是一轮
-	// 完全正常的探测被标成事故(src/index.js:840-844)。
-	windowMS := p.cacheWindowMS()
-	aliveTags := make(map[string]bool, len(pool))
-	toProbe := make([]parse.Outbound, 0, len(pool))
-	// O32:窗口判定过去对每个节点各拿两次锁(ProbedWithin + HealthOf);一次
-	// 快照拿全,判据逐字等价(state 必须 alive/dead 才算「量过」,LastProbeAt
-	// 在窗口内)。
-	snap := p.Health.NodeSnapshot()
-	nowMS := p.nowMS()
-	for _, o := range pool {
-		if view, ok := snap[o.Tag]; ok &&
-			(view.State == health.StateAlive || view.State == health.StateDead) &&
-			view.LastProbeAt > 0 && nowMS-view.LastProbeAt <= windowMS {
-			if !force {
-				summary.Cached++
-				if view.State == health.StateAlive {
-					aliveTags[o.Tag] = true
-				}
-				continue
-			}
-		}
-		toProbe = append(toProbe, o)
-	}
-	if len(toProbe) == 0 {
-		logger.Info(fmt.Sprintf("probe round: 整轮跳过（%d 个节点都在 %d 分钟结果缓存窗口内）",
-			summary.Cached, int(windowMS/60000)))
-		summary.Alive = len(aliveTags)
-		summary.MS = p.nowMS() - started
-		return summary, nil
-	}
-
-	// 探测源直连门。不通就整轮跳过 —— 不是「照测但不淘汰」:照测会给每个节点
-	// 写 dead 行,而 pickExit 看的是行状态,一次十秒的 WAN 抖动会造成三十分钟
-	// 全网 503(src/index.js:870-878)。
-	if err := p.Prober.ProbeDirect(ctx, probeDirectTimeoutMS); err != nil {
-		logger.Error(fmt.Sprintf("探测源直连不可达：本机到 liveness 源全失败（%v）— 本轮跳过，不探测也不淘汰（现有 %d 个节点与健康行原样保留）",
-			err, len(pool)))
-		summary.Skipped = true
-		summary.MS = p.nowMS() - started
-		return summary, nil
-	}
-
-	// prevAlive 必须在探测开始前取:事故判定的分母是「上一轮还活着」的节点,
-	// 而不是「这一轮有多少节点通过」。整池失败率是常态(首轮 2373 个节点里
-	// 2246 个不通),只有一批已证存活的同时掉线才指向探测源本身。
-	prevAlive := map[string]bool{}
-	for tag, view := range p.Health.NodeSnapshot() {
-		if view.State == health.StateAlive {
-			prevAlive[tag] = true
-		}
-	}
-
-	items := make([]nodeprobe.Item, 0, len(toProbe))
-	for _, o := range toProbe {
-		d, derr := p.Host.Dialer(o.Tag)
-		if derr != nil {
-			// 拨不出去的节点本轮测不到:它不进 probedTags,于是淘汰判决也
-			// 碰不到它 —— 「没证据」不等于「有罪」。
+// collectPassItems 把「tags 里能构建拨号器的」打包成探测项。
+func (p *Parts) collectPassItems(tags []string, opts nodeprobe.ProbeOptions) []nodeprobe.Item {
+	items := make([]nodeprobe.Item, 0, len(tags))
+	for _, tag := range tags {
+		d, err := p.Host.Dialer(tag)
+		if err != nil {
+			// 拨不出去的节点本轮测不到:没有证据不等于有罪,不参与状态推进。
 			continue
 		}
-		opts := nodeprobe.ProbeOptions{}
-		if p.Registry.FailCount(o.Tag) > 0 {
-			opts = nodeprobe.ProbeOptions{Attempts: 1, TimeoutMS: probeDegradedTimeoutMS}
+		items = append(items, nodeprobe.Item{Tag: tag, Dial: d, Options: opts})
+	}
+	return items
+}
+
+// applyAccidentGuard 是热区 pass 的事故判决:通过率跌破地板说明探测通道本身
+// 坏了。ProbeDirect 区分「本机断网」与「上游闸门故障」——两种情况都整轮丢弃
+// 结果(成功的少数量也不应用:一个把 95% 存活节点判死的 pass 里,那 5% 的
+// 「成功」同样不可信),并冻结 lastHotOK(冷区删除随之暂停)。
+func (p *Parts) applyAccidentGuard(ctx context.Context, sum *PassSummary, tested, alive int) bool {
+	if tested < probeAccidentMin || float64(alive)/float64(tested) >= probeAliveFloor {
+		return false
+	}
+	derr := p.Prober.ProbeDirect(ctx, probeDirectTimeoutMS)
+	reason := "上游闸门疑似故障"
+	if derr != nil {
+		reason = "本机断网（直连也不可达）"
+	}
+	logger.Error(fmt.Sprintf("探测通道疑似故障（%s）：热区 %d 个节点仅 %d 个通过（%.0f%% < %.0f%% 地板）— 本轮结果整体丢弃，冷区删除冻结",
+		reason, tested, alive, float64(alive)/float64(tested)*100, probeAliveFloor*100))
+	sum.Accident = true
+	sum.Skipped = true
+	return true
+}
+
+// runProbeItems 是 pass 的公共执行段:并发探测 → 取消丢弃 → 事故闸门。
+// 返回 (结果, 事故)。items 为空时结果为 nil、事故为 false。ok 语义:
+// 结果为 nil 且事故为 false = 无事可做;调用方拿到 accident=true 时必须
+// 原样把判决带进自己的 PassSummary(过去事故标记写在本函数的局部 sum 里,
+// 随返回值一起被丢掉 —— 调用方的 sum.Accident 恒为 false,测试与面板都
+// 看不到事故轮)。
+func (p *Parts) runProbeItems(ctx context.Context, items []nodeprobe.Item, max int) ([]nodeprobe.Result, bool) {
+	if len(items) == 0 {
+		return nil, false
+	}
+	// 并发预算 = max(设置值, 按节点数摊),封顶到该档。设置值必须被消费:
+	// 面板上挂着「探测并发」却谁都不读它 = 展示值与事实不符(第五轮审计同型)。
+	setting := p.settingsSnapshot().ProbeWorkers
+	results := p.Prober.ProbeAll(ctx, items, passWorkers(len(items), setting, max))
+	if ctx.Err() != nil {
+		// C2 同理:取消的一轮不产生任何结论。
+		logger.Info("probe pass: 已取消（关停）— 整轮结果丢弃")
+		return nil, false
+	}
+	alive := 0
+	for _, r := range results {
+		if r.Result.State == nodeprobe.StateAlive {
+			alive++
 		}
-		items = append(items, nodeprobe.Item{Tag: o.Tag, Dial: d, Options: opts})
+	}
+	var sum PassSummary
+	if p.applyAccidentGuard(ctx, &sum, len(items), alive) {
+		return nil, true
+	}
+	return results, false
+}
+
+// hotPass 复检热区(alive)节点。keep alive 节点在 60s 级别的新鲜度:这是
+// 流量真正要走的出口。
+func (p *Parts) hotPass(ctx context.Context) PassSummary {
+	started := p.nowMS()
+	sum := PassSummary{Kind: "hot", At: started}
+	if !p.probeEnabled() || p.Prober == nil {
+		sum.Skipped = true
+		return sum
+	}
+	if !p.hotRunning.CompareAndSwap(false, true) {
+		sum.Skipped = true
+		return sum
+	}
+	defer p.hotRunning.Store(false)
+
+	snap := p.Health.NodeSnapshot()
+	var tags []string
+	for _, n := range p.poolNodes() {
+		if view, ok := snap[n.Tag]; ok && view.State == health.StateAlive {
+			tags = append(tags, n.Tag)
+		}
+	}
+	items := p.collectPassItems(tags, nodeprobe.ProbeOptions{
+		TimeoutMS: hotProbeTimeoutMS, Attempts: 1, UpstreamOnly: true,
+	})
+	sum.Scanned = len(tags)
+	if len(items) == 0 {
+		// 热区暂时为空(冷启动/全池已死):没东西可测,打一行方便对账。
+		logger.Info(fmt.Sprintf("probe round: 0/%d alive (热区为空,等待冷区/首探复活)", sum.Scanned))
+		sum.MS = p.nowMS() - started
+		return sum
+	}
+	results, accident := p.runProbeItems(ctx, items, hotWorkersMax)
+	if accident {
+		// 事故判决必须原样进本 pass 的 summary(面板/测试读 sum.Accident),
+		// 且一个结果都不应用:上一行已整轮丢弃。lastHotOK 不清 —— 冻结冷区
+		// 删除正是这道闸的语义。
+		sum.Accident = true
+		sum.Skipped = true
+		sum.MS = p.nowMS() - started
+		return sum
+	}
+	if results == nil {
+		// 取消的一轮:什么都不应用,原样收场。
+		sum.MS = p.nowMS() - started
+		return sum
+	}
+	p.lastHotOK.Store(true)
+
+	demoted := 0
+	for _, r := range results {
+		switch r.Result.State {
+		case nodeprobe.StateAlive:
+			p.Health.MarkPassSuccess(r.Tag)
+			sum.Alive++
+		case nodeprobe.StateDead:
+			if p.Health.MarkPassFail(r.Tag, true) == "demote" {
+				demoted++
+			}
+		}
+	}
+	sum.Demoted = demoted
+	// B 档认证:进入热区的非 B 节点(新认证/region 恢复)在此烧一次 16-token
+	// 认证。已证 B 的跳过 —— 认证是准入,不是监测。
+	sum.NewGated = p.runTierPipeline(ctx, items, results)
+
+	counts := p.Health.TierCounts()
+	sum.Tested = len(items)
+	sum.MS = p.nowMS() - started
+
+	// 前端 probeFromLogs 按 "probe round:" 前缀抓热区摘要,形状必须兼容:
+	//   /probe round:\s*(\d+)\/(\d+)\s+alive\s*\(A\s*(\d+)[^0-9]*B\s*(\d+)[^)]*\)\s*in\s*([\d.]+)s/
+	logger.Info(fmt.Sprintf(
+		"probe round: %d/%d alive (A %d · B %d · 本轮新验 B %d · 降冷 %d) in %.1fs",
+		sum.Alive, sum.Scanned, counts.A, counts.B, sum.NewGated, demoted,
+		float64(sum.MS)/1000))
+	return sum
+}
+
+// coldPass 扫冷区(dead)节点:复活立即升热;连续 3 轮失败 → 彻底删除。
+// 删除只在 lastHotOK(最近一次热区 pass 健康结束)时执行 —— 探测通道坏了的
+// 时候,「冷区连续失败」是通道的锅,不是节点的罪。
+func (p *Parts) coldPass(ctx context.Context) PassSummary {
+	started := p.nowMS()
+	sum := PassSummary{Kind: "cold", At: started}
+	if !p.probeEnabled() || p.Prober == nil {
+		sum.Skipped = true
+		return sum
+	}
+	if !p.coldRunning.CompareAndSwap(false, true) {
+		sum.Skipped = true
+		return sum
+	}
+	defer p.coldRunning.Store(false)
+
+	snap := p.Health.NodeSnapshot()
+	var tags []string
+	for _, n := range p.poolNodes() {
+		if view, ok := snap[n.Tag]; ok && view.State == health.StateDead {
+			tags = append(tags, n.Tag)
+		}
+	}
+	items := p.collectPassItems(tags, nodeprobe.ProbeOptions{
+		TimeoutMS: coldProbeTimeoutMS, Attempts: 1, UpstreamOnly: true,
+	})
+	sum.Scanned = len(tags)
+	if len(items) == 0 {
+		sum.MS = p.nowMS() - started
+		return sum
+	}
+	results := p.Prober.ProbeAll(ctx, items, passWorkers(len(items), p.settingsSnapshot().ProbeWorkers, coldWorkersMax))
+	if ctx.Err() != nil {
+		logger.Info("cold pass: 已取消（关停）— 整轮结果丢弃")
+		sum.MS = p.nowMS() - started
+		return sum
+	}
+	// 冷区自己的通道闸:整轮零复活(常态可以是零)且直连也挂 → 丢弃本轮,
+	// 别让「本机断网」给冷区节点白记失败;直连正常则照常应用(零复活是
+	// 合法观测)。
+	aliveCount := 0
+	for _, r := range results {
+		if r.Result.State == nodeprobe.StateAlive {
+			aliveCount++
+		}
+	}
+	if len(items) >= probeAccidentMin && aliveCount == 0 {
+		if derr := p.Prober.ProbeDirect(ctx, probeDirectTimeoutMS); derr != nil {
+			logger.Error(fmt.Sprintf("冷区 sweep 期间本机断网（%v）— 本轮结果丢弃", derr))
+			sum.Accident = true
+			sum.Skipped = true
+			sum.MS = p.nowMS() - started
+			return sum
+		}
 	}
 
-	if len(items) == 0 {
-		// 所有候选的拨号器都构建失败:这一轮其实什么都没测。旧判据
-		// (Scanned>0 && alive==0) 会把这当成「探测源事故」打一行误导排障的
-		// 日志 —— 直连门通过说明本机没断网,但真相是本轮零测量。
-		logger.Warn(fmt.Sprintf("[app] 本轮没有可测节点：%d 个候选的拨号器全部构建失败 — 不淘汰、不判事故", len(toProbe)))
-		summary.MS = p.nowMS() - started
-		return summary, nil
-	}
-	summary.Tested = len(items)
-	probedTags := make(map[string]bool, len(items))
-	for _, it := range items {
-		probedTags[it.Tag] = true
-	}
-	results := p.Prober.ProbeAll(ctx, items, p.probeWorkers(len(items)))
-	if ctx.Err() != nil {
-		// C2(关键):取消发生在探测途中 —— 面板「立即探测」一轮要跑数分钟,
-		// 期间刷新/关页、或关停掐断了请求 ctx。此后的每个 shot 都会立刻失败、
-		// samples 恒为空,而 nodeprobe 的「量不到 = dead」判决加上下面无条件的
-		// MarkProbe 会把**整个池子**写成 dead 并落盘:pick 排除全部 dead,每个
-		// 请求 503,而且这些 dead 行在缓存窗口内被当「新鲜结论」跳过不重测,
-		// 故障持续到窗口过期。取消的一轮不产生任何结论:结果整体丢弃,
-		// 健康表与淘汰账原样保留。
-		logger.Info("probe round: 已取消（请求方离开或关停）— 整轮结果丢弃，健康表原样保留")
-		summary.MS = p.nowMS() - started
-		return summary, nil
-	}
-	// unknownTags 是 backstop 兜底点火的节点(本轮没量出来)。nodeprobe 的契约
-	// (nodeprobe.go:440-452)与 health.MarkProbe 都写着「拿到 unknown 应当跳过它
-	// 这一轮」:它既不是通关也不是判决。跳过在两个地方都要兑现 —— 记连败会
-	// 三轮后够到淘汰门槛(探测源越抖,池子越缩),而 RetainOnly 看 probedTags,
-	// 留在这里同样会被判死。
-	unknownTags := make(map[string]bool, len(items))
+	deletionsAllowed := p.lastHotOK.Load()
 	for _, r := range results {
+		switch r.Result.State {
+		case nodeprobe.StateAlive:
+			p.Health.MarkPassSuccess(r.Tag)
+			sum.Revived++
+		case nodeprobe.StateDead:
+			// 删除判决只在热区健康时执行;冻结期间这次失败不计数
+			// (下一轮再算),避免「通道抖三下 = 白删一池子」。
+			switch p.Health.MarkPassFail(r.Tag, deletionsAllowed) {
+			case "delete":
+				p.Registry.Remove(r.Tag)
+				p.Health.Forget(r.Tag)
+				sum.Deleted++
+			case "demote":
+				// 冷区节点不会再降档(已经是冷区);防御性忽略。
+			}
+		}
+	}
+	sum.Tested = len(items)
+	sum.MS = p.nowMS() - started
+	logger.Info(fmt.Sprintf(
+		"cold pass: %d scanned · 复活 %d · 删除 %d（删除闸门 %s）in %.1fs",
+		sum.Scanned, sum.Revived, sum.Deleted, map[bool]string{true: "开", false: "冻结"}[deletionsAllowed],
+		float64(sum.MS)/1000))
+	return sum
+}
+
+// firstProbePass 给「还没有健康行」的节点做全量首探(三段 + echo),通关的
+// 随后烧 B 档认证。完成后的节点拥有健康行,进入热/冷双循环。
+func (p *Parts) firstProbePass(ctx context.Context) PassSummary {
+	started := p.nowMS()
+	sum := PassSummary{Kind: "first", At: started}
+	if !p.probeEnabled() || p.Prober == nil {
+		sum.Skipped = true
+		return sum
+	}
+	if !p.firstRunning.CompareAndSwap(false, true) {
+		sum.Skipped = true
+		return sum
+	}
+	defer p.firstRunning.Store(false)
+
+	snap := p.Health.NodeSnapshot()
+	var tags []string
+	for _, n := range p.poolNodes() {
+		if _, ok := snap[n.Tag]; !ok {
+			tags = append(tags, n.Tag)
+		}
+	}
+	items := p.collectPassItems(tags, nodeprobe.ProbeOptions{})
+	sum.Scanned = len(tags)
+	if len(items) == 0 {
+		sum.MS = p.nowMS() - started
+		return sum
+	}
+	results, accident := p.runProbeItems(ctx, items, hotWorkersMax)
+	if accident {
+		// 首探通道同样吃事故闸:新节点在坏通道上被判死会白丢一整批首探
+		// 判决(它们会带着 dead 行进冷区挨三轮删除)。丢弃,下一拍重探。
+		sum.Accident = true
+		sum.Skipped = true
+		sum.MS = p.nowMS() - started
+		return sum
+	}
+	if results == nil {
+		sum.MS = p.nowMS() - started
+		return sum
+	}
+	for _, r := range results {
+		// MarkProbe:既有判决写入(含 echo 的出口 IP/国家);unknown 自动跳过。
 		p.Health.MarkProbe(r.Tag, r.Result)
 		switch r.Result.State {
 		case nodeprobe.StateAlive:
-			aliveTags[r.Tag] = true
+			sum.Alive++
 		case nodeprobe.StateDead:
-		default:
-			unknownTags[r.Tag] = true
-			delete(probedTags, r.Tag) // 与拨不出去的节点同一待遇:没证据不等于有罪
+			// 首探判死:进冷区,连败从 0 开始数。
 		}
 	}
-
-	// B 档流水线。JS 是在 A 档每个节点通关时立刻触发(onPass 回调),Go 的
-	// nodeprobe.ProbeAll 按输入顺序整批返回、没有回调,所以这里等 A 档收完再
-	// 统一编排 —— 时序不同,结论一致(只有通关的节点才值得花配额)。
-	summary.NewGated = p.runTierPipeline(ctx, items, results)
-
-	lostAlive := 0
-	for tag := range prevAlive {
-		if !aliveTags[tag] {
-			lostAlive++
-		}
-	}
-	ratioHit := len(prevAlive) >= probeAccidentMin &&
-		float64(lostAlive)/float64(len(prevAlive)) > probeAccidentRate
-	// collapse 是第二把闸:存活塌到上一轮的 1/4 以下才算「绝对值也塌方」。
-	// 真实数据(2026-10-03):alive 50-59 的池子每轮随机换血 60-80% 却仍是
-	// 同一个可服务规模 —— 只看比率,事故轮每轮都误触发,淘汰被永久压制
-	// (观察期涨到全池 97%,池子只增不减)。双条件后:随机换血(比率超 50%
-	// 但绝对值持平)不再误报;真正的探测源断供(alive 塌到 1/4 以下/0)
-	// 两条同时满足,保护仍在。
-	collapse := len(prevAlive) >= probeAccidentMin && len(aliveTags)*4 < len(prevAlive)
-	zeroAlive := summary.Tested > 0 && len(aliveTags) == 0
-	accident := (ratioHit && collapse) || zeroAlive
-	summary.Accident = accident
-	// 日志必须与 accident 的双条件判决同门:过去挂在 ratioHit 上,「换血但
-	// 规模未塌方」的每一轮都打 Error「不淘汰任何节点」而实际照常淘汰 ——
-	// 运行日志已抓到同轮矛盾(2026-10-03 19:53 ERROR 与「淘汰 1941」同现)。
-	if accident && ratioHit {
-		logger.Error(fmt.Sprintf("探测源疑似事故：上一轮存活的 %d 个节点本轮掉了 %d 个（%.0f%% > %.0f%%）且存活塌方 — 本轮不淘汰任何节点，保留现有池子",
-			len(prevAlive), lostAlive,
-			float64(lostAlive)/float64(len(prevAlive))*100, probeAccidentRate*100))
-	} else if accident && zeroAlive {
-		logger.Error(fmt.Sprintf("探测源疑似事故：本轮实测 %d 个节点 0 个通关（直连门已通过，说明不是本机断网）— 本轮不淘汰任何节点，保留现有池子",
-			summary.Tested))
-	} else if ratioHit {
-		logger.Info(fmt.Sprintf("探测存活换血 %.0f%%（超过 %.0f%%）但规模未塌方，判定非事故 — 本轮照常执行淘汰",
-			float64(lostAlive)/float64(len(prevAlive))*100, probeAccidentRate*100))
-	}
-
-	// 计败:本轮真的测出结论、又没通关的节点各记一次。缓存跳过的不在此列 ——
-	// 缓存的语义是「同一个观测只算一次」,否则 MAX_FAILS=3 会被缓存加速一倍。
-	// unknown 也不在此列(R16):兜底超时是「本轮没量出来」,不是「量到了不通」。
-	now := p.now()
-	for _, it := range items {
-		if aliveTags[it.Tag] || unknownTags[it.Tag] {
-			continue
-		}
-		p.Registry.NoteFail(it.Tag, now)
-	}
-
-	// alive 名单 = 本轮通关的节点;连败未到门槛的是「观察期」名单。两者必须分开:
-	// RetainOnly 对 alive 做「清零连败 + 清墓碑」,把观察期节点塞进 alive 会让
-	// 计数每轮 1→0,门槛永远够不到(现场表现:淘汰恒为 0、观察期长期钉死)。
-	// Go 把 JS retainOnly 里耦在一起的「计败」与「判决」拆成两步,正值的门槛由这里
-	// 用两个名单执行。事故轮不能传空的 Protected —— 那会把本轮真通关的节点也记成
-	// 一次失败,所以只把 MaxFails 抬成 -1(Infinity,只记账不淘汰)。
-	aliveList := make([]string, 0, len(aliveTags))
-	for tag := range aliveTags {
-		aliveList = append(aliveList, tag)
-	}
-	protected := make(map[string]bool, len(items))
-	maxFails := registry.MaxFails
-	if accident {
-		maxFails = -1
-	} else {
-		for _, it := range items {
-			if aliveTags[it.Tag] {
-				continue
-			}
-			if p.Registry.FailCount(it.Tag) < registry.MaxFails {
-				protected[it.Tag] = true
-			}
-		}
-	}
-	dropped := p.Registry.RetainOnly(aliveList, registry.RetainOpts{
-		ProbedTags: probedTags,
-		Protected:  protected,
-		MaxFails:   maxFails,
-	})
-	for _, tag := range dropped {
-		p.Health.Forget(tag)
-	}
-	// 池子超上限的淘汰同样要清健康行(D-C1):RetainOnly 的 dropped 只覆盖
-	// 「本轮测过且没活」的,容量挤出的是另一批人。
-	for _, tag := range p.Registry.EnforceCap(registry.PoolCap) {
-		p.Health.Forget(tag)
-	}
-	if err := p.Health.Persist(); err != nil {
-		logger.Warn(fmt.Sprintf("[app] 健康表落盘失败: %v", err))
-	}
-
-	counts := p.Health.TierCounts()
-	summary.Alive = len(aliveTags)
-	summary.TierA = counts.A
-	summary.TierB = counts.B
-	summary.Removed = len(dropped)
-	summary.Pool = p.Registry.Len()
-	summary.Probation = p.probationCount()
-	summary.MS = p.nowMS() - started
-
-	// 形状必须与 web/app.js 的 probeFromLogs 正则一致（全局约束 7）：
-	//   /probe round:\s*(\d+)\/(\d+)\s+alive\s*\(A\s*(\d+)[^0-9]*B\s*(\d+)[^)]*\)\s*in\s*([\d.]+)s/
+	sum.NewGated = p.runTierPipeline(ctx, items, results)
+	sum.Tested = len(items)
+	sum.MS = p.nowMS() - started
 	logger.Info(fmt.Sprintf(
-		"probe round: %d/%d alive (A %d · B %d · 本轮新验 B %d · 实测 %d · 缓存复用 %d · 淘汰 %d · 观察期 %d · 池内剩余 %d) in %.1fs",
-		summary.Alive, summary.Scanned, summary.TierA, summary.TierB, summary.NewGated,
-		summary.Tested, summary.Cached, summary.Removed, summary.Probation, summary.Pool,
-		float64(summary.MS)/1000))
-	return summary, nil
-}
-
-// probeWorkers 复刻 src/index.js:893 的 workers 公式。
-func (p *Parts) probeWorkers(n int) int {
-	workers := p.settingsSnapshot().ProbeWorkers
-	if q := (n + 3) / 4; q > workers {
-		workers = q
-	}
-	if workers > 128 {
-		workers = 128
-	}
-	if workers < 1 {
-		workers = 1
-	}
-	return workers
-}
-
-// probationCount 是还在观察期的节点数(连败 > 0)。走 Registry 的一次性聚合:
-// 逐 tag 调 FailCount 是每 tag 一次 RLock 往返(引擎审计 M5),池子几千个
-// 节点时一轮探测白付几千次锁竞争。
-func (p *Parts) probationCount() int {
-	return p.Registry.ProbationCount()
+		"first probe: %d 个新节点, %d 通关 (新验 B %d) in %.1fs",
+		sum.Scanned, sum.Alive, sum.NewGated, float64(sum.MS)/1000))
+	return sum
 }
 
 // runTierPipeline 对 A 档通关的节点跑 B 档区域探针,返回本轮新验证为 B 的节点数。
 //
 // B 档探测是真会话、真烧配额,所以它挂在两个闸门后面:全局错峰闸门
 // (tierGate,60ms 一个)和按出口 IP 的串行链。已经验明 B 的节点永不重测 ——
-// 稳态成本跟着新增节点数走,而不是跟着池子大小走(src/index.js:894-899)。
+// 认证是准入,不是监测(1.3.0 定稿);稳态成本跟着新进热区的节点数走。
 func (p *Parts) runTierPipeline(ctx context.Context, items []nodeprobe.Item, results []nodeprobe.Result) int {
 	alive := make([]string, 0, len(results))
 	for _, r := range results {
@@ -474,9 +506,8 @@ func (p *Parts) runTierPipeline(ctx context.Context, items []nodeprobe.Item, res
 	var wg sync.WaitGroup
 	for _, tag := range alive {
 		if p.Health.TierOf(tag) == health.TierB {
-			// 已证 B:不重测(稳态成本跟新增节点走),也**不计入**返回值 ——
-			// 日志字段是「本轮新验 B」,把存量也算进去会让面板数字虚高,
-			// 观察不到 B 档增长是否真的发生了。
+			// 已证 B:不重测,也**不计入**返回值 —— 日志字段是「本轮新验 B」,
+			// 把存量算进去会让面板数字虚高。
 			continue
 		}
 		wg.Add(1)
@@ -575,8 +606,7 @@ func (p *Parts) probeTierModel(ctx context.Context, tag string) string {
 		req.Header.Set(name, value)
 	}
 	// OneShotClient:每 shot 一个全新 Transport,keep-alive 会留一条 idle 连接
-	// 挂满 60s —— 一轮 B 档几十到几百 shot 就是同量级的瞬时 fd 尖峰(nodeprobe
-	// 侧的同类问题已修,这里是最后一处漏网)。
+	// 挂满 60s —— 一轮 B 档几十到几百 shot 就是同量级的瞬时 fd 尖峰。
 	client := httpclient.NewOneShotClient(d, time.Duration(tierProbeTimeoutMS)*time.Millisecond)
 	resp, err := client.Do(req)
 	if err != nil {

@@ -48,7 +48,9 @@ const SubRetryExits = 12
 //
 // The separators are deliberately loose: the line carries Chinese labels
 // between the numbers and the console must keep parsing it if those labels are
-// reworded.
+// reworded. 1.3.0's hot-pass line ("A 5 · B 0 · 本轮新验 B 0 · 降冷 1") still
+// matches: the [^0-9]*B group lands on the first B count and [^)]* swallows
+// the rest of the paren.
 const ProbeSummaryPattern = `probe round:\s*(\d+)\/(\d+)\s+alive\s*\(A\s*(\d+)[^0-9]*B\s*(\d+)[^)]*\)\s*in\s*([\d.]+)s`
 
 // ProbeSummaryRe is ProbeSummaryPattern compiled once. Groups: 1 alive,

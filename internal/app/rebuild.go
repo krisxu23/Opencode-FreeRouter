@@ -42,9 +42,9 @@ const (
 	subRetryDelay = 20 * time.Second
 	subRetryLimit = 2
 
-	// rebuildInterval / limitsInterval 照抄 src/index.js:1103-1104。
-	rebuildInterval = 6 * time.Hour
-	limitsInterval  = 24 * time.Hour
+	// limitsInterval 照抄 src/index.js:1103-1104。订阅刷新间隔 1.3.0 起改为
+	// 面板可设的 refreshIntervalMin(默认 30 分钟),不再是写死的 6 小时。
+	limitsInterval = 24 * time.Hour
 	// firstProbeDelay 照抄 src/index.js:739-740:重建完 3 秒后立刻补一轮探测,
 	// 让面板上的「—」尽快变成一次真实测量。
 	firstProbeDelay = 3 * time.Second
@@ -188,14 +188,13 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 		logger.Info(fmt.Sprintf("rebuild ok: %d nodes(热插 %d, 撤下 %d)", p.Registry.Len(), added, removed))
 		p.refreshCatalog(ctx)
 	}
+	// 1.3.0:重建完成后 nudge 首探循环 —— 新入池节点(没有健康行的)立即
+	// 走全量首探,不必等 firstProbeLoop 的 30s 节拍。
 	p.afterFunc(firstProbeDelay, func() {
 		if ctx.Err() != nil {
 			return
 		}
-		if _, err := p.ProbeNow(ctx, false); err != nil {
-			// 已有一轮在跑:首探是尽力而为,不排队。
-			return
-		}
+		p.nudgeFirst()
 	})
 	return rebuildErr
 }

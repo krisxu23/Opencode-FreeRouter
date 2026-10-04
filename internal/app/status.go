@@ -240,8 +240,8 @@ func (p *Parts) stopPendingTimers() {
 	}
 }
 
-// wait 返回一个在 d 后闭合的通道。probeTicker 间隔每轮重读
-// (面板改 probeIntervalMin 立即生效),所以是逐轮 wait 而不是固定 Ticker。
+// wait 返回一个在 d 后闭合的通道。三档间隔每轮重读
+// (面板改 hotIntervalSec 立即生效),所以是逐轮 wait 而不是固定 Ticker。
 // waitFn 是测试接缝:注入后三个循环的节拍完全由测试驱动。
 func (p *Parts) wait(d time.Duration) <-chan time.Time {
 	if p.waitFn != nil {
@@ -259,32 +259,54 @@ func (p *Parts) base() string {
 	return upstream.BaseFromEnv()
 }
 
-// probeInterval 是探测周期:max(5, probeIntervalMin) 分钟。下限 5 分钟来自
-// src/index.js:1102 —— 更密的探测只会烧配额、把出口 IP 打成 429,不会让
-// 池子更健康。
-//
-// 上限是一道**防御性 clamp**,不依赖校验层(生命周期审计 #2):validateSettingsPatch
-// 只管面板 PUT 那条路,手改 settings.json 或旧版本落盘的超大值会绕过它直接
-// 到达这里。time.Duration(minutes)*time.Minute 在 minutes 超过约 1.5 亿时溢出
-// 成 ≤0,而调用方的 time.After(≤0) **立即就绪** —— probeLoop 于是变成整轮
-// O(pool) 缓存扫描的自旋,没有一秒睡眠。判据写成「先算溢出、再 clamp」而不是
-// 「minutes > N」的硬阈值:用 maxProbeIntervalMinutes 卡入口,任何会溢出的值
-// 都落不进来。0..4 归 5(下限)与超上限归 43200(30 天)共用同一次比较。
-func (p *Parts) probeInterval() time.Duration {
-	const maxProbeIntervalMinutes = 43200 // 30 天,与 status.go 的 PUT 校验同一上限
-	minutes := p.settingsSnapshot().ProbeIntervalMin
-	if minutes < 5 {
-		minutes = 5
+// 三档 pass 与订阅重建的间隔(1.3.0):全部带**运行时 clamp** —— 校验层只管
+// 面板 PUT 那条路,手改 settings.json 或旧版本落盘的超大值会绕过它直接到达
+// 这里。间隔语义是「上一轮完整结束后再等 N」:一轮耗时多久都无所谓,绝不堆积,
+// 也不存在 time.After(≤0) 的自旋形态。
+
+// hotInterval 热区复检间隔(默认 60s):alive 节点的新鲜度预算。
+func (p *Parts) hotInterval() time.Duration {
+	const minS, maxS = 15, 3600
+	s := p.settingsSnapshot().HotIntervalSec
+	if s < minS {
+		s = minS
 	}
-	if minutes > maxProbeIntervalMinutes {
-		minutes = maxProbeIntervalMinutes
+	if s > maxS {
+		s = maxS
 	}
-	return time.Duration(minutes) * time.Minute
+	return time.Duration(s) * time.Second
 }
 
-// StartTimers 起三个周期任务:探测、订阅重建、限额覆盖层刷新
-// (间隔照抄 src/index.js:1102-1104)。它们都阻塞在 firstFetch 上再进第一轮:
-// 宁可晚几秒,也不要对着空池子空转。
+// coldInterval 冷区扫描间隔(默认 5 分钟):复活节点的发现预算。
+func (p *Parts) coldInterval() time.Duration {
+	const minS, maxS = 60, 86400
+	s := p.settingsSnapshot().ColdIntervalSec
+	if s < minS {
+		s = minS
+	}
+	if s > maxS {
+		s = maxS
+	}
+	return time.Duration(s) * time.Second
+}
+
+// refreshInterval 订阅刷新间隔(默认 30 分钟,取代 1.2.x 写死的 6 小时):
+// 刷新同时是「消失节点删除」的触发点,节奏必须可调。
+func (p *Parts) refreshInterval() time.Duration {
+	const minM, maxM = 5, 10080
+	m := p.settingsSnapshot().RefreshIntervalMin
+	if m < minM {
+		m = minM
+	}
+	if m > maxM {
+		m = maxM
+	}
+	return time.Duration(m) * time.Minute
+}
+
+// StartTimers 起五个持续任务:热区/冷区/首探三档 pass 循环 + 订阅重建 +
+// 限额覆盖层刷新。它们都阻塞在 firstFetch 上再进第一轮:宁可晚几秒,也不要
+// 对着空池子空转。
 //
 // 传入的 ctx 是调用方的生命周期信号(生产里是 main 的 signal.NotifyContext)。
 // Load 已经建好了 lifeCtx,这里只把它桥接起来:调用方 ctx 一旦取消,p.cancel
@@ -303,6 +325,10 @@ func (p *Parts) StartTimers(ctx context.Context) {
 	life := p.lifeCtx
 
 	if p.firstFetch != nil {
+		// 三个 pass 循环各自独立成 goroutine。曾把它们**串行**塞进同一个
+		// goroutine(hotLoop 永不返回,coldLoop/firstProbeLoop 排在它后面 =
+		// 永不执行)——冷区扫描与首探双双停摆,新节点永远没有健康行。
+		// warmUp 只属于热区那一路(首探 nudge 定时器 + 目录刷新)。
 		p.timersWG.add()
 		go func() {
 			defer p.timersWG.done()
@@ -312,7 +338,27 @@ func (p *Parts) StartTimers(ctx context.Context) {
 			case <-p.firstFetch:
 			}
 			p.warmUp(life)
-			p.probeLoop(life)
+			p.hotLoop(life)
+		}()
+		p.timersWG.add()
+		go func() {
+			defer p.timersWG.done()
+			select {
+			case <-life.Done():
+				return
+			case <-p.firstFetch:
+			}
+			p.coldLoop(life)
+		}()
+		p.timersWG.add()
+		go func() {
+			defer p.timersWG.done()
+			select {
+			case <-life.Done():
+				return
+			case <-p.firstFetch:
+			}
+			p.firstProbeLoop(life)
 		}()
 
 		p.timersWG.add()
@@ -327,7 +373,11 @@ func (p *Parts) StartTimers(ctx context.Context) {
 		}()
 	} else {
 		p.timersWG.add()
-		go func() { defer p.timersWG.done(); p.probeLoop(life) }()
+		go func() { defer p.timersWG.done(); p.hotLoop(life) }()
+		p.timersWG.add()
+		go func() { defer p.timersWG.done(); p.coldLoop(life) }()
+		p.timersWG.add()
+		go func() { defer p.timersWG.done(); p.firstProbeLoop(life) }()
 		p.timersWG.add()
 		go func() { defer p.timersWG.done(); p.rebuildLoop(life) }()
 	}
@@ -357,9 +407,9 @@ func (p *Parts) warmUp(ctx context.Context) {
 			return
 		case <-p.wait(firstProbeDelay):
 		}
-		// 与 Rebuild 的首探同口径:force=false,新鲜结果不重测。已有轮在跑就放弃
-		// —— 首探是尽力而为,排队只会让它变成紧接着的第二轮全量实测。
-		_, _ = p.ProbeNow(ctx, false)
+		// 1.3.0:首探由 firstProbeLoop 负责,这里 nudge 让新节点立刻开测
+		// (循环自身的 30s 节拍是兜底)。
+		p.nudgeFirst()
 	}()
 	p.timersWG.add()
 	go func() {
@@ -368,21 +418,53 @@ func (p *Parts) warmUp(ctx context.Context) {
 	}()
 }
 
-func (p *Parts) probeLoop(ctx context.Context) {
+// hotLoop 热区循环:复检所有 alive 节点,完成后再等 hotIntervalSec。
+// 与冷区循环并发运行(它们的 worker 预算对半封顶,合计不超现行峰值)。
+func (p *Parts) hotLoop(ctx context.Context) {
 	for {
-		interval := p.probeInterval()
+		p.hotPass(ctx)
 		select {
 		case <-ctx.Done():
 			return
-		case <-p.wait(interval):
+		case <-p.hotNudge:
+		case <-p.wait(p.hotInterval()):
 		}
 		if ctx.Err() != nil {
 			return
 		}
-		// ProbeNow 自己用 probing 标志串行化:上一轮没跑完时这一轮只记
-		// 重跑意图,绝不并发 —— 两轮并发会让淘汰判决互相覆盖。
-		if _, err := p.ProbeNow(ctx, false); err != nil {
-			logger.Info(fmt.Sprintf("[app] 定时探测跳过: %v", err))
+	}
+}
+
+// coldLoop 冷区循环:扫描所有 dead 节点,完成后再等 coldIntervalSec。
+func (p *Parts) coldLoop(ctx context.Context) {
+	for {
+		p.coldPass(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.coldNudge:
+		case <-p.wait(p.coldInterval()):
+		}
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+// firstProbeLoop 首探循环:给还没有健康行的新入池节点做全量三段首探。
+// 30s 节拍兜底;Rebuild/订阅拉取完成后会 nudge 立即开测。没有新节点时
+// 本轮是零成本(一次快照 diff)。
+func (p *Parts) firstProbeLoop(ctx context.Context) {
+	for {
+		p.firstProbePass(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.firstNudge:
+		case <-p.wait(firstProbeTick):
+		}
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }
@@ -392,7 +474,7 @@ func (p *Parts) rebuildLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-p.wait(rebuildInterval):
+		case <-p.wait(p.refreshInterval()):
 		}
 		if ctx.Err() != nil {
 			return
@@ -462,8 +544,8 @@ func (p *Parts) Status() any {
 		"lastCheck": map[string]any{
 			"ok":        okValue,
 			"dropped":   dropped,
-			"nodes":     len(outs), // 前端 checkAlert 的「N 个节点正常启用」读它
-			"probation": p.Registry.ProbationCount(),
+			"nodes":     len(outs),     // 前端 checkAlert 的「N 个节点正常启用」读它
+			"probation": p.coldCount(), // 1.3.0:观察期语义并入冷区(dead 节点数)
 			"at":        lastRebuildAt,
 			"mode":      mode,
 			"error":     lastErr,
@@ -555,7 +637,7 @@ func (p *Parts) Status() any {
 	return map[string]any{
 		// probing 供面板把「探测中」渲染成状态而不是本地布尔:探测改异步
 		// 受理后(F5),前端不再自己维护探测期。
-		"probing":      p.probing.Load(),
+		"probing":      p.probingActive(),
 		"singbox":      singbox,
 		"forward":      forward,
 		"lanes":        lanes,
@@ -648,17 +730,19 @@ func (p *Parts) setSettings(next Settings) {
 func (p *Parts) SettingsView() map[string]any {
 	s := p.settingsSnapshot()
 	return map[string]any{
-		"subUrls":          s.SubURLs,
-		"countries":        s.Countries,
-		"probeEnabled":     s.ProbeEnabled,
-		"probeWorkers":     s.ProbeWorkers,
-		"probeIntervalMin": s.ProbeIntervalMin,
-		"effortLevel":      s.EffortLevel,
-		"defaultMaxTokens": s.DefaultMaxTokens,
-		"forwardPort":      s.ForwardPort,
-		"panelPort":        s.PanelPort,
-		"maxWallClockMs":   s.MaxWallClockMS,
-		"exitConcurrency":  s.ExitConcurrency,
+		"subUrls":            s.SubURLs,
+		"countries":          s.Countries,
+		"probeEnabled":       s.ProbeEnabled,
+		"probeWorkers":       s.ProbeWorkers,
+		"refreshIntervalMin": s.RefreshIntervalMin,
+		"hotIntervalSec":     s.HotIntervalSec,
+		"coldIntervalSec":    s.ColdIntervalSec,
+		"effortLevel":        s.EffortLevel,
+		"defaultMaxTokens":   s.DefaultMaxTokens,
+		"forwardPort":        s.ForwardPort,
+		"panelPort":          s.PanelPort,
+		"maxWallClockMs":     s.MaxWallClockMS,
+		"exitConcurrency":    s.ExitConcurrency,
 	}
 }
 
@@ -731,7 +815,8 @@ func (p *Parts) ApplySettings(patch map[string]any) (Settings, error) {
 func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 	clean := map[string]any{}
 	for _, key := range []string{
-		"subUrls", "countries", "probeEnabled", "probeWorkers", "probeIntervalMin",
+		"subUrls", "countries", "probeEnabled", "probeWorkers",
+		"refreshIntervalMin", "hotIntervalSec", "coldIntervalSec",
 		"effortLevel", "defaultMaxTokens", "forwardPort", "panelPort", "maxWallClockMs",
 		"exitConcurrency",
 	} {
@@ -801,7 +886,8 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 			} else {
 				clean[key] = n
 			}
-		case "probeWorkers", "probeIntervalMin", "forwardPort", "panelPort", "exitConcurrency":
+		case "probeWorkers", "forwardPort", "panelPort", "exitConcurrency",
+			"refreshIntervalMin", "hotIntervalSec", "coldIntervalSec":
 			n, ok := settingsInt(v)
 			if !ok {
 				return nil, fmt.Errorf("app: 设置 %s 必须是整数", key)
@@ -827,17 +913,16 @@ func validateSettingsPatch(patch map[string]any) (map[string]any, error) {
 				if n > 128 {
 					return nil, fmt.Errorf("app: 设置 probeWorkers 不能超过 128")
 				}
-			case "probeIntervalMin":
-				// 必须有上限(生命周期审计 #2):probeInterval() 算的是
-				// time.Duration(minutes)*time.Minute,而 settingsInt 放行到
-				// ±2^53。minutes 超过约 1.5 亿时这个乘法**溢出成 ≤0**,
-				// probeLoop 的 time.After(≤0) 立即就绪 → 整轮 O(pool) 缓存
-				// 扫描的空转循环,探测预算全部烧在 spin 上。下限 5 在
-				// probeInterval() 的读取处 clamp(0..4 归 5),这里只管上限:
-				// 30 天(43200 分钟)已是操作上无意义的长(真要停探有
-				// probeEnabled 开关),且比溢出点低三个数量级。
-				if n > 43200 {
-					return nil, fmt.Errorf("app: 设置 probeIntervalMin 不能超过 43200（30 天）")
+			case "refreshIntervalMin", "hotIntervalSec", "coldIntervalSec":
+				// 三档间隔的读取处有 clamp(与 PUT 校验同口径),这里只管
+				// 上限 —— 手改 settings.json 的超大值在这里拦下。
+				caps := map[string]int{
+					"refreshIntervalMin": 10080, // 7 天(分钟)
+					"hotIntervalSec":     3600,  // 1 小时
+					"coldIntervalSec":    86400, // 1 天
+				}
+				if n > caps[key] {
+					return nil, fmt.Errorf("app: 设置 %s 不能超过 %d", key, caps[key])
 				}
 			case "exitConcurrency":
 				// 0 = 不限是合法值;上限取 128 与 probeWorkers 同级 —— 超过
@@ -927,4 +1012,16 @@ func topBuckets(all map[string]stats.Bucket, n int) map[string]stats.Bucket {
 		out[e.k] = all[e.k]
 	}
 	return out
+}
+
+// coldCount 是冷区(dead)节点数:面板的「观察期」数字在 1.3.0 双档模型里
+// 的对应物。一次快照算完,不逐 tag 锁往返。
+func (p *Parts) coldCount() int {
+	n := 0
+	for _, view := range p.Health.NodeSnapshot() {
+		if view.State == health.StateDead {
+			n++
+		}
+	}
+	return n
 }

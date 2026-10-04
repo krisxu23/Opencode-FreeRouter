@@ -88,8 +88,12 @@ type row struct {
 	ExitCountry string    `json:"exitCountry"`
 	GeoMismatch bool      `json:"geoMismatch"`
 	LastProbeAt int64     `json:"lastProbeAt,omitempty"`
-	Tier        Tier      `json:"tier,omitempty"`
-	LastQuotaAt int64     `json:"lastQuotaAt,omitempty"`
+	// Streak 是连续失败的 pass 轮数(1.3.0 双档状态机):热区连续 2 轮失败降
+	// 冷区,冷区连续 3 轮失败触发「彻底删除」;任何一次通过清零。持久化是为了
+	// 重启后删除计数不归零。
+	Streak      int   `json:"streak,omitempty"`
+	Tier        Tier  `json:"tier,omitempty"`
+	LastQuotaAt int64 `json:"lastQuotaAt,omitempty"`
 }
 
 // NodeView is row plus the cooling overlay the panel shows. It is a separate
@@ -420,6 +424,70 @@ func (h *Health) ClearQuotaMark(nodeKey string) {
 
 // MarkProbe 应用一轮粗探(零配额 HTTP 闸门)的判决,通关即 tier A。
 // (src/health.js:244-307)
+// MarkPassSuccess 记一轮 pass 通过(或一次数据面成功):状态归 alive、连败
+// 清零、LastProbeAt 刷新。行不存在(冷区节点被数据面信号捞到?理论不可达;
+// 健康表损坏?)时建一行 —— 保守地按 alive 处理,交给下一轮 pass 复核。
+func (h *Health) MarkPassSuccess(nodeKey string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now().UnixMilli()
+	r, ok := h.nodes[nodeKey]
+	if !ok {
+		r = row{State: StateAlive, LatencyMS: -1}
+	}
+	r.State = StateAlive
+	r.Streak = 0
+	r.LastProbeAt = now
+	h.nodes[nodeKey] = r
+}
+
+// MarkPassFail 记一轮 pass 失败(或一次数据面连通性失败),推进双档状态机:
+//   - 热区(alive)连续 2 轮失败 → 降冷区(State=dead,streak 归零重数);
+//   - 冷区(dead)连续 3 轮失败 → 返回 "delete",由调用方执行彻底删除
+//     (注册表条目 + 健康行,零记录)。allowDelete=false(数据面失败)时不
+//     触发删除 —— 删除是冷区 pass 的专属判决。
+//
+// unknown 语义不变:调用方对 unknown/未测节点不调本方法。行不存在返回 ""。
+func (h *Health) MarkPassFail(nodeKey string, allowDelete bool) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now().UnixMilli()
+	r, ok := h.nodes[nodeKey]
+	if !ok {
+		return ""
+	}
+	r.Streak++
+	switch r.State {
+	case StateDead:
+		if allowDelete && r.Streak >= coldDeleteAfter {
+			delete(h.nodes, nodeKey)
+			return "delete"
+		}
+		r.LastProbeAt = now
+		h.nodes[nodeKey] = r
+		return ""
+	default: // alive(热区)
+		if r.Streak >= hotDemoteAfter {
+			r.State = StateDead
+			r.Streak = 0 // 降档重数:冷区的 3 次从进冷区起算
+			r.LastProbeAt = now
+			h.nodes[nodeKey] = r
+			return "demote"
+		}
+		r.LastProbeAt = now
+		h.nodes[nodeKey] = r
+		return ""
+	}
+}
+
+// hotDemoteAfter / coldDeleteAfter 是双档状态机的两个门槛(1.3.0 定稿:
+// 热区连续 2 轮失败降冷;冷区连续 3 轮失败删除)。降档时 streak 归零,
+// 两个门槛各数各的。
+const (
+	hotDemoteAfter  = 2
+	coldDeleteAfter = 3
+)
+
 func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
 	// state == "unknown" 是本轮不完整(probeAll 的超时兜底),不是判决:整行
 	// 原样保留,既不刷新 lastProbeAt 也不改写 state。把它当 dead 会凭一次调度

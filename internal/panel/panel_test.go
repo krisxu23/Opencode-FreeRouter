@@ -258,8 +258,11 @@ func TestBootSettingsWhitelistCoversEveryFormKey(t *testing.T) {
 	// 无条件回写的**往返键**全集。少给一个,冷启动读 undefined、下次保存就
 	// 把该字段清零 —— H2 的病根。forwardPort/panelPort 不在这条往返里
 	// (改了要重启,由别处单独展示),所以不列。
+	// 1.3.0:probeIntervalMin 退役,被三档间隔(refresh/hot/cold)取代 ——
+	// 前端往返键集必须跟着换,否则这条白名单钉会拿旧键去查新 boot 视图。
 	formKeys := []string{
-		"subUrls", "countries", "probeEnabled", "probeWorkers", "probeIntervalMin",
+		"subUrls", "countries", "probeEnabled", "probeWorkers",
+		"refreshIntervalMin", "hotIntervalSec", "coldIntervalSec",
 		"effortLevel", "defaultMaxTokens", "maxWallClockMs", "exitConcurrency",
 	}
 	dir := writeAssets(t, goodShell, "console.log('app')\n")

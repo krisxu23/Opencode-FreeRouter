@@ -101,30 +101,6 @@ func TestShutdownCapsTheTimerJoin(t *testing.T) {
 	}
 }
 
-// TestProbeRerunDoesNotOutliveShutdown 钉住 B9 最刺眼的那条复活路径:
-// finishProbeRound 安排的一秒重跑从前写死 context.Background(),是四个复活点
-// 里唯一连 ctx.Err() 都不查的 —— 关停之后它真的会跑完一整轮探测。
-func TestProbeRerunDoesNotOutliveShutdown(t *testing.T) {
-	p := newProbeParts(t, 3)
-	armLifecycle(p)
-	prober := p.Prober.(*fakeProber)
-
-	p.markRerun(true)
-	p.finishProbeRound() // 排一秒后的重跑
-
-	if err := p.Shutdown(context.Background()); err != nil {
-		t.Fatalf("Shutdown: %v", err)
-	}
-	time.Sleep(1300 * time.Millisecond)
-
-	prober.mu.Lock()
-	rounds := prober.allCnt
-	prober.mu.Unlock()
-	if rounds != 0 {
-		t.Fatalf("关停后仍跑了 %d 轮探测, want 0", rounds)
-	}
-}
-
 // TestRebuildReportsSubscriptionFailure 钉住 B11 的用户可见面:订阅全挂时
 // Rebuild 必须回错误,面板「刷新」才不会再对着一次全军覆没 toast 成功。
 func TestRebuildReportsSubscriptionFailure(t *testing.T) {

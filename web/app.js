@@ -153,7 +153,11 @@
       effortLevel: s.effortLevel || 'balanced',
       defaultMaxTokens: s.defaultMaxTokens == null ? '' : String(s.defaultMaxTokens),
       probeWorkers: String(s.probeWorkers == null ? 24 : s.probeWorkers),
-      probeIntervalMin: String(s.probeIntervalMin == null ? 30 : s.probeIntervalMin),
+      /* 1.3.0:probeIntervalMin 退役,被三档间隔取代(热区复检/冷区扫描/
+         订阅刷新)。旧键既不进表单也不再回写 —— 盘上的遗留值由后端忽略。 */
+      refreshIntervalMin: String(s.refreshIntervalMin == null ? 30 : s.refreshIntervalMin),
+      hotIntervalSec: String(s.hotIntervalSec == null ? 60 : s.hotIntervalSec),
+      coldIntervalSec: String(s.coldIntervalSec == null ? 300 : s.coldIntervalSec),
       maxWallClockMs: String(s.maxWallClockMs == null ? 0 : s.maxWallClockMs),
       exitConcurrency: String(s.exitConcurrency == null ? 0 : s.exitConcurrency),
     }
@@ -455,7 +459,7 @@
         + '<div class="r"><span class="k">层级</span><span class="v">A ' + D.probe.a + ' · B ' + D.probe.b + '</span></div>'
         + '<div class="r"><span class="k">探测耗时</span><span class="v">' + D.probe.secs + 's</span></div>'
         + '<div class="r"><span class="k">完成于</span><span class="v">' + fmtTime(D.probe.at) + '</span></div>'
-        + '<div class="r"><span class="k">下次自动</span><span class="v">' + esc(S.form.probeIntervalMin) + ' 分钟后</span></div>'
+        + '<div class="r"><span class="k">下次自动</span><span class="v">' + esc(S.form.hotIntervalSec) + ' 秒后（热区复检）</span></div>'
         + '</div>'
       : '        <div class="empty">还没有探测记录</div>')
     /* 真实接口是阻塞的，拿不到进度百分比——用不定态进度条，不编造数字 */
@@ -599,7 +603,7 @@
     + '  </div>'
     + '  <div class="note note-info" style="margin-top:14px">' + I.info
     + '    <div><b>层级说明</b>：<b>B 级</b> = 已验证可通过上游区域校验，可服务全部模型（含受限模型）；'
-    + '<b>A 级</b> = 仅粗粒度可达，受限模型会绕开它。探测每 ' + esc(S.form.probeIntervalMin) + ' 分钟自动跑一轮。'
+    + '<b>A 级</b> = 仅粗粒度可达，受限模型会绕开它。热区每 ' + esc(S.form.hotIntervalSec) + ' 秒复检一轮，冷区每 ' + esc(Math.round(Number(S.form.coldIntervalSec) / 60)) + ' 分钟扫一轮复活。'
     + '<br><b>延迟条</b>用平方根压缩刻度（封顶 10s）——节点延迟跨度达 60 倍，线性刻度会让快节点全部贴地看不出差别。'
     + '绿色 &lt;1.5s、琥珀色 &gt;5s。</div></div>'
     + '</div>'
@@ -926,10 +930,15 @@
     + '      <div class="inline" style="gap:20px">'
     + '        <label class="inline"><input type="checkbox" id="f-probeEnabled"' + (S.form.probeEnabled ? ' checked' : '') + '> 自动探测</label>'
     + '        <label class="inline">探测并发 <input type="number" id="f-probeWorkers" value="' + esc(S.form.probeWorkers) + '" style="width:76px" min="1" max="128"></label>'
-    + '        <label class="inline">探测周期 <input type="number" id="f-probeIntervalMin" value="' + esc(S.form.probeIntervalMin) + '" style="width:76px" min="5" max="43200"> 分钟</label>'
+    + '      </div>'
+    + '      <div class="inline" style="gap:20px;margin-top:8px">'
+    + '        <label class="inline">热区复检 <input type="number" id="f-hotIntervalSec" value="' + esc(S.form.hotIntervalSec) + '" style="width:76px" min="15" max="3600"> 秒</label>'
+    + '        <label class="inline">冷区扫描 <input type="number" id="f-coldIntervalSec" value="' + esc(S.form.coldIntervalSec) + '" style="width:86px" min="60" max="86400"> 秒</label>'
+    + '        <label class="inline">订阅刷新 <input type="number" id="f-refreshIntervalMin" value="' + esc(S.form.refreshIntervalMin) + '" style="width:76px" min="5" max="10080"> 分钟</label>'
     + '      </div>'
     + '      <div class="help">并发越高越快，但更容易触发上游限流。当前 ' + D.nodes.length + ' 个节点，'
-    + '一轮约需 ' + Math.max(10, Math.round(D.nodes.length / Math.max(1, Number(S.form.probeWorkers) || 24) * 15)) + ' 秒。</div>'
+    + '一轮约需 ' + Math.max(10, Math.round(D.nodes.length / Math.max(1, Number(S.form.probeWorkers) || 24) * 15)) + ' 秒。'
+    + '间隔从上一轮**完整结束**后起算，一轮跑多久都不会堆积。</div>'
     + '    </div></div>'
 
     + '  <div class="card sec"><div class="card-head"><h2>模型与输出</h2></div>'
@@ -1035,7 +1044,8 @@
   /* ── 未保存检测 ─────────────────────────────────────────────────── */
   const FIELD_LABEL = {
     subUrls:'订阅链接', probeEnabled:'自动探测', effortLevel:'思考强度',
-    defaultMaxTokens:'输出上限', probeWorkers:'探测并发', probeIntervalMin:'探测周期',
+    defaultMaxTokens:'输出上限', probeWorkers:'探测并发',
+    hotIntervalSec:'热区复检间隔', coldIntervalSec:'冷区扫描间隔', refreshIntervalMin:'订阅刷新间隔',
     maxWallClockMs:'墙钟上限', exitConcurrency:'单出口并发上限',
   }
   function dirtyKeys() {
@@ -1216,11 +1226,12 @@
       probeEnabled: S.form.probeEnabled,
       /* 后端硬上限 128，HTML 的 max 只是提示。前端 clamp 而不是放行 400 */
       probeWorkers: Math.min(128, Math.max(1, Number(S.form.probeWorkers) || 24)),
-      /* 探测周期上限 43200(30 天)是后端硬闸:time.Duration(分钟)*分钟在约
-         1.5 亿处溢出成 <=0,probeLoop 退化成零睡眠自旋(生命周期审计 #2)。
-         下限 5 与后端运行时 clamp 同口径 —— 过去填 1 能保存、能显示,实际每 5
-         分钟一轮,展示与事实不符。同一纪律:前端 clamp,不放行 400。 */
-      probeIntervalMin: Math.min(43200, Math.max(5, Math.round(Number(S.form.probeIntervalMin) || 30))),
+      /* 1.3.0 三档间隔:clamp 与后端读取处/PUT 校验同口径(热 15..3600 秒、
+         冷 60..86400 秒、订阅刷新 5..10080 分钟)。同一纪律:前端 clamp,
+         不放行 400。旧 probeIntervalMin 退役,不再回写。 */
+      hotIntervalSec: Math.min(3600, Math.max(15, Math.round(Number(S.form.hotIntervalSec) || 60))),
+      coldIntervalSec: Math.min(86400, Math.max(60, Math.round(Number(S.form.coldIntervalSec) || 300))),
+      refreshIntervalMin: Math.min(10080, Math.max(5, Math.round(Number(S.form.refreshIntervalMin) || 30))),
       /* 0 = 不限(默认)；负数按 0 归一 */
       maxWallClockMs: Math.max(0, Math.round(Number(S.form.maxWallClockMs) || 0)),
       /* 0 = 不限(默认)；同一出口 IP 的最大在途数 */
@@ -1382,7 +1393,8 @@
     if (t.id === 'nodeQ') { S.nodeQ = t.value; rerenderSoft(); return }
     if (t.id === 'logQ') { S.logQ = t.value; rerenderSoft(); return }
     const fmap = {
-      'f-subUrls':'subUrls', 'f-probeWorkers':'probeWorkers', 'f-probeIntervalMin':'probeIntervalMin',
+      'f-subUrls':'subUrls', 'f-probeWorkers':'probeWorkers', 'f-hotIntervalSec':'hotIntervalSec',
+      'f-coldIntervalSec':'coldIntervalSec', 'f-refreshIntervalMin':'refreshIntervalMin',
       'f-effortLevel':'effortLevel', 'f-defaultMaxTokens':'defaultMaxTokens', 'f-maxWallClockMs':'maxWallClockMs',
       'f-exitConcurrency':'exitConcurrency',
     }

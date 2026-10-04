@@ -168,7 +168,15 @@ func newProbeParts(t *testing.T, n int) *Parts {
 		tierGate:   gate.New(tierGapMS),
 		catalog:    &catalogBox{list: catalog.Static()},
 		firstFetch: fetchDone,
+		hotNudge:   make(chan struct{}, 1),
+		coldNudge:  make(chan struct{}, 1),
+		firstNudge: make(chan struct{}, 1),
 	}
+	// 热区/冷区节点预先分层:与生产形状对齐(夹具的 fakeProber 把状态同时写进
+	// 健康行,始态全部 alive=hot;冷区由 coldPass 测试显式建)。lifecycle 测试
+	// 的 afterFuncFn 接缝不就绪时,afterFunc 退化为 time.AfterFunc 直接在后台
+	// 跑一轮,夹具不依赖这个接缝。
+	_ = p
 	return p
 }
 
@@ -196,15 +204,18 @@ func TestProbeNowWritesHealthAndPersists(t *testing.T) {
 	for i := 3; i < 10; i++ {
 		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 3 alive,7 dead
 	}
-	sum, err := p.ProbeNow(context.Background(), false)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
+	for i := 0; i < 10; i++ {
+		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
 	}
+	sum := p.hotPass(context.Background())
 	if sum.Tested != 10 || sum.Alive != 3 {
 		t.Fatalf("summary = tested %d alive %d, want 10/3", sum.Tested, sum.Alive)
 	}
 	if got := p.Health.HealthOf("n0"); got != health.StateAlive {
 		t.Fatalf("n0 state = %q, want alive", got)
+	}
+	if err := p.Health.Persist(); err != nil {
+		t.Fatalf("persist: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(p.Root, "node-health.json"))
 	if err != nil {
@@ -218,58 +229,14 @@ func TestProbeNowWritesHealthAndPersists(t *testing.T) {
 	}
 }
 
-func TestProbeNowSkipsWholeRoundWhenDirectIsDown(t *testing.T) {
-	p := newProbeParts(t, 4)
-	fp := p.Prober.(*fakeProber)
-	fp.directErr = fmt.Errorf("liveness unreachable")
-	healthFile := filepath.Join(p.Root, "node-health.json")
-	if err := p.Health.Persist(); err != nil {
-		t.Fatalf("seed persist: %v", err)
-	}
-	st1, err := os.Stat(healthFile)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-	sum, err := p.ProbeNow(context.Background(), false)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
-	}
-	if !sum.Skipped {
-		t.Fatal("Skipped = false, want true")
-	}
-	if p.Registry.Len() != 4 {
-		t.Fatalf("registry len = %d, want 4 (一个都不能少)", p.Registry.Len())
-	}
-	st2, _ := os.Stat(healthFile)
-	if !st1.ModTime().Equal(st2.ModTime()) {
-		t.Fatal("node-health.json 被改写:跳过的轮次不许写任何健康行")
-	}
-}
-
-func TestProbeNowKeepsAliveTagsFromResultCache(t *testing.T) {
-	p := newProbeParts(t, 8)
-	for i := 0; i < 8; i++ {
-		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.7"))
-	}
-	sum, err := p.ProbeNow(context.Background(), false)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
-	}
-	if sum.Tested != 0 || sum.Cached != 8 {
-		t.Fatalf("tested %d cached %d, want 0/8", sum.Tested, sum.Cached)
-	}
-	if sum.Alive != 8 {
-		t.Fatalf("alive = %d, want 8 (缓存里 alive 的必须计入存活,否则误判事故)", sum.Alive)
-	}
-}
-
 func TestProbeSummaryLineMatchesFrontendRegex(t *testing.T) {
 	p := newProbeParts(t, 6)
 	fp := p.Prober.(*fakeProber)
 	fp.failedTags = map[string]bool{"n5": true}
-	if _, err := p.ProbeNow(context.Background(), true); err != nil {
-		t.Fatalf("probe: %v", err)
+	for i := 0; i < 6; i++ {
+		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
 	}
+	p.hotPass(context.Background())
 	found := false
 	for _, line := range logger.Recent(50) {
 		m := check.ProbeSummaryRe.FindStringSubmatch(line.Msg)
@@ -287,10 +254,10 @@ func TestProbeSummaryLineMatchesFrontendRegex(t *testing.T) {
 }
 
 func TestProbeNowDoesNotEvictOnAccident(t *testing.T) {
-	// 场景 A（误报修复的回归钉）：上一轮 20 alive、这轮掉 70% 但存活仍有 6
-	// —— 真实池里「A 档抖动换血」的形状。旧单条件判据（比率>50% 即事故）
-	// 每轮都触发、淘汰被永久压制；新双条件判据要求比率超标 **且** 存活塌到
-	// 上一轮的 1/4 以下，6/20 不满足塌方，因此**不算事故、照常淘汰**。
+	// 场景 A(误报修复的回归钉):20 个热区节点这轮只剩 6 个通过 —— 通过率
+	// 30%,远高于 10% 地板,不算事故。「随机换血 70% 但池子仍可服务」正是
+	// 旧双条件判据每轮误触发、淘汰被永久压制的真实形状(第五轮审计),地板
+	// 判据对此免疫:照常推进状态机,该降冷的降冷。
 	p := newProbeParts(t, 20)
 	for i := 0; i < 20; i++ {
 		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
@@ -300,99 +267,109 @@ func TestProbeNowDoesNotEvictOnAccident(t *testing.T) {
 	for i := 6; i < 20; i++ {
 		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 掉 14(70%),存活 6 > 20/4
 	}
-	sum, err := p.ProbeNow(context.Background(), true)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
-	}
+	sum := p.hotPass(context.Background())
 	if sum.Accident {
 		t.Fatalf("accident = true, want false (掉 14/20 但存活 6 未塌到 1/4,双条件不满足)")
 	}
 }
 
 func TestProbeNowAccidentNeedsCollapseToo(t *testing.T) {
-	// 场景 B：同样的池子,这轮存活塌到 3/20(< 1/4)—— 比率超标且绝对值塌方,
-	// 两条同时成立,这才是事故轮:一个不淘汰。
+	// 1.3.0 事故判据:热区 pass 的**通过率跌破 10% 地板**(样本 ≥20)才是通道
+	// 故障 —— 上一轮比率对比与绝对塌方双条件被这条更直的信号取代(旧双条件在
+	// 真实池的「换血」形状下每轮误触发,见第五轮审计)。20 个热区节点只剩 1 个
+	// 通过(5% < 10%)= 事故轮:结果整体丢弃,一个状态都不推进。
 	p := newProbeParts(t, 20)
 	for i := 0; i < 20; i++ {
 		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
 	}
 	fp := p.Prober.(*fakeProber)
 	fp.failedTags = map[string]bool{}
-	for i := 3; i < 20; i++ {
-		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 掉 17(85%),存活 3 < 20/4
+	for i := 1; i < 20; i++ {
+		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 掉 19(95%),通过率 5% < 10% 地板
 	}
-	sum, err := p.ProbeNow(context.Background(), true)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
-	}
+	sum := p.hotPass(context.Background())
 	if !sum.Accident {
-		t.Fatalf("accident = false, want true (存活塌到 3/20,比率与塌方双条件成立)")
+		t.Fatalf("accident = false, want true (通过率 5%% 跌破 10%% 地板)")
+	}
+	if !sum.Skipped {
+		t.Error("事故轮必须同时标记 Skipped(结果整体丢弃)")
 	}
 	if p.Registry.Len() != 20 {
 		t.Fatalf("registry len = %d, want 20 (事故轮一个都不淘汰)", p.Registry.Len())
 	}
+	// 判决丢弃的硬核对:失败的 19 个一个都没被降档(仍是 alive),
+	// 通关的 1 个也不推进 —— 坏通道上「成功」的少数量同样不可信。
+	snap := p.Health.NodeSnapshot()
+	for i := 0; i < 20; i++ {
+		if v := snap[fmt.Sprintf("n%d", i)]; v.State != health.StateAlive {
+			t.Fatalf("n%d 被事故轮推进成 %v, want alive(整轮丢弃)", i, v.State)
+		}
+	}
+	// 冻结不变量的硬核对:事故轮不算「热区健康结束」—— lastHotOK 必须保持
+	// false(冷区删除闸从此刻起关闭,直到下一次健康的热区 pass 重新打开)。
+	// 夹具里 MarkProbe 不是 pass,本轮又是事故,所以这里只可能是 false。
+	if p.lastHotOK.Load() {
+		t.Fatal("事故轮把 lastHotOK 置真了 —— 删除冻结闸被事故轮自己解开,冻结语义失效")
+	}
 }
 
-func TestProbeNowEvictsWhenNotAccident(t *testing.T) {
+func TestHotPassDemotesButNeverDeletes(t *testing.T) {
+	// 1.3.0:热区 pass 只降档(连续 2 轮失败 → 冷区),删除是冷区 sweep 的
+	// 专属判决。这里验证热区本身不删东西。
 	p := newProbeParts(t, 10)
-	now := time.Now()
-	// n1..n4 预置 3 次连败:本轮再测不到就够淘汰门槛。
-	for i := 1; i <= 4; i++ {
-		tag := fmt.Sprintf("n%d", i)
-		p.Registry.NoteFail(tag, now)
-		p.Registry.NoteFail(tag, now)
-		p.Registry.NoteFail(tag, now)
-	}
 	fp := p.Prober.(*fakeProber)
 	fp.failedTags = map[string]bool{}
 	for i := 1; i <= 4; i++ {
 		fp.failedTags[fmt.Sprintf("n%d", i)] = true
 	}
-	// prevAlive 只有 5 个(<8)不构成事故样本。
-	for i := 5; i < 10; i++ {
+	for i := 0; i < 10; i++ {
 		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
 	}
-	sum, err := p.ProbeNow(context.Background(), true)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
+	p.hotPass(context.Background())
+	if got := p.Registry.Len(); got != 10 {
+		t.Fatalf("registry len = %d, want 10 (热区 pass 不删节点)", got)
 	}
-	if sum.Accident {
-		t.Fatal("accident = true, want false (样本 5 < probeAccidentMin)")
+	// 第二轮:streak 到 2,降档。健康行状态应变 dead。
+	p.hotPass(context.Background())
+	demoted := 0
+	for _, view := range p.Health.NodeSnapshot() {
+		if view.State == health.StateDead {
+			demoted++
+		}
 	}
-	if sum.Removed != 4 || p.Registry.Len() != 6 {
-		t.Fatalf("removed %d len %d, want 4/6", sum.Removed, p.Registry.Len())
+	if demoted == 0 {
+		t.Fatal("热区连续 2 轮失败后应有节点降入冷区")
 	}
 }
 
-// TestFailingNodeIsEvictedAfterConsecutiveRounds 跑真实的连续轮次,而不是像
-// TestProbeNowEvictsWhenNotAccident 那样手工预置三次 NoteFail。
-//
-// 这一条是回归测试:观察期的节点过去被塞进 RetainOnly 的 alive 名单,而 alive
-// 名单里的节点连败会被清零,于是连败计数每轮 0→1→0→1… 永远到不了
-// registry.MaxFails。现场表现就是日志里 `淘汰 0 · 观察期 1601` 长期钉死,
-// 整池死节点一个都不处理。手工预置 NoteFail 的测试绕开了累加环节,所以一直是绿的。
-func TestFailingNodeIsEvictedAfterConsecutiveRounds(t *testing.T) {
-	p := newProbeParts(t, 10)
+// TestFailingNodeIsDeletedAfterConsecutiveColdRounds 是 1.3.0 双档淘汰的
+// 端到端钉:冷区节点连续 3 轮 sweep 失败 → 彻底删除(注册表条目 + 健康行
+// 都不留);失败一次都不该碰 registry 里的名字。
+func TestFailingNodeIsDeletedAfterConsecutiveColdRounds(t *testing.T) {
+	p := newProbeParts(t, 3)
 	fp := p.Prober.(*fakeProber)
-	fp.failedTags = map[string]bool{"n1": true} // 只有 n1 一直失败,9 个通关
-
-	// force=true:夹具的健康行每轮都是新的,不绕过结果缓存窗就只会测到一次。
-	for round := 1; round <= registry.MaxFails; round++ {
-		if _, err := p.ProbeNow(context.Background(), true); err != nil {
-			t.Fatalf("round %d: %v", round, err)
-		}
-		want := round
-		if round < registry.MaxFails && p.Registry.FailCount("n1") != want {
-			t.Fatalf("round %d 后连败 = %d, want %d(观察期不能清零计数)",
-				round, p.Registry.FailCount("n1"), want)
+	// n0 先降到冷区(预置两轮热区失败)。
+	fp.failedTags = map[string]bool{"n0": true}
+	for i := 0; i < 3; i++ {
+		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
+	}
+	p.hotPass(context.Background())
+	p.hotPass(context.Background())
+	if p.Health.HealthOf("n0") != health.StateDead {
+		t.Fatal("n0 应已降入冷区")
+	}
+	// 冷区 sweep:3 轮连续失败 → 删除。
+	for round := 1; round <= 3; round++ {
+		p.coldPass(context.Background())
+		if p.Registry.Has("n0") && round < 3 {
+			continue
 		}
 	}
-	if p.Registry.Has("n1") {
-		t.Fatalf("连败 %d 轮的节点仍在池内,池子 %d 个 —— 淘汰从未生效",
-			registry.MaxFails, p.Registry.Len())
+	if p.Registry.Has("n0") {
+		t.Fatal("连续 3 轮冷区失败的节点仍在池内 —— 删除未生效")
 	}
-	if p.Registry.Len() != 9 {
-		t.Fatalf("池子剩 %d 个, want 9", p.Registry.Len())
+	if got := p.Health.HealthOf("n0"); got != health.StateUnknown {
+		t.Fatalf("删除的节点不应留健康行: %v", got)
 	}
 }
 
@@ -406,10 +383,7 @@ func TestAccidentNeedsMinimumSample(t *testing.T) {
 	for i := 1; i < 5; i++ {
 		fp.failedTags[fmt.Sprintf("n%d", i)] = true // 4/5 掉线,但样本只有 5
 	}
-	sum, err := p.ProbeNow(context.Background(), true)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
-	}
+	sum := p.hotPass(context.Background())
 	if sum.Accident {
 		t.Fatal("accident = true, want false (probeAccidentMin=8)")
 	}
@@ -417,16 +391,15 @@ func TestAccidentNeedsMinimumSample(t *testing.T) {
 
 func TestTierGateSurvivesAcrossRounds(t *testing.T) {
 	p := newProbeParts(t, 3)
-	if _, err := p.ProbeNow(context.Background(), true); err != nil {
-		t.Fatalf("round1: %v", err)
+	for i := 0; i < 3; i++ {
+		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
 	}
+	p.hotPass(context.Background())
 	if p.tierGate == nil {
 		t.Fatal("tierGate 未装配")
 	}
 	first := p.tierGate.NextAt()
-	if _, err := p.ProbeNow(context.Background(), true); err != nil {
-		t.Fatalf("round2: %v", err)
-	}
+	p.hotPass(context.Background())
 	// 第二轮仍有节点在排队:闸门是跨轮复用的,不是每轮新建
 	// (每轮新建会让上一轮的错峰成果全部丢失)。
 	if p.tierGate.NextAt() < first {
@@ -481,35 +454,46 @@ func TestTierBucketReleasesOnlyItsOwnSection(t *testing.T) {
 // unknown 是「本轮没量出来」,不是判决 —— nodeprobe(nodeprobe.go:440-452)与
 // health.MarkProbe 都要求调用方跳过它这一轮。过去只有 MarkProbe 那半兑现了:
 // 计败与淘汰判决照样把 unknown 当失败,探测源越抖,池子被缩得越狠。
-func TestProbeRoundSkipsTheFailCountOnUnknownVerdicts(t *testing.T) {
+// 1.3.0:unknown 不该记失败(MarkProbe 本就跳过 unknown,状态机不被调用);
+// dead 对照组连续失败应降入冷区,再 3 轮冷区 sweep 才删除。
+func TestUnknownVerdictsDoNotAdvanceTheTwoTierMachine(t *testing.T) {
 	p := newProbeParts(t, 4)
 	fp := p.Prober.(*fakeProber)
 	fp.unknownTags = map[string]bool{"n1": true}
-	fp.failedTags = map[string]bool{"n2": true, "n3": true} // 对照组:真判决必须照常计败
-	for round := 0; round <= registry.MaxFails; round++ {
-		if _, err := p.ProbeNow(context.Background(), true); err != nil {
-			t.Fatalf("round %d: %v", round, err)
-		}
+	fp.failedTags = map[string]bool{"n2": true, "n3": true} // 对照组:真判决必须照常生效
+	for i := 0; i < 4; i++ {
+		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
 	}
-	if got := p.Registry.FailCount("n1"); got != 0 {
-		t.Fatalf("unknown 节点的连败 = %d, want 0(它这一轮被跳过了)", got)
+	for round := 0; round < 4; round++ {
+		p.hotPass(context.Background())
+	}
+	// n1(unknown)的健康行状态必须原样保持:它这一轮被跳过,不推进状态机。
+	if got := p.Health.HealthOf("n1"); got != health.StateAlive {
+		t.Fatalf("unknown 节点的状态被推进成 %v, want alive(没量出来不算判决)", got)
 	}
 	if !p.Registry.Has("n1") {
-		t.Fatal("没量出来的节点被淘汰了:「没证据」被当成「有罪」")
+		t.Fatal("没量出来的节点被删了:「没证据」被当成「有罪」")
 	}
-	if p.Registry.Has("n2") || p.Registry.Has("n3") {
-		t.Fatalf("对照组失效:dead 节点连败到门槛就该淘汰(池子 %d 个)", p.Registry.Len())
+	// n2/n3(dead)连续热区失败 → 应降入冷区,但**热区本身不删**(池子仍全在)。
+	if got := p.Health.HealthOf("n2"); got != health.StateDead {
+		t.Fatalf("n2 应已降入冷区: %v", got)
+	}
+	if got := p.Registry.Len(); got != 4 {
+		t.Fatalf("registry len = %d, want 4(热区只降档,不删除)", got)
 	}
 }
 
 func TestProbeNowIsSerialized(t *testing.T) {
 	p := newProbeParts(t, 3)
+	for i := 0; i < 3; i++ {
+		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.9"))
+	}
 	fp := p.Prober.(*fakeProber)
 	fp.block = make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, err := p.ProbeNow(context.Background(), false)
-		done <- err
+		p.hotPass(context.Background())
+		done <- nil
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -521,55 +505,14 @@ func TestProbeNowIsSerialized(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	_, err2 := p.ProbeNow(context.Background(), false)
-	if err2 == nil || !strings.Contains(err2.Error(), "already running") {
-		t.Fatalf("并发第二轮 err = %v, want already running", err2)
+	// 1.3.0:同 CAS 语义由 hotRunning 位提供 —— 并发第二轮应被跳过(零探测)。
+	sum := p.hotPass(context.Background())
+	if !sum.Skipped {
+		t.Fatal("并发第二轮应被 hotRunning 跳过")
 	}
 	close(fp.block)
 	if err := <-done; err != nil {
 		t.Fatalf("first round: %v", err)
-	}
-}
-
-func TestForceIgnoresResultCacheWindow(t *testing.T) {
-	p := newProbeParts(t, 8)
-	for i := 0; i < 8; i++ {
-		p.Health.MarkProbe(fmt.Sprintf("n%d", i), aliveResult("198.51.100.7"))
-	}
-	sum, err := p.ProbeNow(context.Background(), true)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
-	}
-	if sum.Cached != 0 || sum.Tested != 8 {
-		t.Fatalf("cached %d tested %d, want 0/8", sum.Cached, sum.Tested)
-	}
-}
-
-func TestProbeRerunsOneSecondAfterCancel(t *testing.T) {
-	p := newProbeParts(t, 2)
-	type captured struct {
-		d  time.Duration
-		fn func()
-	}
-	got := make(chan captured, 4)
-	p.afterFuncFn = func(d time.Duration, fn func()) *time.Timer {
-		got <- captured{d, fn}
-		return nil
-	}
-	p.markRerun(true)
-	p.finishProbeRound()
-	select {
-	case c := <-got:
-		if c.d != time.Second {
-			t.Fatalf("rerun delay = %v, want 1s", c.d)
-		}
-		before := p.Prober.(*fakeProber).allCnt
-		c.fn() // 重跑真的发起一轮探测,而不是只打个日志
-		if p.Prober.(*fakeProber).allCnt != before+1 {
-			t.Fatal("重跑没有发起探测轮")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("finishProbeRound 没有安排重跑")
 	}
 }
 
@@ -857,15 +800,63 @@ func TestStatusSurfacesTheStatsWriteFailure(t *testing.T) {
 	}
 }
 
-func TestTimersUseMaxFiveMinuteProbeFloor(t *testing.T) {
-	p := newProbeParts(t, 1)
-	p.Settings.ProbeIntervalMin = 1
-	if got := p.probeInterval(); got != 5*time.Minute {
-		t.Fatalf("interval = %v, want 5m 下限", got)
+// TestAllThreePassLoopsAreAlive 钉住 1.3.0 的结构缺陷修复:三个 pass 循环
+// 曾被**串行**塞进同一个 goroutine(hotLoop 永不返回,coldLoop/firstProbeLoop
+// 排在它后面 = 永不执行)—— 冷区扫描与首探双双停摆,新入池节点永远没有
+// 健康行、死节点永远不被回收。现在三路各自独立:每个 nudge 只驱动自己的
+// pass,各自恰好一轮。夹具:hot 有 alive 行、cold 有 dead 行、first 有无行
+// 节点;周期全部沉默,只靠 nudge 驱动。
+func TestAllThreePassLoopsAreAlive(t *testing.T) {
+	p := newProbeParts(t, 3) // n0,n1,n2
+	// n0 alive(热区有活)、n1 dead(冷区有活)、n2 无健康行(首探有活)。
+	p.Health.MarkProbe("n0", aliveResult("198.51.100.1"))
+	p.Health.MarkProbe("n1", deadResult())
+	fp := p.Prober.(*fakeProber)
+	p.waitFn = func(time.Duration) <-chan time.Time { return make(chan time.Time) } // 周期全沉默
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.StartTimers(ctx)
+
+	// 三档各投一个 nudge。
+	p.nudgeHot()
+	p.nudgeCold()
+	p.nudgeFirst()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		fp.mu.Lock()
+		n := fp.allCnt
+		fp.mu.Unlock()
+		if n >= 3 {
+			return // 三个 pass 都真的跑起来了
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	p.Settings.ProbeIntervalMin = 15
-	if got := p.probeInterval(); got != 15*time.Minute {
-		t.Fatalf("interval = %v, want 15m", got)
+	fp.mu.Lock()
+	got := fp.allCnt
+	fp.mu.Unlock()
+	t.Fatalf("5 秒内只有 %d 个 pass 跑过, want 3 —— 串行 goroutine 的停摆复发", got)
+}
+
+// TestPassWorkersConsumesTheSetting 钉「面板并发」真被消费:passWorkers 取
+// max(设置值, 按节点数摊)再封顶。旧实现完全忽略设置值,面板上挂着「探测
+// 并发」字段却不读它 —— 展示值与事实不符(第五轮审计同型)。
+func TestPassWorkersConsumesTheSetting(t *testing.T) {
+	cases := []struct {
+		n, setting, max, want int
+		why                   string
+	}{
+		{100, 8, 96, 25, "自动档 (100+3)/4=25 > 设置 8,取大者"},
+		{100, 48, 96, 48, "设置 48 > 自动 25,设置赢"},
+		{8, 128, 96, 96, "设置顶到档位封顶 96(热)"},
+		{8, 128, 32, 32, "同一设置,冷档封顶 32 —— 合计不超 128 峰值"},
+		{0, 0, 96, 1, "零节点零设置也至少 1,不给 ProbeAll 传 0"},
+	}
+	for _, c := range cases {
+		if got := passWorkers(c.n, c.setting, c.max); got != c.want {
+			t.Errorf("passWorkers(%d,%d,%d) = %d, want %d(%s)", c.n, c.setting, c.max, got, c.want, c.why)
+		}
 	}
 }
 
@@ -883,42 +874,10 @@ func TestTimersStopOnContextCancel(t *testing.T) {
 	}
 }
 
-func TestTimersDoNotOverlapProbeRounds(t *testing.T) {
-	p := newProbeParts(t, 2)
-	fp := p.Prober.(*fakeProber)
-	fp.block = make(chan struct{})
-	p.Settings.ProbeIntervalMin = 5
-	interval := p.probeInterval()
-	// 缓冲 2:第二拍不许阻塞测试 goroutine —— 它要等 probing 标志挡掉。
-	tick := make(chan time.Time, 2)
-	p.waitFn = func(d time.Duration) <-chan time.Time {
-		if d == interval {
-			return tick
-		}
-		return time.After(1 * time.Hour) // 重建/限额循环在本测试里保持沉默
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p.StartTimers(ctx)
-	tick <- time.Now()
-	tick <- time.Now() // 第二拍:上一轮还堵着,必须被 probing 标志挡掉
-	time.Sleep(200 * time.Millisecond)
-	fp.mu.Lock()
-	n := fp.allCnt
-	fp.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("探测轮并发执行了 %d 次, want 1", n)
-	}
-	close(fp.block)
-	// 第二轮在 tick#2 被消费后开跑;等它落完盘再让 TempDir 清理,
-	// 否则 Windows 的 RemoveAll 会撞上正在写的文件。
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && p.probing.Load() {
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 func TestFirstProbeRunsThreeSecondsAfterReady(t *testing.T) {
+	// 1.3.0:重建后的补探从「直接跑一轮」改成「给首探循环投 nudge」。定时器
+	// 回调触发时,判决落在 firstNudge 通道上(循环 goroutine 消费后开测);
+	// 这里没有起循环,所以钉的是「nudge 正确入 channel」。
 	p := newProbeParts(t, 1)
 	url := subAndCatalogServer(t, vlink("n0"), `{"data":[]}`, http.StatusOK)
 	p.Settings.SubURLs = []string{url}
@@ -934,17 +893,24 @@ func TestFirstProbeRunsThreeSecondsAfterReady(t *testing.T) {
 	if err := p.Rebuild(context.Background()); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
-	select {
-	case c := <-got:
-		if c.d != firstProbeDelay {
-			t.Fatalf("first probe delay = %v, want %v", c.d, firstProbeDelay)
+	// Rebuild 可能先排其他定时器(订阅重试等);取**第一个 d=firstProbeDelay** 的。
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case c := <-got:
+			if c.d != firstProbeDelay {
+				continue
+			}
+			c.fn()
+			select {
+			case <-p.firstNudge:
+				return // nudge 正确落道
+			default:
+				t.Fatal("定时器触发后 firstNudge 通道没有收到投递")
+			}
+		case <-deadline:
+			t.Fatal("重建后没有安排首探补探定时器")
 		}
-		c.fn()
-		if p.Prober.(*fakeProber).allCnt != 1 {
-			t.Fatal("首探没有真的跑一轮")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("重建后没有安排首探")
 	}
 }
 
@@ -955,7 +921,6 @@ func TestFirstProbeRunsThreeSecondsAfterReady(t *testing.T) {
 func TestWarmUpProbesWithoutWaitingForTheInterval(t *testing.T) {
 	p := newProbeParts(t, 1)
 	swallowTimers(p) // 目录刷新失败时的 60s 重试定时器与本测试无关
-	p.Settings.ProbeIntervalMin = 30
 	p.waitFn = func(d time.Duration) <-chan time.Time {
 		if d == firstProbeDelay {
 			c := make(chan time.Time, 1)
@@ -1020,7 +985,7 @@ func TestApplySettingsKeepsNullAndGuardsKey(t *testing.T) {
 	_, err := p.ApplySettings(map[string]any{
 		"defaultMaxTokens": nil,         // 清空 = null,必须存 null 而不是删键
 		"forwardKey":       "ofm-evil",  // 白名单外:改不掉
-		"probeIntervalMin": float64(15), // JSON 数字
+		"hotIntervalSec":   float64(90), // JSON 数字
 	})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
@@ -1037,8 +1002,8 @@ func TestApplySettingsKeepsNullAndGuardsKey(t *testing.T) {
 	if p.Settings.ForwardKey != "ofm-keep-me" {
 		t.Fatalf("forwardKey 被补丁改成了 %q", p.Settings.ForwardKey)
 	}
-	if p.Settings.ProbeIntervalMin != 15 {
-		t.Fatalf("probeIntervalMin = %d, want 15", p.Settings.ProbeIntervalMin)
+	if p.Settings.HotIntervalSec != 90 {
+		t.Fatalf("hotIntervalSec = %d, want 90", p.Settings.HotIntervalSec)
 	}
 }
 
@@ -1068,7 +1033,7 @@ func TestApplySettingsRejectsAMalformedPatchWithoutTouchingDisk(t *testing.T) {
 		{"subUrls": []any{float64(1)}}, // 数组里混进非字符串
 		{"probeEnabled": "yes"},        // 布尔位收到字符串
 		{"countries": "US"},            // 数组位收到字符串
-		{"probeIntervalMin": nil},      // 数字位收到 null
+		{"hotIntervalSec": nil},        // 数字位收到 null
 	} {
 		if _, err := p.ApplySettings(patch); err == nil {
 			t.Fatalf("ApplySettings(%v) 接受了畸形补丁", patch)

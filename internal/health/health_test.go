@@ -172,6 +172,56 @@ func TestMarkTierProbeLeavesOtherVerdictsAlone(t *testing.T) {
 	}
 }
 
+// TestPassStateMachineTwoTierThresholds 直接钉 1.3.0 双档状态机的门槛本身
+// (app 层的 pass 测试只间接经过它)。规则:热区连续 2 轮失败降冷(streak 归零
+// 重数),冷区连续 3 轮失败删除;任何一次通过清零连败;allowDelete=false
+// (数据面信号)永不触发删除 —— 删除是冷区 pass 的专属判决。
+func TestPassStateMachineTwoTierThresholds(t *testing.T) {
+	h := NewHealth("")
+
+	// 行不存在:返回 ""(没有可推进的状态机)。
+	if got := h.MarkPassFail("ghost", true); got != "" {
+		t.Fatalf("无行节点 MarkPassFail = %q, want \"\"", got)
+	}
+
+	h.MarkPassSuccess("n1")
+	if h.HealthOf("n1") != StateAlive {
+		t.Fatal("MarkPassSuccess 必须建 alive 行(理论不可达路径的保守兜底)")
+	}
+	// 热区:第 1 轮失败 —— 不降档。
+	if got := h.MarkPassFail("n1", true); got != "" {
+		t.Fatalf("热区 1 败 = %q, want \"\"(门槛是 2)", got)
+	}
+	// 热区:第 2 轮失败 —— 降冷区,streak 归零重数。
+	if got := h.MarkPassFail("n1", true); got != "demote" {
+		t.Fatalf("热区 2 败 = %q, want demote", got)
+	}
+	if snap := h.NodeSnapshot(); snap["n1"].State != StateDead || snap["n1"].Streak != 0 {
+		t.Fatalf("降档后行 = %+v, want dead + streak 0", snap["n1"])
+	}
+	// 冷区:数据面信号(allowDelete=false)数满也不删。
+	h.MarkPassFail("n1", false)
+	h.MarkPassFail("n1", false)
+	if got := h.MarkPassFail("n1", false); got != "" {
+		t.Fatalf("allowDelete=false 数满 3 = %q, want \"\"(删除是冷区 pass 专属)", got)
+	}
+	// 中途一次通过:连败清零,3 次要从头数。
+	h.MarkPassSuccess("n1")
+	if snap := h.NodeSnapshot(); snap["n1"].State != StateAlive || snap["n1"].Streak != 0 {
+		t.Fatalf("复活后行 = %+v, want alive + streak 0", snap["n1"])
+	}
+	// 冷区满 3(delete 后行被删,节点回到「无行」)。
+	h.MarkProbe("n2", nodeprobe.ProbeResult{State: nodeprobe.StateDead, LatencyMS: 1})
+	h.MarkPassFail("n2", true)
+	h.MarkPassFail("n2", true)
+	if got := h.MarkPassFail("n2", true); got != "delete" {
+		t.Fatalf("冷区 3 败 = %q, want delete", got)
+	}
+	if _, ok := h.NodeSnapshot()["n2"]; ok {
+		t.Fatal("delete 之后必须不留健康行(零记录,墓碑已退役)")
+	}
+}
+
 func TestSurvivingCoarseProbeKeepsBTier(t *testing.T) {
 	h := NewHealth("")
 	h.MarkProbe("n1", aliveRes(100, "1.1.1.1", "US"))

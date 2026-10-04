@@ -115,6 +115,12 @@ const (
 type ProbeOptions struct {
 	TimeoutMS int
 	Attempts  int
+	// UpstreamOnly 把探测收窄成**单发上游闸门**（GET /zen/v1/models）：
+	// 不打 liveness、不做 echo、强制单次尝试。持续健康监测（热区/冷区
+	// pass）用这个模式 —— 上游可达是持续监测唯一关心的信号，liveness 与
+	// echo 是首探（全量三段）的职责；单发也让 60s 一次的热区复检成本
+	// 压到每节点一个请求。
+	UpstreamOnly bool
 }
 
 // ProbeResult 是单个节点的探测结论。
@@ -461,6 +467,51 @@ func (p *Prober) ProbeNode(ctx context.Context, dial httpclient.Dialer, timeoutM
 	}
 }
 
+// probeUpstream 是持续健康监测（热区/冷区 pass）的单发探针：只打上游闸门
+// 一次，成功即 alive。与全量三段的分工 ——
+//   - liveness 不打：上游可达蕴含出网，单独的「能出网」对持续监测没有增量信息；
+//   - echo 不做：出口 IP/国家是首探的职责（pass 频率下 echo 的第三方源会被
+//     我们自己打成热点）；
+//   - 单次尝试：下一轮 pass 在 hotIntervalSec 之后，瞬态失败由下一轮纠正，
+//     连败由 app 侧的状态机计数，不在这里用重试掩盖（全量探针的双次尝试是
+//     为了取延迟最小值，单发判活不需要）。
+//
+// 闸门被关掉（测试整体替换 URL 表）时退化为对 stage1URLs 的单发探测，保持
+// 测试可跑。
+func (p *Prober) probeUpstream(ctx context.Context, dial httpclient.Dialer, timeoutMs int) ProbeResult {
+	start := time.Now()
+	urls := []string{p.gate}
+	if p.gate == "" {
+		urls = p.stage1URLs()
+	}
+	judge := func(resp *http.Response, url string) (any, error) {
+		if p.gate != "" && url == p.gate {
+			if err := gateVerdict(resp); err != nil {
+				return nil, err
+			}
+		} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+			return nil, fmt.Errorf("reachability HTTP %d", resp.StatusCode)
+		}
+		return time.Since(start).Milliseconds(), nil
+	}
+	if v := firstSuccess(ctx, dial, urls, timeoutMs, func(url string) string {
+		if p.gate != "" && url == p.gate {
+			return GateProbeUA
+		}
+		return ProbeUA
+	}, judge); v != nil {
+		if ms, ok := v.(int64); ok {
+			return ProbeResult{State: StateAlive, LatencyMS: ms, LatencyMin: ms}
+		}
+	}
+	if ctx.Err() != nil {
+		// 与 ProbeNode 同一契约:取消不是判决(app 的取消守卫会整轮丢弃,
+		// unknown 让类型层面也守住「取消 ≠ dead」)。
+		return ProbeResult{State: StateUnknown, LatencyMS: time.Since(start).Milliseconds(), Incomplete: true}
+	}
+	return ProbeResult{State: StateDead, LatencyMS: time.Since(start).Milliseconds()}
+}
+
 // ProbeAll 有界并发粗探测，移植自 src/nodeprobe.js:305。
 //
 // 每个 worker 有自己的**超时兜底**。probeNode 内部每一发都有预算，理论上最坏耗时
@@ -523,6 +574,12 @@ func (p *Prober) probeOne(ctx context.Context, item Item, out *Result) {
 	timeoutMs := item.Options.TimeoutMS
 	if timeoutMs <= 0 {
 		timeoutMs = defaultTimeoutMS
+	}
+	if item.Options.UpstreamOnly {
+		// 持续健康监测的单发探针：预算就是 timeoutMs 本身（firstSuccess 的
+		// shot 自带期限），不需要 backstop 兜底。
+		out.Result = p.probeUpstream(ctx, item.Dial, timeoutMs)
+		return
 	}
 	attempts := item.Options.Attempts
 	if attempts <= 0 {
