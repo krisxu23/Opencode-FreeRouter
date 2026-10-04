@@ -96,6 +96,30 @@ func TestUnusableDirectoryDegradesToRingOnly(t *testing.T) {
 	}
 }
 
+// TestRecordKeepsBackdatedRowsOnTheirOwnDay 钉住「At 早于当前轮转日的行
+// 不再被永久丢弃」。旧实现把 `lastPruneDay != day` 当成丢弃条件:时钟回拨、
+// 上游回放、调用方显式给历史时刻,任何一条这样的记录都在第一个新一天之后
+// 永远进不了盘 —— 旧日文件明明还在,面板上那条轨迹就是空的。
+func TestRecordKeepsBackdatedRowsOnTheirOwnDay(t *testing.T) {
+	dir := t.TempDir()
+	Init(dir)
+
+	today := time.Now().UTC()
+	yesterday := today.AddDate(0, 0, -1)
+	// 先落一条今天,把 lastPruneDay 推进到今天。
+	Record(Route{Result: "今天第一条", At: today.UnixMilli()})
+	// 再落一条昨天的:它必须写进昨天那个文件。
+	Record(Route{Result: "回拨的一行", At: yesterday.Add(time.Hour).UnixMilli()})
+
+	b, err := os.ReadFile(filepath.Join(dir, yesterday.Format("2006-01-02")+".jsonl"))
+	if err != nil {
+		t.Fatalf("回拨记录必须落到它自己的日文件: %v", err)
+	}
+	if !strings.Contains(string(b), "回拨的一行") {
+		t.Fatalf("昨天的文件里没有那一条: %s", b)
+	}
+}
+
 func TestRecordNeverPanicsOnGarbage(t *testing.T) {
 	Init(t.TempDir())
 	// Route is a plain struct, so there is nothing unserialisable here; the

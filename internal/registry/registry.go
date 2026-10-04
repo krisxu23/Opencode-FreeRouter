@@ -157,6 +157,10 @@ func (r *Registry) Load() error {
 		if de.LastSeenAt != 0 {
 			e.LastSeenAt = time.UnixMilli(de.LastSeenAt)
 		}
+		// fails/lastFailAt 有意**不载入**:1.3.0 起连败状态机整体搬到 health
+		// （见包注释的「零记录」裁定），注册表回归纯粹的成员账本。盘上这两个
+		// 键由旧版本写成、现在恒为 0，按未知字段忽略（registry_test.go 的
+		// 「1.3.0:fails/墓碑随机制退役」一条钉的就是这个）。
 		entries[tag] = e
 	}
 	r.entries = entries
@@ -373,15 +377,16 @@ type diskEntry struct {
 	LastFailAt int64          `json:"lastFailAt"`
 }
 
-// diskEntryIn 是载入侧的条目形状:outbound 留原始字节交给 absorbOutbound,
-// fails 用指针区分「缺失」与 0(JS :102 对非正整数一律归 0,两者结果相同,
-// 指针只是让判断直白)。
+// diskEntryIn 是载入侧的条目形状:outbound 留原始字节交给 absorbOutbound。
+//
+// 曾经这里还有 Fails *int 与 LastFailAt int64(指针用来区分「缺失」与 0),
+// 两个字段从 1.3.0 起**零生产调用点** —— 连败状态机整体退役、迁到 health,
+// 盘上的旧键按未知字段忽略即可。留着它们会让读者以为「载入会恢复失败记忆」,
+// 而它实际什么都不做。
 type diskEntryIn struct {
 	Outbound   json.RawMessage `json:"outbound"`
 	AddedAt    int64           `json:"addedAt"`
 	LastSeenAt int64           `json:"lastSeenAt"`
-	Fails      *int            `json:"fails"`
-	LastFailAt int64           `json:"lastFailAt"`
 }
 
 // snapshotLocked 生成内存 → 落盘的快照。
@@ -396,6 +401,9 @@ func (r *Registry) snapshotLocked() diskFile {
 			// 条目把整份注册表锁死(与 Load 的逐条守卫对称)。
 			continue
 		}
+		// Fails/LastFailAt 恒写 0:1.3.0 起连败机制整体退役（包注释），这两个键
+		// 是为了**字节兼容**现网文件与 JS 版才留在形状里，写出来的 0 与
+		// 「键缺失」语义相同（载入侧按未知字段忽略，见 Load）。
 		df.Entries[tag] = diskEntry{
 			Outbound:   ob,
 			AddedAt:    msOf(e.AddedAt),

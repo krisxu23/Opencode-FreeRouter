@@ -10,8 +10,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -796,5 +798,41 @@ func TestForeignOriginIsRejectedOnWrites(t *testing.T) {
 		map[string]string{"Origin": "http://evil.example"})
 	if status != http.StatusOK {
 		t.Errorf("GET 带恶意 Origin = %d, want 200(只读请求不设 Origin 闸门)", status)
+	}
+}
+
+// TestOmittedPortResolvesToTheSchemeDefault 是省略端口的同源判定钉。
+//
+// 浏览器对 http://127.0.0.1:80 这样的页面发出来的 Origin 就是
+// "http://127.0.0.1"（省略默认端口），而 url.URL.Port() 返回的是**空串**
+// —— 旧实现直接 strconv.Atoi("") 得到 err，于是一律 403：部署在 80/443 的
+// 实例上，面板自己的同源写请求全被自己的同源保护挡住。
+func TestOmittedPortResolvesToTheSchemeDefault(t *testing.T) {
+	for _, tc := range []struct {
+		port       int
+		origin     string
+		wantStatus int
+	}{
+		{port: 80, origin: "http://127.0.0.1", wantStatus: http.StatusOK},
+		{port: 80, origin: "http://127.0.0.1:80", wantStatus: http.StatusOK},
+		{port: 443, origin: "https://localhost", wantStatus: http.StatusOK},
+		{port: 443, origin: "https://localhost:443", wantStatus: http.StatusOK},
+		// 省略端口但监听口不是默认值 —— 仍要挡。
+		{port: 8080, origin: "http://127.0.0.1", wantStatus: http.StatusForbidden},
+		// http 的 Origin 不能配 https 默认端口。
+		{port: 443, origin: "http://127.0.0.1", wantStatus: http.StatusForbidden},
+	} {
+		s := New(baseDeps(writeAssets(t, goodShell, "console.log('app')\n")))
+		s.port = tc.port
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/api/settings",
+			strings.NewReader(`{"probeEnabled":false}`))
+		req.Host = "127.0.0.1:" + strconv.Itoa(tc.port) // 绕过的是 Origin 闸,Host 仍要合法
+		req.Header.Set("Origin", tc.origin)
+		s.route(rec, req)
+		status, body := rec.Code, rec.Body.String()
+		if status != tc.wantStatus {
+			t.Errorf("port=%d Origin=%q → %d %s, want %d", tc.port, tc.origin, status, body, tc.wantStatus)
+		}
 	}
 }

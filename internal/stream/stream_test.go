@@ -164,6 +164,27 @@ func TestScanUsageMergesAnOutputOnlyFrame(t *testing.T) {
 	}
 }
 
+// 只带输入的 usage 帧**不得**把已累计的输出清零:输出侧与输入侧共用同一
+// 条 `??` 语义。旧实现的 else 分支写的是 acc.Out = 0，于是「先 usage{Out}
+// 后 usage{prompt}」这两帧形状的流（OpenAI 线两种都出现过）会把先到的
+// 输出量清成 0 —— 面板用量与 sticky TTL（cacheRead/In 比例）一起丢。
+// 这是 R14 在输入侧修掉的 bug 的输出侧镜像。
+func TestScanUsageMergesAnInputOnlyFrame(t *testing.T) {
+	for _, body := range []string{
+		`{"usage":{"prompt_tokens":11,"prompt_tokens_details":{"cached_tokens":3}}}`,
+		`{"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":3}}}`,
+	} {
+		acc := Usage{In: 11, CacheRead: 3, Out: 5, HasUsage: true}
+		ScanUsage([]byte(body), &acc, new(bool), time.Now())
+		if acc.Out != 5 {
+			t.Fatalf("%s -> Out = %d, want 5(输入侧帧不得清零已累计输出)", body, acc.Out)
+		}
+		if acc.In != 8 || acc.CacheRead != 3 || !acc.HasUsage {
+			t.Fatalf("%s -> %+v, want in=8 cacheRead=3（毛值减缓存）", body, acc)
+		}
+	}
+}
+
 // R14 的另一半:输入侧与输出侧都不提的 usage 帧**不产出 usage**
 // (js stream.js:120 的 `if (prompt === undefined && completion === undefined)
 // return undefined`),acc 与 HasUsage 都不动。

@@ -965,8 +965,9 @@
 
     + '  <div class="card sec"><div class="card-head"><h2>危险操作</h2></div>'
     + '    <div class="card-body inline">'
-    + '      <button class="btn btn-danger" id="btnResetProbe">清空探测结果并重新探测</button>'
-    + '      <span class="dim" style="font-size:12px">会丢弃全部节点的存活与层级记录，重新跑一轮完整探测。</span>'
+    + '      <button class="btn btn-danger" id="btnProbeForce">立即探测一轮</button>'
+    + '      <span class="dim" style="font-size:12px">跳过结果缓存，立刻重新扫一遍全部节点。'
+    + '      只认节点当前的存活与层级记录，不清空它们——没有「重置」语义。</span>'
     + '    </div></div>'
     + '</div>'
   }
@@ -1065,16 +1066,13 @@
   /* ═══════════════════════════════════════════════════════════════════
      15. 与网关通信
      ═══════════════════════════════════════════════════════════════════ */
-  function j(url, opt) {
-    return fetch(url, opt).then(function (r) {
-      if (!r.ok) return r.text().then(function (t) { throw new Error(t) })
-      return r.json()
-    })
-  }
   /* W22：阻塞型动作请求必须有超时 —— fetch 不设超时的话，一个半死的连接会
-     把动作按钮永久卡在 disabled，只能整页刷新。超时中止在 j() 里被翻译成
+     把动作按钮永久卡在 disabled，只能整页刷新。超时中止在这里被翻译成
      明确的中文文案：TimeoutError 的原始 message 是浏览器内部串（"signal timed
-     out"/"The operation was aborted"），直接 toast 出去用户看不懂。 */
+     out"/"The operation was aborted"），直接 toast 出去用户看不懂。
+     注：这份文件里曾同时存在两个 function j 声明 —— 后者覆盖前者，于是
+     「!r.ok 时抛响应体文本」那一半只在读者眼里存在，实际从未运行；
+     现在只留这一份，两半行为都在。 */
   function j(url, opt) {
     return fetch(url, opt).catch(function (e) {
       if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
@@ -1171,10 +1169,12 @@
       const lines = d.lines || []
       /* F7：日志页内层滚动器(#logbox)每 15s 被软重建重置 —— O18 的 sig 守卫
          只盖住了 refreshStatus，logs/routes 轮询是无条件 rerenderSoft。内容
-         真没变就不重建；变了也先记下内层滚动位置，重建后恢复。 */
-      const unchanged = lines.length === (DATA.logs || []).length && lines.length > 0 &&
-        lines[lines.length - 1].msg === (DATA.logs[lines.length - 1] || {}).msg &&
-        lines[0].t === (DATA.logs[0] || {}).t
+         真没变就不重建；变了也先记下内层滚动位置，重建后恢复。
+         「没变」逐行比全量而不是看 length+首尾两条：环形缓冲滚动一格时
+         长度不变，而中间那一行的内容已经换了 —— 那次滚动正好是用户最想
+         看到的更新，旧启发式会把它静默吃掉。行数有上限，O(行长) 可接受。 */
+      const unchanged = lines.length > 0 && lines.length === (DATA.logs || []).length &&
+        lines.every(function (ln, i) { return ln.msg === (DATA.logs[i] || {}).msg })
       DATA.logs = lines
       if (S.view !== 'logs' || isEditing()) return
       if (unchanged) return
@@ -1355,7 +1355,7 @@
       return
     }
 
-    if (t.closest('#btnProbe') || t.closest('#btnProbe2') || t.closest('#btnResetProbe')) { runProbe(); return }
+    if (t.closest('#btnProbe') || t.closest('#btnProbe2') || t.closest('#btnProbeForce')) { runProbe(); return }
     if (t.closest('#btnRefresh')) {
       /* I28：防重入 —— 连点会并发多个 POST /api/refresh，后端按 rebuildMu
          排队但前端 toast 会乱套 */

@@ -4,6 +4,7 @@ package errors
 
 import (
 	stderrors "errors"
+	"fmt"
 	"testing"
 
 	"freerouter/internal/check"
@@ -212,5 +213,54 @@ func TestInsufficientNarrowsToBillingPhrases(t *testing.T) {
 	f = Classify(402, []byte(`{"error":{"message":"Insufficient account funds"}}`), 0)
 	if f.Code != check.CodeQuota || !f.Retryable {
 		t.Fatalf("402 计费拒绝应归 quota 可重试: %v", f)
+	}
+}
+
+// TestModelReIsNarrowedToModelDimension 钉住 modelRe 的收窄。旧实现里的裸词
+// `not supported` 让任何提到「不支持」的文案都命中模型支,而这一支打的是
+// Unavailable 位 —— engine 见到它就直接失败、不再扫池(engine.go:537)。
+// 一句基础设施 5xx 里的 "region not supported" 就足以让可用模型第一次尝试
+// 就报死。
+func TestModelReIsNarrowedToModelDimension(t *testing.T) {
+	// 真判决:模型维度的拒绝仍必须打 Unavailable。
+	for _, body := range []string{
+		`{"error":{"type":"ModelError","message":"model is unavailable"}}`,
+		`{"error":{"message":"This model is not supported"}}`,
+		`{"error":{"message":"model not found"}}`,
+		`{"error":{"message":"unknown model: gpt-x"}}`,
+		`{"error":{"message":"unsupported model"}}`,
+	} {
+		f := Classify(400, []byte(body), 0)
+		if !f.Unavailable {
+			t.Errorf("%s 应判 Unavailable(换出口救不了),得到 %+v", body, f)
+		}
+	}
+	// 非模型维度的「不支持」必须落回默认分支:5xx 仍 Retryable,4xx 不带
+	// Unavailable 位(否则就是上面那条误杀)。
+	for _, body := range []string{
+		`{"error":{"message":"this endpoint is not supported"}}`,
+		`{"error":{"message":"streaming is not supported for this key"}}`,
+		`{"error":{"message":"region not supported"}}`,
+		`{"error":{"message":"unsupported region"}}`,
+	} {
+		f := Classify(500, []byte(body), 0)
+		if f.Unavailable {
+			t.Errorf("%s 被误判成模型不可用 —— 会让可用模型首尝试就失败: %+v", body, f)
+		}
+		if f.Code != check.CodeServer || !f.Retryable {
+			t.Errorf("%s 应落回默认 SERVER 可重试,得到 %+v", body, f)
+		}
+	}
+}
+
+// TestCodeOfSeesWrappedFailure:链路里被 fmt.Errorf("%w") 包过的 Failure 也必须
+// 拿到失败码 —— 裸类型断言在那种路径上静默返回 ""。
+func TestCodeOfSeesWrappedFailure(t *testing.T) {
+	inner := Failure{Code: check.CodeCredential}
+	if got := CodeOf(fmt.Errorf("拨号重试: %w", inner)); got != check.CodeCredential {
+		t.Fatalf("CodeOf(wrapped Failure) = %q, want %q", got, check.CodeCredential)
+	}
+	if got := CodeOf(fmt.Errorf("外层: %w", stderrors.New("plain"))); got != "" {
+		t.Fatalf("CodeOf(wrapped plain) = %q, want \"\"", got)
 	}
 }

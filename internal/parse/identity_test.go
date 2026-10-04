@@ -136,7 +136,7 @@ func TestUnroutableCatchesMappedIPv6LinkLocalAndThisNet(t *testing.T) {
 	bad := []string{
 		"::ffff:10.0.0.5", "::ffff:192.168.1.10", "::ffff:172.16.0.9",
 		"::ffff:169.254.169.254", "::ffff:0.1.2.3",
-		"fe80::1", "febf::a",
+		"fe80::1", "febf::a", "feb0::", "feaa::5",
 		"0.1.2.3",
 	}
 	for _, s := range bad {
@@ -150,7 +150,11 @@ func TestUnroutableSparesRealHosts(t *testing.T) {
 	// 这一组是被误杀过的真实地址：128.x 是公网，172.15/172.32 在私网段外，
 	// localhost.example.com 是真实域名。
 	good := []string{"128.0.0.1", "27.0.0.1", "172.32.0.1", "172.15.0.1", "192.169.0.1",
-		"11.0.0.1", "localhost.example.com", "[2001:db8::1]", "example.com:443", ""}
+		"11.0.0.1", "localhost.example.com", "[2001:db8::1]", "example.com:443", "",
+		// fe8/fe9/fea/feb 是**合法主机名**的常见开头：旧实现用裸前缀判
+		// link-local，把这些整条节点误杀。而 febf::1 这类真地址属于
+		// fe80::/10 同一段，裸前缀反而漏判。
+		"fe8-node.example.com", "fe9.example.org", "fea.example.net", "feb01.example.io"}
 	for _, s := range good {
 		if IsUnroutableServer(s) {
 			t.Errorf("%q must not be treated as unroutable", s)

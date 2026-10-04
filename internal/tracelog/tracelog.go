@@ -165,10 +165,16 @@ func Record(r Route) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	mu.Lock()
-	// 跨天护栏:两次进 mu 之间若别的 Record 完成了日轮转(lastPruneDay 前进
-	// 到新的一天),本条的字节账会记到新一天的配额上、文件却写到旧一天 ——
-	// 直接丢弃这一行(本包 fail-silent by design),别让旧日文件超配额。
-	if writeOff || dir != d || lastPruneDay != day {
+	// 跨天护栏:两次进 mu 之间若别的 Record 换了目录,本条会写到与 d 不同的
+	// 目录去 —— 直接丢弃(本包 fail-silent by design)。
+	//
+	// 注意**不再**因为 lastPruneDay != day 丢这一条:那个条件让任何 At 早于
+	// 当前轮转日的记录(时钟回拨、上游回放、调用方显式给历史时刻)被**永久**
+	// 静默丢弃 —— 旧日文件明明还在,这一行却再也进不去。字节账记在当前
+	// 轮转日(lastPruneDay)的额度上:回拨行的字节不能把新一天的 32MB 额度
+	// 撑爆,而旧一天的额度无法核实(那天早已 prune),所以记当前天是唯一
+	// 保守的选择。
+	if writeOff || dir != d {
 		mu.Unlock()
 		return
 	}
@@ -179,24 +185,25 @@ func Record(r Route) {
 		mu.Unlock()
 		return
 	}
-	dayBytes += int64(len(b))
-	mu.Unlock()
-
-	path := filepath.Join(d, day+".jsonl")
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	// 扣账放在开文件**之后**:OpenFile 失败时下面会把 writeOff 置真(整日停写),
+	// 扣没扣都一样;而真开成的这一行才计入当天额度,账目与盘上内容一一对应,
+	// 不会出现「配额被没落地的行吃掉」。OpenFile 在锁内(本地文件的一次
+	// open,毫秒级),换来的是「写出去的行」与「记在账上的行」严格一致。
+	f, err := os.OpenFile(filepath.Join(d, day+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		mu.Lock()
 		writeOff = true
 		mu.Unlock()
 		return
 	}
-	_, err = f.Write(b)
-	_ = f.Close()
-	if err != nil {
+	dayBytes += int64(len(b))
+	mu.Unlock()
+
+	if _, err := f.Write(b); err != nil {
 		mu.Lock()
 		writeOff = true
 		mu.Unlock()
 	}
+	_ = f.Close()
 }
 
 // pruneLocked deletes jsonl files older than the retention window. Only

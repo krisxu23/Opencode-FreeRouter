@@ -200,6 +200,10 @@ type Health struct {
 	// turn on transport; without this fuse one session re-hits the same dead
 	// exit for the full TTL, paying one wasted failure per request.
 	stickyFail map[string]int
+	// flushMu 把所有写盘(只有 Persist 一处)串行化。快照在 mu 内拷贝、IO 在
+	// mu 外,但两个并发 Persist 仍会并发 WriteJSONFile 同一个文件(各自的 temp
+	// 文件不同,坏的是 rename 的先后顺序 → 旧快照覆盖新快照)。
+	flushMu sync.Mutex
 }
 
 // NewHealth opens (or creates) the health file. An empty file path disables
@@ -277,6 +281,8 @@ func (h *Health) Persist() error {
 	if h.file == "" {
 		return nil
 	}
+	h.flushMu.Lock()
+	defer h.flushMu.Unlock()
 	h.mu.Lock()
 	// R9:顺带回收过窗的在途计数条目。这张表按出口 IP 建键,订阅轮换会让
 	// IP 不断换代,不回收就是无界增长。选这里是因为 Persist 每轮 rebuild/
@@ -478,7 +484,7 @@ func (h *Health) MarkPassFail(nodeKey string, allowDelete bool) string {
 		r.LastProbeAt = now
 		h.nodes[nodeKey] = r
 		return ""
-	default: // alive(热区)
+	case StateAlive: // 热区
 		r.Streak++
 		if r.Streak >= hotDemoteAfter {
 			r.State = StateDead
@@ -490,7 +496,16 @@ func (h *Health) MarkPassFail(nodeKey string, allowDelete bool) string {
 		r.LastProbeAt = now
 		h.nodes[nodeKey] = r
 		return ""
+	case StateUnknown:
+		// unknown 行(NoteQuota 造的临时行、还没探完的行)从没拿到可达性结论,
+		// 不能当成「热区连败器」计数:2 次 pass 失败就会把它按 hotDemoteAfter
+		// 写成 dead,而它可能只是这一轮没轮到。与冷区同理 —— 不计数、不改状态,
+		// 只记下「这一轮没给出判决」。
+		r.LastProbeAt = now
+		h.nodes[nodeKey] = r
+		return ""
 	}
+	return "" // 未知 state 字符串(旧版本落盘的脏值):当没发生过
 }
 
 // hotDemoteAfter / coldDeleteAfter 是双档状态机的两个门槛(1.3.0 定稿:
@@ -612,6 +627,16 @@ func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
 		lastQuotaAt = prev.LastQuotaAt
 	}
 
+	// Streak 同样跟着节点走:整行重写若把它清零,MarkPassFail 攒下的
+	// 「热区连败 N 轮」会被下一轮全量粗探无声归零,双档状态机的降冷/删除
+	// 判决(以及冻结期解除后的补数)永远数不满。实测:粗探与 pass 闸门并行
+	// 跑,每轮粗探都插在两次 pass 之间,不保留 = hotDemoteAfter/coldDeleteAfter
+	// 两个门槛形同虚设。
+	streak := 0
+	if hasPrev {
+		streak = prev.Streak
+	}
+
 	h.nodes[nodeKey] = row{
 		State:       NodeState(res.State),
 		LatencyMS:   latMS,
@@ -623,6 +648,7 @@ func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
 		LastProbeAt: now,
 		Tier:        tier,
 		LastQuotaAt: lastQuotaAt,
+		Streak:      streak,
 	}
 }
 
@@ -658,7 +684,10 @@ func (h *Health) exitIpOfLocked(nodeKey string, now int64) string {
 // 只有 alive/dead 两种判决算数:unknown(本轮不完整)与 unknown 状态的配额行
 // 都没给出可达性结论,跳过它们等于把一个没测过的节点当成「刚测过」,会让它
 // 永远得不到探测。lastProbeAt 缺失或为 0 的行不算新鲜。
-func (h *Health) ProbedWithin(nodeKey string, windowMS int64) bool {
+// now 由调用方给，与 ExitIPOf 同口径：包内所有「新鲜度」判定都读**同一个**
+// 时刻，测试才能把边界钉在确定的时间点上（过去这里自己调 time.Now()，窗口
+// 边界只能靠 sleep 逼近，既不可测也让同一轮探测里各行的「现在」不是同一个）。
+func (h *Health) ProbedWithin(nodeKey string, windowMS int64, now int64) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	r, ok := h.nodes[nodeKey]
@@ -669,7 +698,7 @@ func (h *Health) ProbedWithin(nodeKey string, windowMS int64) bool {
 		return false
 	}
 	at := r.LastProbeAt
-	return at > 0 && time.Now().UnixMilli()-at <= windowMS
+	return at > 0 && now-at <= windowMS
 }
 
 // MarkTierProbe 用 region-gated 探针模型的判决精化一个粗探通关的节点。
@@ -1432,7 +1461,10 @@ func (h *Health) ReleaseExitBusy(exitIP string) {
 	if r.Count > 0 {
 		r.Count--
 	}
-	r.At = time.Now().UnixMilli()
+	// At 只在 NoteExitBusy 递增时刷新:每次归还都刷新会让「陈旧计数 10 分钟清零」
+	// 的窗口被任何一次 Release 反复续命 —— 一个漏 Release 的计数只要与同 IP 的
+	// 正常 release 交错就长期存活,exitBusyStale 形同虚设。这里是递减,不是
+	// 新一轮在途的起点。
 }
 
 // exitBusyCountLocked 这个出口 IP 当前的在途请求数(已过窗的陈旧计数按 0 处理,

@@ -17,6 +17,7 @@ package errors
 
 import (
 	"encoding/json"
+	stderrors "errors"
 	"regexp"
 	"strconv"
 	"strings"
@@ -42,8 +43,18 @@ func (f Failure) Error() string { return f.Code + ": " + f.Message }
 // CodeOf 返回 err 携带的失败码;err 不是 Failure 时返回 ""。每个决定是否
 // 轮换的层都会调它,所以必须容忍普通 error(取消、拨号失败)而不是 panic。
 func CodeOf(err error) string {
-	if f, ok := err.(Failure); ok {
+	// errors.As 而非类型断言:调用方常在链路中把 Failure 包过一层
+	// (fmt.Errorf("%w")、adapter 的信封),裸断言在那种路径上静默返回 "",
+	// 于是「凭据失败」一路走到最后一步都看不出该做什么。Failure 是值类型,
+	// 所以只匹配 Failure 本身、不追 *Failure —— 两个类型都带上免得将来
+	// 有人在链路上取地址。
+	var f Failure
+	if stderrors.As(err, &f) {
 		return f.Code
+	}
+	var pf *Failure
+	if stderrors.As(err, &pf) && pf != nil {
+		return pf.Code
 	}
 	return ""
 }
@@ -61,7 +72,15 @@ var (
 	regionRe = regexp.MustCompile(`(?i)not available in your country|not available in (?:this|your) region|unsupported region`)
 	quotaRe  = regexp.MustCompile(`(?i)usage limit|rate limit`)
 	freeRe   = regexp.MustCompile(`(?i)freetier|free.?tier`)
-	modelRe  = regexp.MustCompile(`(?i)model is unavailable|not supported`)
+	// modelRe 只认**模型维度**的判决,这是对 JS 原版的一处有意收紧。
+	// 旧实现里的裸词 `not supported` 匹配任何提到「不支持」的文案:
+	// "this endpoint is not supported"、"streaming is not supported"、
+	// "unsupported region"、乃至 5xx 的 "region not supported" 全都命中。
+	// 代价是不可逆的:这一支打的是 Unavailable 位,engine 见到它就直接
+	// 失败、**不再扫池**(engine.go:537 `!failure.Unavailable`)。于是一句
+	// 基础设施 5xx 里的 "region not supported" 就能让一个完全可用的模型
+	// 在第一次尝试就报死。
+	modelRe = regexp.MustCompile(`(?i)model is unavailable|model is not supported|model not found|no such model|unknown model|unsupported model|invalid model`)
 )
 
 // Classify 把 HTTP 状态码和响应体映射成一个 Failure。

@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"freerouter/internal/stream"
@@ -126,11 +127,18 @@ type sink struct {
 	brokenToolCall bool
 }
 
+// ttftUnmeasured 是「本轮没有量到 TTFT」的哨兵。零值 0 是个**合法**的量测
+// 结果(亚毫秒的首字,本机回环上的模型真的能量出 0ms),所以「没量到」不能靠
+// 0 表示 —— stats.Record 那侧正是按这个哨兵区分两者(负数 = 没量到)。
+const ttftUnmeasured = -1
+
 func newSink(emit func(Delta) error, renames map[string]string) *sink {
 	if emit == nil {
 		emit = func(Delta) error { return nil }
 	}
-	return &sink{emit: emit, renames: renames, byKey: map[string]*block{}}
+	s := &sink{emit: emit, renames: renames, byKey: map[string]*block{}}
+	s.acc.TTFTMS = ttftUnmeasured
+	return s
 }
 
 // result 交出当前的收尾事实。任何时刻调用都安全:error 路径也要把已经折出的
@@ -245,6 +253,9 @@ func (s *sink) setFinish(token string) {
 	s.finish = token
 }
 
+// fallbackSeq 是 mintToolCallID 熵源降级路径上的单调计数器。
+var fallbackSeq uint64
+
 // mintToolCallID 对应 js stream.js:23-25 的
 // `call_${crypto.randomBytes(12).toString('hex')}`。
 func mintToolCallID() string {
@@ -253,9 +264,20 @@ func mintToolCallID() string {
 		// 熵源坏掉时退回时间派生的字节:形状仍然合法(24 个十六进制字符),
 		// 代价是唯一性变弱 —— 比 panic 拖垮整条转发链路好。同包内的
 		// upstream.mintID 是同样的取舍。
-		v := time.Now().UnixNano()
+		//
+		// `8*(i%8)` 的旧写法只有前 8 字节有效,后 4 字节(i=8..11)是
+		// i=0..3 的**重复**:同一次降级里 call_ 后缀只有 12 字节里的前 8
+		// 字节在变,且纳秒低位抖动最小 —— 同毫秒内发起的两个工具调用会拿到
+		// 完全相同的后 4 字节。改成前 8 字节取时间、后 4 字节取单调计数,
+		// 12 个位置全部在变。
+		v := uint64(time.Now().UnixNano())
+		seq := atomic.AddUint64(&fallbackSeq, 1)
 		for i := range b {
-			b[i] = byte(v >> (8 * (i % 8)))
+			src, shift := v, uint(i)
+			if i >= 8 {
+				src, shift = seq, uint(i-8)
+			}
+			b[i] = byte(src >> (8 * shift))
 		}
 	}
 	return "call_" + hex.EncodeToString(b[:])

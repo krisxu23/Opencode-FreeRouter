@@ -214,10 +214,15 @@ func ScanUsage(chunk []byte, acc *Usage, firstContentSeen *bool, t0 time.Time) (
 				if acc.In < 0 {
 					acc.In = 0
 				}
+				// 同样的 `??` 语义必须在输出侧也成立:只带输入的 usage 帧
+				// (prompt 有值、completion 缺)不得把**已累计**的输出清零。
+				// 旧实现的 else 分支写的是 acc.Out = 0 —— OpenAI 线里
+				// 「先 usage{model:...,usage:{prompt_tokens:N}}、后
+				// usage{completion_tokens:M}」的两帧形状(或反过来)会让
+				// 先到的那一侧被后一帧清成 0,面板输出量与 sticky TTL
+				// 一起丢。这正是 R14 在输入侧修掉的那个 bug 的输出侧镜像。
 				if completion != nil {
 					acc.Out = int64(*completion)
-				} else {
-					acc.Out = 0
 				}
 			}
 		}

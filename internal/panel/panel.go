@@ -352,12 +352,34 @@ func (s *Server) loopbackConsoleURL(raw string) bool {
 		return false
 	}
 	if s.port > 0 {
-		p, perr := strconv.Atoi(u.Port())
+		// u.Port() 在省略端口时是**空串**，不是 "80"/"443"：Origin 头由
+		// 浏览器生成，http://127.0.0.1:80 的同源页面发出来的 Origin 就是
+		// "http://127.0.0.1"。旧实现对这个空串做 strconv.Atoi 得到 err → 一律
+		// 403，面板自己所在机器上的同源请求（按端口 80/443 部署的实例）全部
+		// 被自己的同源保护挡住。
+		p, perr := effectivePort(u)
 		if perr != nil || p != s.port {
 			return false
 		}
 	}
 	return true
+}
+
+// effectivePort 返回 URL 的实际端口：显式端口优先，省略时按 scheme 取默认值
+// （http=80、https=443）—— RFC 3986 的默认端口语义，与浏览器对同源
+// Origin 的省略规则一致。
+func effectivePort(u *url.URL) (int, error) {
+	if raw := u.Port(); raw != "" {
+		return strconv.Atoi(raw)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return 80, nil
+	case "https":
+		return 443, nil
+	default:
+		return 0, errors.New("no default port for scheme " + u.Scheme)
+	}
 }
 
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {

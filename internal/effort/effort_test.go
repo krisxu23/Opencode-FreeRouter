@@ -4,6 +4,7 @@
 package effort
 
 import (
+	"math"
 	"reflect"
 	"testing"
 )
@@ -36,6 +37,21 @@ func TestBudgetForNilSettingsFallsBackToMaxOutput(t *testing.T) {
 	}
 	if got := BudgetFor(LevelNone, TUNABLE, 0, nil); got != 131072 {
 		t.Fatalf("BudgetFor(none, requested=0, nil) = %d, want 131072", got)
+	}
+}
+
+// TestBudgetForNeverReturnsANegativeBudget 是 int 宽度的钉。capacity 是
+// int64(E.MaxOutput)，旧实现直接 int(capacity) 返回：32 位平台上超过 2^31-1
+// 的模型上限溢成负数，而调用方按「非正 = 未设置」处理，那个预算被静默丢弃、
+// 请求不带 max_tokens。返回值必须恒为正。
+func TestBudgetForNeverReturnsANegativeBudget(t *testing.T) {
+	huge := Entry{SupportsReasoning: true, MaxOutput: math.MaxInt64}
+	got := BudgetFor(LevelNone, huge, 0, nil)
+	if got <= 0 {
+		t.Fatalf("BudgetFor(MaxOutput=MaxInt64) = %d, 必须恒为正（溢出成负数会被当「未设置」丢弃）", got)
+	}
+	if int64(got) != math.MaxInt64 {
+		t.Fatalf("BudgetFor(MaxOutput=MaxInt64) = %d, want %d（钳在 math.MaxInt）", got, math.MaxInt64)
 	}
 }
 

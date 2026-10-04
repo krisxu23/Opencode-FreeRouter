@@ -84,8 +84,14 @@ const (
 	firstProbeTick = 30 * time.Second
 )
 
-// tierUnavailableRe 复刻 src/probe.js:113-128 stateOf 的「模型侧拒绝」判据。
-var tierUnavailableRe = regexp.MustCompile(`(?i)unavailable|not supported|no such model|unknown model|invalid model`)
+// tierUnavailableRe 复刻 src/probe.js:113-128 stateOf 的「模型侧拒绝」判据,
+// 但把裸词 `not supported` 收窄到**模型维度**(与 errors.modelRe 同一处收窄,
+// 见该处注释:裸词会让 "region not supported" / "this endpoint is not
+// supported" 命中,而这一支的结论是把模型判死到下一轮粗探)。
+// 唯一的非模型字面量是裸 `unavailable`:上游的模型停服文案一律带它,而
+// "temporarily unavailable" 这类更该由 status 分支处理(5xx 已在函数开头
+// 归 unknown,403 的裸 unavailable 是上游真实的模型侧拒绝)。
+var tierUnavailableRe = regexp.MustCompile(`(?i)unavailable|model is not supported|not supported model|unsupported model|model not found|no such model|unknown model|invalid model`)
 
 // PassSummary 是一轮 pass(hot/cold/first)的结论,喂日志行与测试。
 type PassSummary struct {

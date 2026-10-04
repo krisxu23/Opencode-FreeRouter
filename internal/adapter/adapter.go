@@ -414,8 +414,16 @@ var (
 // (js http.js:143-174 的实现语义)。
 func (a *Adapter) readReply(resp *http.Response, t *turn, s *sink) error {
 	head := make([]byte, 8)
-	n, _ := io.ReadFull(resp.Body, head)
+	n, headErr := io.ReadFull(resp.Body, head)
 	head = head[:n]
+	if headErr != nil && headErr != io.EOF && headErr != io.ErrUnexpectedEOF {
+		// 中途读故障不是「上游没产东西」:旧实现丢掉 err 只判 n==0，于是
+		// 连接在第 3 字节断掉的响应体走进「首块形状判定」——half-read 的
+		// 前缀恰好不匹配任何正则时按 Content-Type 判型，或直接落到
+		// readJSON 报成 SERVER。两条都撒谎：这条连接不可信（该冷却），
+		// 上游确实想产东西（不该按 EMPTY_RESPONSE 换出口）。
+		return bodyReadFailure(headErr)
+	}
 	if n == 0 {
 		// JS:body 为空的 2xx 是「上游什么都没产」,归 EMPTY_RESPONSE —— 它在
 		// 引擎的可重试码表里,换出口是对的应对。

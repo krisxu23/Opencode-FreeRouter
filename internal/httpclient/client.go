@@ -150,36 +150,66 @@ func (t *idleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // idleReader 是「每读到数据就续期」的响应体。计时器在两次 Read 之间跑，超时
-// 即 Close 底层连接 —— Close 会让阻塞中的 Read 立刻返回，读取方看到的是
-// ErrIdleTimeout（errors.Is 可认）。除了 Close 还要取消 context：DialContext
-// 挂在它上面，一个还没建连的请求同样会被空闲计时器收走。
+// 即 Close 底层连接并取消请求 context —— Close 让阻塞中的 Read 立刻返回，
+// cancel 收走还挂在 DialContext 上的建连（一个还没建连的请求同样该被空闲
+// 计时器收走；且超时路径上调用方未必会走到 Close，不能只指望 Close 释放）。
+//
+// gen 是续期与超时的仲裁位。time.Timer.Reset 对**已触发**的计时器同样「成功」
+// 返回 nil，但 AfterFunc 的回调已经被 runtime 排进 goroutine 队列：它正阻塞在
+// r.mu 上等锁，而这一侧的 Read 先拿到锁、拿到数据、把表重整完就放锁 —— 回调
+// 随后拿到锁，r.done 还是 false，于是把一条正在正常吐字的流 Close 掉，下一次
+// Read 报 ErrIdleTimeout。引擎按可重试可冷却的 TIMEOUT 处理它：**健康出口被误
+// 冷却**。
+//
+// 解法是「一次武装一枚计时器，不复用」：每次续期都递增 gen 并新开 AfterFunc，
+// 回调带着自己那一代的编号进来，对不上就当作「本次触发已被后续数据作废」直接
+// 返回。**不能**用 Reset 复用同一枚 —— 复用后回调携带的是首次武装时的旧 gen，
+// 续期越多、被作废的就越多，最后一次真正的超时也一并被作废，流永远不收口
+// （这正是它第一次跑挂的形状）。
 type idleReader struct {
 	body   io.ReadCloser
 	idle   time.Duration
 	cancel context.CancelFunc
 	mu     sync.Mutex
 	t      *time.Timer
+	gen    uint64
 	done   bool
 }
 
 func newIdleReader(body io.ReadCloser, idle time.Duration, cancel context.CancelFunc) *idleReader {
 	r := &idleReader{body: body, idle: idle, cancel: cancel}
 	if idle > 0 {
-		r.t = time.AfterFunc(idle, r.expire)
+		r.armLocked()
 	}
 	return r
 }
 
-// expire 只关底层连接，不碰 r.done：谁先到（读完成还是超时）由 arm/disarm 的
-// 互斥保证不会两边同时动计时器。
-func (r *idleReader) expire() {
+// armLocked（持有 r.mu）把空闲截止重整到「此刻起 idle 之后」。代价是每读到一块
+// 数据就换一枚计时器：流式响应里这是每 chunk 一次 time.AfterFunc，量级可忽略，
+// 换来的是「过期回调永不误伤新鲜数据」这条硬保证。
+func (r *idleReader) armLocked() {
+	r.gen++
+	gen := r.gen
+	if r.t != nil {
+		r.t.Stop() // 已触发时 Stop 返回 false，回调仍会来 —— 由 gen 挡掉
+	}
+	r.t = time.AfterFunc(r.idle, func() { r.expire(gen) })
+}
+
+// expire 只关底层连接并取消请求 ctx。超时必须自我收口：调用方在超时后未必还会
+// Close（错误分支直接 return、或把 resp 交给非 defer 的路径），而排队/拨号中的
+// 请求只有 ctx 能中止。
+func (r *idleReader) expire(gen uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.done {
-		return
+	if r.done || gen != r.gen {
+		return // 已被后续数据续期作废，或已收尾
 	}
 	// 关掉底层连接让阻塞中的 Read 返回；真正的错误值由 Read 自己判超时。
 	_ = r.body.Close()
+	if r.cancel != nil {
+		r.cancel() // 幂等：Close 路径也调它
+	}
 	r.done = true
 }
 
@@ -191,7 +221,7 @@ func (r *idleReader) Read(p []byte) (int, error) {
 		switch {
 		case err == nil:
 			// 收到数据就续期（js http.js:235 的 deadline = Date.now() + timeoutMs）。
-			r.t.Reset(r.idle)
+			r.armLocked()
 		case stderrors.Is(err, io.EOF):
 			// 读完了:停表。旧实现让计时器以剩余时间继续跑满整个 idle 窗口,
 			// 期间 expire() 会对已读完的 body 再做一次 Close、把 r 钉在

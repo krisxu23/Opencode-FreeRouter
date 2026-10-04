@@ -474,8 +474,42 @@ func TestFullProbeDoesUseEcho(t *testing.T) {
 	}
 }
 
+// stubbornConn 是「不响应取消」的那一类连接：头部照发，之后 Read 永久阻塞，
+// Close / SetDeadline 都是空操作。它钉的是 easy-proxies 记录过的协议形状 ——
+// 拨号能回来，但请求体永远不落地，客户端的 cancel 与 client.Timeout 都无法让
+// 这一发收口（只有传输层的 close 能，而这一层不理会）。
+type stubbornConn struct {
+	sentHead bool
+}
+
+func (c *stubbornConn) Read(p []byte) (int, error) {
+	if !c.sentHead {
+		c.sentHead = true
+		return copy(p, []byte("HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")), nil
+	}
+	select {} // 永久阻塞：头发完了就永远不返回，也不理会 Close
+}
+
+func (*stubbornConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (*stubbornConn) Close() error                     { return nil }
+func (*stubbornConn) LocalAddr() net.Addr              { return stubAddr{} }
+func (*stubbornConn) RemoteAddr() net.Addr             { return stubAddr{} }
+func (*stubbornConn) SetDeadline(time.Time) error      { return nil }
+func (*stubbornConn) SetReadDeadline(time.Time) error  { return nil }
+func (*stubbornConn) SetWriteDeadline(time.Time) error { return nil }
+
+type stubAddr struct{}
+
+func (stubAddr) Network() string { return "stub" }
+func (stubAddr) String() string  { return "stub" }
+
 // hangServer 的 /live 秒回 204，/echo 永远不回（等客户端自己取消）：stage-1
-// 快速通过、echo 挂满预算——这正是会撞上兜底的形状（echo 8s > 兜底余量 5s）。
+// 快速通过、echo 挂满 8s 的 echoBudgetMS。
+//
+// 注意：兜底预算（attempts×timeoutMs+echoBudgetMS+backstopSlackMS）按构造
+// **大于**这个形状的最坏耗时，所以这里撞不出兜底——NodeProbe 会等 echo 走完
+// 再以 alive 收场。兜底要靠真·挂死（拨号器不响应 ctx）才触发，见
+// TestBackstopFiresOnAnUncancellableDialer。
 func hangServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -493,15 +527,66 @@ func hangServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// hangPair 是 hangServer 的两实例版：/live 一个监听端口，/echo 另一个。分端口是
+// 必需的 —— 同一 host:port 上 stage-1 与 echo 会复用同一条连接，echo 段压根不
+// 发起新拨号，「挂死不响应 ctx」的形状就构造不出来。
+func hangPair(t *testing.T) (live, echoSrv *httptest.Server) {
+	t.Helper()
+	liveMux := http.NewServeMux()
+	liveMux.HandleFunc("/live", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	live = httptest.NewServer(liveMux)
+	t.Cleanup(live.Close)
+
+	echoMux := http.NewServeMux()
+	echoMux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+		}
+	})
+	echoSrv = httptest.NewServer(echoMux)
+	t.Cleanup(echoSrv.Close)
+	return live, echoSrv
+}
+
 // TestIncompleteIsNotDead（Go 特有）：必触发 backstop 的配置下，结果是
 // unknown 且 Incomplete，绝不是 dead——dead 会给可能健康的节点记一次连败。
+//
+// 「必触发 backstop」只能用**真·挂死**的拨号器构造：底层拨号不响应 ctx 取消时，
+// 请求 ctx 的 deadline 也救不了它。hangServer 那条形状（服务器不回、客户端能
+// 取消）走的是 shot ctx 期限，兜底按构造晚于它，所以那里拿到的是 alive ——
+// 这正是兜底预算必须 ≥ attempts×timeoutMs+echoBudget 的理由。
 func TestIncompleteIsNotDead(t *testing.T) {
-	srv := hangServer(t)
+	live, echoSrv := hangPair(t)
+	// stage-1 走 live 的真实拨号；echo 指向**另一个**监听端口，所以必然触发一次
+	// 新拨号 —— 那一发永久挂起、故意不看 ctx（easy-proxies 记录过的那种协议）。
+	// 注意不能把两段放在同一 host:port 上：连接会被复用，压根没有第二次拨号，
+	// 用例就退化成「客户端自己的 shot ctx 能取消」的形状，兜底自然不会触发。
+	// 拨号器收到的 addr 是 host:port：echo 源与 live 源分端口，所以按 addr 判定
+	// 「这一发是 echo 段」，比数拨号次数更贴合真实形状（一次请求可能重拨多次）。
+	dial := httpclient.Dialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if strings.HasSuffix(addr, strings.TrimPrefix(echoSrv.URL, "http://")) {
+			// 只有「拨号后读不回来、Close 也无人理会」才是真的不响应取消：
+			// 光让 DialContext 挂起不够 —— client.Timeout 的定时器会让 do() 提前
+			// 返回（它并不需要拨号结束），那一发照样收口。
+			return &stubbornConn{}, nil
+		}
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
+	})
 	p := NewProber(nil)
-	p.liveness = []string{srv.URL + "/live"}
+	p.liveness = []string{live.URL + "/live"}
 	p.gate = ""
-	p.echo = []string{srv.URL + "/echo"}
-	items := []Item{{Tag: "slow", Options: ProbeOptions{TimeoutMS: 100, Attempts: 1}}}
+	p.echo = []string{echoSrv.URL + "/echo"}
+	// 余量必须给「响应头」留够时间：echo 这一发能撞到兜底，靠的是**头已经
+	// 到了、判决层卡在读 body 上**（stubbornConn 的 Close 与各 deadline 都是
+	// 空操作）。若 echo 的单发预算先到期，transport 会放弃这一发、ProbeNode
+	// 立刻以 alive 收场 —— 用例就退化成「客户端自己能取消」的形状。100ms 的
+	// 预算在满载 CI 上真会先到期（实测拿到 alive），1000ms 才有可用的裕量。
+	p.echoBudgetMS = 1000   // echo 单发预算：只要头在这之内到达即可
+	p.backstopSlackMS = 100 // 兜底 ≈ 100 + 1000 + 100
+	items := []Item{{Tag: "slow", Dial: dial, Options: ProbeOptions{TimeoutMS: 100, Attempts: 1}}}
 	res := p.ProbeAll(context.Background(), items, 1)
 	if len(res) != 1 {
 		t.Fatalf("got %d results, want 1", len(res))
@@ -560,26 +645,33 @@ func (zeroReader) Read(p []byte) (int, error) {
 // 100ms 内 Done。观测点是拨号器收到的 ctx（ProbeNode 把 worker ctx 一路传进每
 // 一次请求），echo 段的拨号 ctx 是 worker ctx 的子孙，cancel 必然传导。
 //
-// 为什么打 echo 段而不是「拨号挂死」：单发预算会作为期限传进请求 ctx
-// （TestOptionsPerItem 钉的就是这条），所以拨号挂死的形状会在单发预算处自己
-// 解挂、以 dead 收场，根本走不到兜底——按构造，兜底（attempts×timeoutMs+5000）
-// 永远晚于单发预算，能活过兜底的只有固定的 8s echo 预算（timeoutMs<3000 时）。
-// 这与生产语义一致：能卡死整轮探测的恰恰是 echo 段。TestIncompleteIsNotDead
+// 为什么必须是「拨号不响应 ctx」而不是「服务器不回」：单发预算会作为期限传进
+// 请求 ctx（TestOptionsPerItem 钉的就是这条），服务器不回时那一发会在 shot ctx
+// 处自己解挂、以 dead/alive 收场，根本走不到兜底 —— 兜底预算（attempts×timeoutMs
+// +echoBudget+slack）按构造就晚于它。能活过兜底的只有底层不配合取消的形状，
+// 与生产语义一致：easy-proxies 记录过的就是这种协议。TestIncompleteIsNotDead
 // 用同一形状钉「unknown 不是 dead」，这里补上「兜底之后不留僵尸 ctx」。
 func TestAbortStopsTheZombie(t *testing.T) {
-	srv := hangServer(t)
+	live, echoSrv := hangPair(t)
 	var mu sync.Mutex
 	var observed context.Context
 	dial := httpclient.Dialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
 		mu.Lock()
 		observed = ctx // 最后一次拨号是 echo 段（stage-1 先发生且只有一发）
 		mu.Unlock()
+		if strings.HasSuffix(addr, strings.TrimPrefix(echoSrv.URL, "http://")) {
+			return &stubbornConn{}, nil // echo 段挂死不响应 ctx
+		}
 		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
 	})
 	p := NewProber(nil)
-	p.liveness = []string{srv.URL + "/live"}
+	p.liveness = []string{live.URL + "/live"}
 	p.gate = ""
-	p.echo = []string{srv.URL + "/echo"}
+	p.echo = []string{echoSrv.URL + "/echo"}
+	// 同 TestIncompleteIsNotDead：撞兜底的前提是 echo 的头先到、body 读挂死，
+	// 预算给到 1000ms 才不会被满载下的调度抖动抢先收口。
+	p.echoBudgetMS = 1000
+	p.backstopSlackMS = 100
 	items := []Item{{Tag: "zombie", Dial: dial, Options: ProbeOptions{TimeoutMS: 100, Attempts: 1}}}
 
 	done := make(chan []Result, 1)

@@ -517,10 +517,15 @@ func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[strin
 		}
 		switch c.Kind {
 		case engine.ChunkText:
-			start()
-			if c.Text != "" {
-				forwarded = true
+			if c.Text == "" {
+				// 与 reasoning 同一守卫:空文本增量也不发帧。部分上游把
+				// content_block_start 的空 text 或纯 keepalive 走成空增量,
+				// 严格客户端把它当成一次新的内容块开始。start() 不调 ——
+				// 空帧不值得花掉骨架帧。
+				return nil
 			}
+			start()
+			forwarded = true
 			stream.send(chunkFrame{
 				ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 				Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{Content: ptr(c.Text)}}},
@@ -821,6 +826,14 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 	var items []*respStreamItem
 	itemBySlot := map[int]*respStreamItem{}
 	seenToolSlot := map[int]bool{}
+	// curMessage / curReasoning 是**当前打开着**的同类 item:文本块只往当前
+	// 那个 message 里拼,而不是「items 里第一个 message」。旧实现用后者,
+	// 于是 text → tool_call → text 这种真实形状(先说一句、再调工具、然后继续
+	// 说)会把第二段话拼进第 0 个 item:item 数少一个、output_index 与流上的
+	// 创建序矛盾、done/completed 里的 output 也少一段。function_call 开新项
+	// 时把两者置 nil,下一段文本自然开一个新 item —— 一个内容块被另一个
+	// 种类打断就是新块。
+	var curMessage, curReasoning *respStreamItem
 	nextItemIdx := 0
 	var finalUsage stream.Usage
 	forwarded := false
@@ -869,16 +882,16 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 		}
 		switch c.Kind {
 		case engine.ChunkText:
-			sendCreated()
-			var it *respStreamItem
-			for _, cand := range items {
-				if cand.kind == "message" {
-					it = cand
-					break
-				}
+			if c.Text == "" {
+				// 与 reasoning 同守卫:空文本增量不发帧(某些上游把 role
+				// 骨架或纯 keepalive 走成 text 块),发了就是一字一行。
+				return nil
 			}
+			sendCreated()
+			it := curMessage
 			if it == nil {
 				it = openItem("message", "msg_"+itoa(nextItemIdx))
+				curMessage = it
 				sse.sendEvent("response.content_part.added", responsesDeltaEvent{
 					Type: "response.content_part.added", ItemID: it.itemID, OutputIndex: it.outIdx,
 					Part: &responsesContent{Type: "output_text", Text: ""},
@@ -897,15 +910,10 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 				return nil
 			}
 			sendCreated()
-			var it *respStreamItem
-			for _, cand := range items {
-				if cand.kind == "reasoning" {
-					it = cand
-					break
-				}
-			}
+			it := curReasoning
 			if it == nil {
 				it = openItem("reasoning", "rs_"+itoa(nextItemIdx))
+				curReasoning = it
 			}
 			it.text.WriteString(c.Text)
 			forwarded = true
@@ -928,6 +936,9 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 					nextItemIdx++
 					items = append(items, it)
 					itemBySlot[c.Index] = it
+					// 工具块打断了当前文本/推理块:它们到此收尾,之后的
+					// 文本另开一个 message item(见 curMessage 的注释)。
+					curMessage, curReasoning = nil, nil
 					sse.sendEvent("response.output_item.added", responsesEvent{Type: "response.output_item.added", OutputIndex: ptr(it.outIdx), Item: &responsesItem{
 						ID: it.itemID, Type: "function_call", Status: "in_progress",
 						CallID: c.ToolID, Name: c.ToolName, Arguments: "",

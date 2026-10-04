@@ -140,6 +140,11 @@ var (
 	// reThisNet 是 0.0.0.0/8(「本网段」):Windows 上 0.x 的目的地同样落在
 	// 本机栈,过去只精确匹配了 0.0.0.0 一个字面量。
 	reThisNet = regexp.MustCompile(`^0(\.\d{1,3}){3}$`)
+	// reIPv6LinkLocal 是 fe80::/10：前两个十六进制组的头 5 位等于 1111111010。
+	// 必须带冒号锚到第一个组的结尾，否则 "fe8" 这类**主机名**前缀会被误判成
+	// IPv6 地址 —— 旧实现用 strings.HasPrefix(h, "fe8") 等四个裸前缀，正是这样
+	// 把名为 "fe8-proxy.example" 的合法节点整条丢掉的。
+	reIPv6LinkLocal = regexp.MustCompile(`^fe[89ab][0-9a-f]:`)
 )
 
 // IsUnroutableServer reports whether a node advertises an address this machine
@@ -180,8 +185,11 @@ func IsUnroutableServer(server string) bool {
 	if v4, ok := strings.CutPrefix(h, "::ffff:"); ok {
 		return IsUnroutableServer(v4)
 	}
-	if strings.HasPrefix(h, "fe8") || strings.HasPrefix(h, "fe9") ||
-		strings.HasPrefix(h, "fea") || strings.HasPrefix(h, "feb") {
+	// fe80::/10（link-local，与 169.254 同义）。旧实现比的是裸前缀
+	// fe8/fe9/fea/feb，于是名为 "fe8-proxy.example" 的合法**主机名**被判成
+	// 内网地址而整条丢弃；反过来 febf::1 这类同样属于 /10 的地址又漏网。
+	// 判据锚到第一个十六进制组的结尾。
+	if reIPv6LinkLocal.MatchString(h) {
 		return true
 	}
 	if reThisNet.MatchString(h) {

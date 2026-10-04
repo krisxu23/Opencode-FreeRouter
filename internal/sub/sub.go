@@ -134,9 +134,13 @@ func Fetch(ctx context.Context, sources []string, exits []Exit) (Result, error) 
 	// 于是池子只能靠剩下那个能直连的源（354 节点）续命。
 	exitClients := make([]*http.Client, len(exits))
 	clientsBuilt := false
+	cancelled := false
 	for i := range list {
 		if raw[i] != nil || len(exits) == 0 {
 			continue
+		}
+		if cancelled {
+			break // ctx 已取消：剩下的源不再复拉（见内层 cancelled=true 处）
 		}
 		if !clientsBuilt {
 			// 客户端按出口缓存一份而不是每次尝试新建：Transport 不 dial 就不占
@@ -161,9 +165,20 @@ func Fetch(ctx context.Context, sources []string, exits []Exit) (Result, error) 
 				raw[i] = obs
 				break
 			}
-			details[i] = Detail{URL: list[i], OK: false, Error: detailError(err)}
+			// 保留**首个**真实原因：后续出口的失败（含 ctx 取消带来的
+			// "context canceled"）不是这个源的新信息，覆盖掉只会把面板上的
+			// 诊断换成一句没有指向的取消理由。
+			if details[i].Error == "" {
+				details[i] = Detail{URL: list[i], OK: false, Error: detailError(err)}
+			}
 			if ctx.Err() != nil {
-				break // JS 版的 signal?.aborted：整体已取消，别再烧出口
+				// JS 版的 signal?.aborted：整体已取消，别再烧出口。
+				// 外层循环（下一个源）同样要停：原实现只 break 内层 exits 循环，
+				// 外层继续用 12 个出口逐个重建请求，全部立刻被 ctx 拒掉 ——
+				// 12 × len(sources) 次无用的 dialer/连接池构造，取消后仍要等它们
+				// 依次失败，而每次 attemptTimeout 名义上 20s。
+				cancelled = true
+				break
 			}
 		}
 	}

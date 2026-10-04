@@ -137,7 +137,11 @@ func OverlayStale(fetchedAt int64, now time.Time) bool {
 	if fetchedAt <= 0 {
 		return true
 	}
-	return now.Sub(time.UnixMilli(fetchedAt)) >= OverlayTTL
+	// 未来时间戳（时钟回拨、另一台机器写的缓存）恒为「不陈旧」：now.Sub
+	// 得到负数，永远 < OverlayTTL，那份缓存就此**永久不刷新** —— 上游改了
+	// 上限也读不到。负向年龄按「年龄未知」处理，当陈旧。
+	age := now.Sub(time.UnixMilli(fetchedAt))
+	return age < 0 || age >= OverlayTTL
 }
 
 // fallbackMarked 报告一个目录行是否是「本地表没见过」的回退行

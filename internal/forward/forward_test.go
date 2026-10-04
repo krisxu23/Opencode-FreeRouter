@@ -1044,6 +1044,125 @@ func TestResponsesStreamEventShapePins(t *testing.T) {
 	}
 }
 
+// TestResponsesStreamTextAfterToolOpensNewItem 是 item 复用缺陷的钉。
+//
+// 形状:text("先说一句") → function_call → text("继续说")。旧实现取「items 里
+// 第一个 message」来拼文本,于是第三帧拼进第 0 个 item:added 只有 2 个
+// output_item、第三段话在 done/completed 的 output 里消失,output_index 也与
+// 流上创建序矛盾。修法是按**当前打开**的同类 item 归属(function_call 开新项
+// 时把文本/推理项置 nil)。
+func TestResponsesStreamTextAfterToolOpensNewItem(t *testing.T) {
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		for _, c := range []engine.Chunk{
+			{Kind: engine.ChunkText, Text: "先说一句"},
+			{Kind: engine.ChunkToolCallDelta, Index: 0, ToolID: "c1", ToolName: "search", ToolDelta: `{"q":"x"}`},
+			{Kind: engine.ChunkText, Text: "继续说"},
+		} {
+			if err := onChunk(c); err != nil {
+				return engine.Outcome{}, err
+			}
+		}
+		return engine.Outcome{Text: "先说一句继续说"}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/responses", auth(), `{"model":"m","stream":true}`)
+	evs := responsesSSEEvents(t, body)
+
+	var addedIDs, deltaIDs []string
+	for _, ev := range evs {
+		switch ev["type"] {
+		case "response.output_item.added":
+			it := ev["item"].(map[string]any)
+			if it["type"] == "message" {
+				addedIDs = append(addedIDs, it["id"].(string))
+			}
+		case "response.output_text.delta":
+			deltaIDs = append(deltaIDs, ev["item_id"].(string))
+		}
+	}
+	if len(addedIDs) != 2 {
+		t.Fatalf("message 项的 added 事件 = %d 个(%v), want 2(工具块后的文本必须另开一项)", len(addedIDs), addedIDs)
+	}
+	if len(deltaIDs) != 2 || deltaIDs[0] == deltaIDs[1] {
+		t.Fatalf("两段文本的 delta 必须落在不同 item 上, got %v", deltaIDs)
+	}
+	if deltaIDs[0] != addedIDs[0] || deltaIDs[1] != addedIDs[1] {
+		t.Fatalf("delta 归属 %v 与 added %v 不一致", deltaIDs, addedIDs)
+	}
+
+	// completed 的 output 必须两段都在,不能少一个 message。
+	var last map[string]any
+	for _, ev := range evs {
+		if ev["type"] == "response.completed" {
+			last = ev
+		}
+	}
+	resp, ok := last["response"].(map[string]any)
+	if !ok {
+		t.Fatalf("completed 缺 response 字段: %v", last)
+	}
+	out, _ := resp["output"].([]any)
+	msgs := 0
+	for _, o := range out {
+		if m, ok := o.(map[string]any); ok && m["type"] == "message" {
+			msgs++
+		}
+	}
+	if msgs != 2 {
+		t.Fatalf("completed.output 里的 message = %d 个(%v), want 2", msgs, out)
+	}
+}
+
+// TestEmptyTextDeltaIsNotForwarded 是空守卫的钉:空文本增量不发帧、不花骨架帧
+// (与 reasoning 同一守卫)。
+func TestEmptyTextDeltaIsNotForwarded(t *testing.T) {
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		if err := onChunk(engine.Chunk{Kind: engine.ChunkText, Text: ""}); err != nil {
+			return engine.Outcome{}, err
+		}
+		if err := onChunk(engine.Chunk{Kind: engine.ChunkText, Text: "实"}); err != nil {
+			return engine.Outcome{}, err
+		}
+		return engine.Outcome{Text: "实"}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m","stream":true}`)
+	evs := sseFrames(t, body)
+	// 空 content 的帧只允许是**骨架帧**那一发(role:assistant,无正文);
+	// 空增量若被成帧,这里会数到 2。
+	emptyFrames, textFrames := 0, 0
+	for _, ev := range evs {
+		if ev["object"] != "chat.completion.chunk" {
+			continue
+		}
+		ch, _ := ev["choices"].([]any)
+		for _, c := range ch {
+			cc, _ := c.(map[string]any)
+			d, _ := cc["delta"].(map[string]any)
+			s, ok := d["content"].(string)
+			if !ok {
+				continue // 收尾帧(只有 finish_reason)
+			}
+			if s == "" {
+				emptyFrames++
+				if d["role"] == nil {
+					t.Fatalf("空文本增量被发成了帧: %v", ev)
+				}
+				continue
+			}
+			textFrames++
+		}
+	}
+	if textFrames != 1 {
+		t.Fatalf("非空正文帧 = %d, want 1", textFrames)
+	}
+	if emptyFrames != 1 {
+		t.Fatalf("空 content 帧 = %d, want 1(只有骨架帧;空增量被当帧发了)", emptyFrames)
+	}
+}
+
 // TestJSONResponsesCarryCORS 是协议审计 M5 的钉:OPTIONS 预检承诺了跨源可用,
 // 实际 JSON 响应(非流式)必须带 Access-Control-Allow-Origin,否则浏览器在
 // 预检通过之后仍把响应拦在 CORS 之外,跨源 harness 连错误体都读不到。

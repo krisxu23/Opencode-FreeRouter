@@ -61,7 +61,12 @@ func mintID(prefix string, timestamp int64) string {
 			next = cur + 1
 		}
 		if idClock.CompareAndSwap(cur, next) {
-			v = ^uint64(next)
+			// 直接用计数值:旧实现写的是 `^uint64(next)`（按位取反）。
+			// 取反对正数就是把高 44 位全翻成 1 —— 头部 6 字节于是对每个 id
+			// 都长得一样（0xffff…），注释承诺的「同一毫秒内仍然有序」正好
+			// 反过来：后铸的 id 头部更小。任何按头部排序/比新旧的下游逻辑
+			// （日志、轨迹行的时序、客户端的会话内排序）读到的都是逆序。
+			v = uint64(next)
 			break
 		}
 	}
@@ -140,9 +145,15 @@ func RequestIDFor(sessionID, turnSeed string) string {
 	return mintID("msg_", time.Now().UnixMilli())
 }
 
-// UserIDFor mints a fresh per-turn request id. A stable per-session value was
-// tried (matching the official input.user.id) and the gated models refused it
-// on every exit; random-per-turn passes (src/upstream.js:193-200)。
+// UserIDFor mints a fresh per-turn **request** id（x-opencode-request）。
+// A stable per-session value was tried (matching the official input.user.id)
+// and the gated models refused it on every exit; random-per-turn passes
+// (src/upstream.js:193-200)。
+//
+// 名字与它铸的东西对不上:铸出的是 msg_ 前缀的**请求 id**，不是 user id。
+// 官方 wire 的 input.user.id 我们根本不填。旧名沿用至今,调用点与测试都跟着
+// 叫 UserIDFor —— 改名会让「这里在填 user id」的误读再传一遍,所以名字保留,
+// 语义写在注释里:要 user id 的地方去别处找,这里没有。
 func UserIDFor() string { return mintID("msg_", time.Now().UnixMilli()) }
 
 // TruncateSession 把会话值绑定在 maxSessionLength 内并去首尾空白

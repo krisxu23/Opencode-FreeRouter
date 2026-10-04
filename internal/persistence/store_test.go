@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestWriteJSONFileIsAtomicAndLeavesNoTemp(t *testing.T) {
@@ -135,6 +136,54 @@ func TestWriteJSONFilePropagatesFailure(t *testing.T) {
 	missing := filepath.Join(blocker, "no-such-dir", "a.json")
 	if err := WriteJSONFile(missing, map[string]int{}, false); err == nil {
 		t.Fatal("write into an unwritable path returned nil, want an error")
+	}
+}
+
+// RemoveStaleTemp 只清本包写出的形状。旧实现按 mtime 删目录里的一切 *.tmp,
+// 于是用户或别的工具链留在 data/ 里的老 .tmp 会在网关启动时被无声清掉。
+func TestRemoveStaleTempOnlyTouchesOurOwnShape(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-48 * time.Hour)
+
+	ours := filepath.Join(dir, "node-registry.json.8734120394.tmp")
+	foreign := filepath.Join(dir, "backup.tmp")
+	nested := filepath.Join(dir, "a.b.c.tmp")
+	hexish := filepath.Join(dir, "scratch.deadbeef.tmp")
+	for _, p := range []string{ours, foreign, nested, hexish} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("age %s: %v", p, err)
+		}
+	}
+	if n := RemoveStaleTemp(dir, 24*time.Hour); n != 1 {
+		t.Fatalf("删除数 = %d, want 1（只有本包写出的 <base>.<rand>.tmp）", n)
+	}
+	if _, err := os.Stat(ours); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("本包的残留临时文件应被清掉: %v", err)
+	}
+	for _, p := range []string{foreign, nested, hexish} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s 不是本包写出的形状,不该被删: %v", filepath.Base(p), err)
+		}
+	}
+}
+
+// TestRemoveStaleTempOnlyTouchesOurOwnShapeSparesRecent 与上条配对：新写出的
+// 临时文件即使形状对，也不能在 age 之内被删（否则一次正在写的原子替换会被
+// 自己人拆掉）。
+func TestRemoveStaleTempSparesRecentFiles(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "settings.json.4210987.tmp")
+	if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if n := RemoveStaleTemp(dir, time.Hour); n != 0 {
+		t.Fatalf("删除数 = %d, want 0（age 之内的新文件不能被删）", n)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("新临时文件不该被删: %v", err)
 	}
 }
 

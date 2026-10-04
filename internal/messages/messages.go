@@ -318,8 +318,14 @@ type ClaudeBlock struct {
 	Input     json.RawMessage    `json:"input,omitempty"`
 	Source    *ClaudeImageSource `json:"source,omitempty"`
 	ToolUseID string             `json:"tool_use_id,omitempty"`
-	Content   string             `json:"content,omitempty"`
-	IsError   *bool              `json:"is_error,omitempty"`
+	// Content 用 *string 而不是 string:tool_result 的 `content` 键是**必写**
+	// 的（JS 定下的插入序里它排在 tool_use_id 与 is_error 之间），而其余块型
+	// 又必须完全不写该键。一个值语义的 `string` 加 omitempty 在空串时会把键
+	// 一起吞掉，产出的 `{"type":"tool_result","tool_use_id":"x"}` 让按必填
+	// 读 content 的上游解析成 undefined 而不是空串。指针 + omitempty 能同时
+	// 满足两边：tool_result 恒给非 nil 指针（哪怕指向空串），其它块型留 nil。
+	Content *string `json:"content,omitempty"`
+	IsError *bool   `json:"is_error,omitempty"`
 }
 
 // ClaudeMessage 是 claude 线的消息。
@@ -380,10 +386,11 @@ func ToClaudeMessages(messages []Message, resolve ResolveImage) (ClaudeShape, []
 		}
 		if m.Role == roleTool {
 			isError := m.IsError
+			out := toolOutput(blocks)
 			shape.Messages = append(shape.Messages, ClaudeMessage{Role: roleUser, Content: []ClaudeBlock{{
 				Type:      "tool_result",
 				ToolUseID: m.ToolCallID,
-				Content:   toolOutput(blocks),
+				Content:   &out,
 				IsError:   &isError,
 			}}})
 			continue

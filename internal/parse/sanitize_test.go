@@ -269,6 +269,11 @@ func TestSanitizeNormalizesFlowTransportAndTLS(t *testing.T) {
 	if _, ok := SanitizeOutbound(Outbound{Type: "vless", Server: "h", ServerPort: 443, UUID: testUUID, Transport: &Transport{Type: "xhttp"}}); ok {
 		t.Fatal("unknown transport must drop the node")
 	}
+	// 已知传输的大小写要规范化回写：旧实现只把 ToLower 结果用于**判定**，
+	// Type 原样进盘，于是同一台服务器的指纹随订阅源怎么写而变。
+	if n, ok := SanitizeOutbound(Outbound{Type: "vless", Server: "h", ServerPort: 443, UUID: testUUID, Transport: &Transport{Type: "WS"}}); !ok || n.Transport.Type != "ws" {
+		t.Fatalf("transport type not normalized: %+v ok=%v", n.Transport, ok)
+	}
 	// tls 块 enabled:false 等价于没有 tls；非 vless 的协议带 tls 会整份配置 FATAL
 	if s, ok := SanitizeOutbound(Outbound{Type: "vless", Server: "h", ServerPort: 443, UUID: testUUID, TLS: &TLS{Enabled: BoolPtr(false)}}); !ok || s.TLS != nil {
 		t.Fatalf("disabled tls must be removed, ok=%v", ok)

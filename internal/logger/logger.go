@@ -99,21 +99,14 @@ func write(level string, parts ...any) {
 	if file == "" {
 		return
 	}
-	if size >= maxFileBytes {
-		// 与 JS 同款单文件轮转：rename 到 <base>.old.log（Windows 的
-		// MoveFileEx REPLACE_EXISTING 语义与 libuv 一致，可直接覆盖）。
-		//
-		// R10:只有 rename **成功**才把计数归零。JS 版无论成败都归零,于是
-		// 目标 .old.log 被占用(MoveFileEx 失败)时计数被清零、继续往没轮转
-		// 的同一个文件追加 ⇒ gateway.log 无界增长。失败时保留 size,下一行
-		// 会再试一次 rename;只有真轮转过去,size 才重新从零开始计。
-		if err := os.Rename(file, strings.TrimSuffix(file, ".log")+".old.log"); err != nil {
-			// 不能在这里递归记日志(会再次进 write,而 mu 已被持有)。
-			// 保留 size 让下一次写入重试,而不是假装轮转成功。
-		} else {
-			size = 0
-		}
-	}
+	// 先写、再轮转。旧顺序是「先 rename 轮转、再 OpenFile 写这一行」：
+	// rename 成功后紧接着的 OpenFile 若失败（杀软正锁着新名字、日志查看器
+	// 抢在前面打开、磁盘抖一下），这一行就被整条吞掉 —— 而且当时 size 已经
+	// 归零，没有任何机制会重试这一行。改成写完再轮转：rename 之后即使
+	// 重开失败，丢的也只是「新建一个空文件」这件事，本行已经落在盘上。
+	//
+	// 代价是轮转边界后移一行（文件最多到 maxFileBytes + 一行），
+	// 这与「不丢日志」相比是可以接受的取舍。
 	f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return // fail-soft: the next line retries
@@ -124,6 +117,19 @@ func write(level string, parts ...any) {
 		return
 	}
 	size += int64(n)
+
+	if size >= maxFileBytes {
+		// 与 JS 同款单文件轮转：rename 到 <base>.old.log（Windows 的
+		// MoveFileEx REPLACE_EXISTING 语义与 libuv 一致，可直接覆盖）。
+		//
+		// R10:只有 rename **成功**才把计数归零。JS 版无论成败都归零,于是
+		// 目标 .old.log 被占用(MoveFileEx 失败)时计数被清零、继续往没轮转
+		// 的同一个文件追加 ⇒ gateway.log 无界增长。失败时保留 size,下一行
+		// 会再试一次 rename;只有真轮转过去,size 才重新从零开始计。
+		if err := os.Rename(file, strings.TrimSuffix(file, ".log")+".old.log"); err == nil {
+			size = 0
+		}
+	}
 }
 
 // Info records a normal event.

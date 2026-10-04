@@ -123,6 +123,13 @@ type Stats struct {
 	// dirty 表示内存比磁盘新,到期或 Flush 时才需要真正写一次。
 	timer *time.Timer
 	dirty bool
+	// flushMu 把写盘串行化,并且**快照的克隆也必须在它里面**。去抖只是缩小了
+	// 并发窗口,没有封死它:flushPending 走到写盘时,Record 可能正在置
+	// dirty=true 并武装新 timer,而一次显式 Flush 也可能同时进来。若只给
+	// WriteJSONFile 串行化、快照在锁外克隆,两路的 rename 顺序仍可能让**旧**
+	// 快照后写、覆盖新快照(丢数据)。把「克隆 + 置 dirty=false + 写盘」整体
+	// 放进 flushMu,盘上任何时刻只有一个写者,且它写的一定是最新克隆。
+	flushMu sync.Mutex
 }
 
 // New returns an empty board writing to file.
@@ -267,7 +274,10 @@ func (s *Stats) Record(r Record) {
 	s.snap.Requests++
 
 	var ttft *int64
-	if r.TTFTMS != 0 {
+	if r.TTFTMS >= 0 {
+		// 0 也算一次真实量测。旧的 `!= 0` 把「本轮 TTFT 恰为 0 毫秒」当成
+		// 「没量到」，样本的 ttftMs 键直接不写 —— 本机回环上的快速模型真的
+		// 会量出 0ms，那一行在面板上就成了「无数据」。负数才是「没量到」。
 		v := r.TTFTMS
 		ttft = &v
 	}
@@ -310,7 +320,14 @@ func (s *Stats) Record(r Record) {
 
 // flushPending is the debounce timer's callback: it lands whatever Record has
 // accumulated since the window opened.
+//
+// flushMu 在 s.mu **之外**先抢：抢到之后再进 s.mu 复检 dirty（期间可能有另一路
+// 写者已经把这批改动落盘），复检不过就什么都不做。反过来先锁 s.mu 再抢
+// flushMu 会与 Record 形成 ABBA 的锁序风险（Record 只碰 s.mu，不碰 flushMu，
+// 实际不会死锁，但把「持有一把锁去等另一把」写进常规路径不划算）。
 func (s *Stats) flushPending() {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	s.mu.Lock()
 	s.timer = nil
 	if !s.dirty || s.file == "" {
@@ -432,6 +449,8 @@ func (s *Stats) History(days int, now int64) []HistoryRow {
 // debounce is cancelled first: otherwise a timer armed before shutdown would
 // fire after the process had already decided it was done writing.
 func (s *Stats) Flush() error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	s.mu.Lock()
 	if s.timer != nil {
 		s.timer.Stop()

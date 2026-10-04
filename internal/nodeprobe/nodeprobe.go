@@ -158,6 +158,30 @@ type Prober struct {
 	liveness []string
 	gate     string // 空串 = 关掉闸门（测试用）
 	echo     []string
+	// echoBudgetMS 是 echo 段（出口 IP/国家那一段）自己的预算。做成字段而不是
+	// 直接引用常量，是为了让测试能用「很快的 echo 预算」构造出「阶段一先过、
+	// echo 慢到吃满预算」的形状 —— 生产值 8000ms 让这种用例要么等 8 秒、
+	// 要么碰不到兜底，钉不住任何东西。零值按 echoBudgetMS 走。
+	echoBudgetMS int
+	// backstopSlackMS 是兜底预算在「最坏耗时」之上的余量。同为测试可覆盖:
+	// 兜底只在底层不响应 ctx 取消时才可能触发，生产余量 5000ms；测试要的是
+	// 「兜底确实会触发且不留僵尸」，把余量压到几百毫秒才能让用例在秒级跑完。
+	// 零值按 backstopSlackMS 走。
+	backstopSlackMS int
+}
+
+func (p *Prober) echoBudgetMs() int {
+	if p.echoBudgetMS > 0 {
+		return p.echoBudgetMS
+	}
+	return echoBudgetMS
+}
+
+func (p *Prober) slackMs() int {
+	if p.backstopSlackMS > 0 {
+		return p.backstopSlackMS
+	}
+	return backstopSlackMS
 }
 
 // NewProber 装入生产默认探测源。logf 可为 nil（静默）。
@@ -446,13 +470,20 @@ func (p *Prober) ProbeNode(ctx context.Context, dial httpclient.Dialer, timeoutM
 	var echo exitInfo
 	if len(p.echo) > 0 {
 		echoJudge := func(resp *http.Response, _ string) (any, error) {
+			// 状态码先于解析:第三方 echo 站点被墙时经常返回一个 200 之外的
+			// 拦截页/错误 JSON，而它的 body 里照样带 ip/query 字段 —— 只解析
+			// body 会把「被拦截」判成「成功量到出口 IP」。与 liveness/gate 段
+			// 的状态码检查同一口径：非 2xx 一律不算这一枪成功。
+			if resp.StatusCode < 200 || resp.StatusCode > 299 {
+				return nil, fmt.Errorf("echo HTTP %d", resp.StatusCode)
+			}
 			body, err := httpclient.ReadCapped(resp.Body, maxEchoBodyBytes)
 			if err != nil {
 				return nil, fmt.Errorf("echo body unreadable: %w", err)
 			}
 			return exitInfoOf(body)
 		}
-		if v := firstSuccess(ctx, dial, p.echo, echoBudgetMS, func(string) string { return ProbeUA }, echoJudge); v != nil {
+		if v := firstSuccess(ctx, dial, p.echo, p.echoBudgetMs(), func(string) string { return ProbeUA }, echoJudge); v != nil {
 			if info, ok := v.(exitInfo); ok {
 				echo = info
 			}
@@ -529,9 +560,9 @@ func (p *Prober) probeUpstream(ctx context.Context, dial httpclient.Dialer, time
 //     ——既不 alive 也**不判 dead**：判 dead 会白白给一个可能健康的节点记一次
 //     连败，调用方拿到 unknown 应当跳过它这一轮。
 //
-// 预算 attempts×timeoutMs+5000：必须**不小于** probeNode 自己允许的最坏耗时，
-// 否则兜底会把正常慢节点误判成不完整（tests/nodeprobe.test.js:71-99 钉的就是
-// 这个下界）。
+// 预算 attempts×timeoutMs+echoBudgetMS+backstopSlackMS（见 probeOne）：必须
+// **不小于** probeNode 自己允许的最坏耗时，否则兜底会把正常慢节点误判成
+// 不完整（tests/nodeprobe.test.js:71-99 钉的就是这个下界）。
 //
 // 与 JS 的差异：JS 用 onResult 回调乱序回报；Go 按输入顺序整批返回（结果槽位按
 // 下标写，worker 间无竞争），app 落盘与断言都需要确定性顺序。
@@ -575,23 +606,42 @@ func (p *Prober) probeOne(ctx context.Context, item Item, out *Result) {
 	if timeoutMs <= 0 {
 		timeoutMs = defaultTimeoutMS
 	}
+	// UpstreamOnly 与全量走同一套兜底。旧的「单发探针自带期限、不需要兜底」是
+	// 错的：firstSuccess 的 shot 期限只是**传进请求 ctx 的期限**，底层拨号器
+	// 不响应 ctx 取消时（easy-proxies 记录过的那种协议），那一发照样永久挂着
+	// —— worker 不归还 slot，workers 逐渐枯竭，整轮 ProbeAll 卡死。兜底的价值
+	// 从来不在「补一个时间上限」，而在「不依赖底层配合地保底收口」。
+	run := p.ProbeNode
+	budgetMS := 0
 	if item.Options.UpstreamOnly {
-		// 持续健康监测的单发探针：预算就是 timeoutMs 本身（firstSuccess 的
-		// shot 自带期限），不需要 backstop 兜底。
-		out.Result = p.probeUpstream(ctx, item.Dial, timeoutMs)
-		return
+		run = func(wctx context.Context, dial httpclient.Dialer, _ int, _ int) ProbeResult {
+			return p.probeUpstream(wctx, dial, timeoutMs)
+		}
+		// 单发探针的最坏耗时就是 timeoutMs 本身。
+		budgetMS = timeoutMs + p.slackMs()
+	} else {
+		attempts := item.Options.Attempts
+		if attempts <= 0 {
+			attempts = defaultAttempts
+		}
+		// 兜底预算必须**不小于** ProbeNode 自己允许的最坏耗时：attempts 段
+		// attempts×timeoutMs，加上 echo 段的 echoBudgetMS（echo 走 firstSuccess，
+		// 它自己是唯一的固定预算段，不吃 timeoutMs），再留 backstopSlackMS 的
+		// 余量。旧式写法 attempts×timeoutMs+backstopSlackMS 少了整段 echo 预算：
+		// 「阶段一至少一枪成功 + echo 慢」的活节点会被兜底提前掐成 incomplete，
+		// 整轮结果作废（这一项在 1.3.2 的事故里已经出现过同形状的误伤）。
+		budgetMS = attempts*timeoutMs + p.echoBudgetMs() + p.slackMs()
+		run = func(wctx context.Context, dial httpclient.Dialer, _ int, _ int) ProbeResult {
+			return p.ProbeNode(wctx, dial, timeoutMs, attempts)
+		}
 	}
-	attempts := item.Options.Attempts
-	if attempts <= 0 {
-		attempts = defaultAttempts
-	}
-	budget := time.Duration(attempts*timeoutMs+backstopSlackMS) * time.Millisecond
+	budget := time.Duration(budgetMS) * time.Millisecond
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	done := make(chan ProbeResult, 1)
-	go func() { done <- p.ProbeNode(wctx, item.Dial, timeoutMs, attempts) }()
+	go func() { done <- run(wctx, item.Dial, 0, 0) }()
 	select {
 	case r := <-done:
 		out.Result = r

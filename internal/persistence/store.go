@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -121,12 +122,38 @@ func WriteJSONFile(file string, v any, indent bool) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("persistence: 替换 %s: %w", file, err)
 	}
+	syncDir(dir)
 	return nil
+}
+
+// syncDir 把目录项本身钉到盘上。
+//
+// rename 的持久性靠两条独立的写:文件数据（上面 f.Sync 已做）与**目录项**
+// （名字到 inode 的映射）。只 Sync 文件时,掉电后目录项可能仍是旧的名字 ——
+// 极端形状是「文件内容是新内容、目录项指向一个已不存在的 tmp」,重启读回
+// 得到 fs.ErrNotExist,网关按 first-run 启动并把上一份注册表/健康账目整个
+// 丢掉。POSIX 上打开目录做 fsync 是标准做法。
+//
+// Windows:目录句柄不能按普通文件那样 fsync(FlushFileBuffers 对目录返回
+// 错误),NTFS 的日志本身保证 rename 的元数据有序落盘,故直接跳过。所有错误
+// 都吞掉——这一步是加固,不是正确性的前提,失败不该让一次成功的写变成失败。
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // RemoveStaleTemp 清掉目录里超过 age 的 *.tmp(WriteJSONFile 崩溃现场的
 // 遗留)。写入中途被杀的进程没有任何清理路径,长期运行的实例会慢慢攒出一堆
 // 临时文件。返回删除的个数;只删 .tmp 后缀,绝不碰别的文件。启动路径调用。
+//
+// 判据是「mtime 早于 cutoff **且** 文件名是本包写出的那种形状」。旧实现只
+// 按 mtime 删目录里的一切 *.tmp:同目录里任何第三方（或另一个工具链）留下的
+// .tmp 只要够老就会被连带删掉,而用户往 data/ 里放的东西没有理由被网关在
+// 启动时清空。本包写出的是 `<basename>.<随机串>.tmp`,按这个模式收窄。
 func RemoveStaleTemp(dir string, age time.Duration) int {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -138,6 +165,9 @@ func RemoveStaleTemp(dir string, age time.Duration) int {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".tmp" {
 			continue
 		}
+		if !ownTempName(e.Name()) {
+			continue // 不是本包写出的形状:不碰
+		}
 		fi, err := e.Info()
 		if err != nil || fi.ModTime().After(cutoff) {
 			continue
@@ -147,6 +177,32 @@ func RemoveStaleTemp(dir string, age time.Duration) int {
 		}
 	}
 	return removed
+}
+
+// ownTempName 报告一个文件名是否是 WriteJSONFile 可能写出的临时文件形状:
+// `<basename>.<随机数>.tmp`。指纹取自 os.CreateTemp 本身 —— 它的随机串是
+// 下一段**十进制数字**（Go 的 nextRandom 走 runtime_rand 的十进制渲染）,
+// 所以「.tmp 紧前的那一段非空且全是数字」就是它的签名。basename 里带点无妨
+// (settings.json 这类目标名本来就带点)。
+func ownTempName(name string) bool {
+	if filepath.Ext(name) != ".tmp" {
+		return false
+	}
+	stem := strings.TrimSuffix(name, ".tmp")
+	i := strings.LastIndex(stem, ".")
+	if i < 0 {
+		return false
+	}
+	tail := stem[i+1:]
+	if tail == "" {
+		return false
+	}
+	for i := 0; i < len(tail); i++ {
+		if tail[i] < '0' || tail[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ReadJSONFile decodes file into out. A missing file reports fs.ErrNotExist so

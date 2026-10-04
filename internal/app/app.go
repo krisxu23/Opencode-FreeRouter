@@ -10,6 +10,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -697,7 +698,12 @@ func Load(root string) (*Parts, error) {
 	}
 	closers = append(closers, fwdLn.Close)
 	go func() {
-		if err := srv.Serve(fwdLn); err != nil {
+		// 与下面的 panel.Serve 同一条纪律（panel.go:234 是这么写的）：
+		// 关停走 srv.Close()，Serve 返回的 ErrServerClosed 是**正常收尾**，
+		// 记成 Error 会在每次正常退出时刷一条红色错误日志，把真正的
+		// 监听故障淹没在噪声里。用 errors.Is 而不是 !=，包过一层的
+		// 关闭错误也能认出来。
+		if err := srv.Serve(fwdLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error(fmt.Sprintf("[app] 转发监听退出: %v", err))
 		}
 	}()

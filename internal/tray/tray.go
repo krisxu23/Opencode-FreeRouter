@@ -111,7 +111,14 @@ func PanelUp(port int) bool {
 // 最不挑环境的开浏览器方式 —— 不依赖默认浏览器注册表形状，也不引入新依赖。
 // 错误被刻意吞掉：开不开得了浏览器都不该影响托盘自身的生命周期。
 func OpenBrowser(url string) {
-	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	// Start 之后必须 Wait（或 Release）：不回收的子进程句柄按 PID 计,
+	// 进程活着就一直占一个 —— 每点一次「Open panel」漏一个,托盘常驻几周的
+	// 实例会累积到进程句柄上限（默认 16 万量级,但是无界泄漏）。Wait 放在
+	// 自己的 goroutine 里：rundll32 通常几十毫秒就退,但它也可能因为
+	// 浏览器迟迟不接管而挂住,而这里不该为此阻塞调用方（菜单点击处理器）。
+	if cmd := exec.Command("rundll32", "url.dll,FileProtocolHandler", url); cmd.Start() == nil {
+		go func() { _ = cmd.Wait() }()
+	}
 }
 
 // Options is everything Run needs from the outside world.
@@ -156,9 +163,17 @@ func Run(o Options) {
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("Quit", "Stop the gateway and quit")
 
+		// 菜单 goroutine 由 done 收口：只监听三个 ClickedCh 时,菜单点击处理器
+		// 在 tray 退出后仍会留在 select 上（菜单项由 systray 持有,没人 Close
+		// 它们）,进程里就多一个永不退的 goroutine。systray.Run 返回时 close
+		// done,这一层随之结束。
+		done := make(chan struct{})
+		defer close(done)
 		go func() {
 			for {
 				select {
+				case <-done:
+					return
 				case <-mOpen.ClickedCh:
 					if o.OpenPanel != nil {
 						o.OpenPanel()

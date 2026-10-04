@@ -189,3 +189,45 @@ func TestStreamClientStillWorksForAWholeBodyRead(t *testing.T) {
 		t.Fatalf("body = %q", raw)
 	}
 }
+
+// TestIdleReaderDoesNotKillAStreamThatKeepsArriving 是 gen 仲裁位的回归用例。
+//
+// 形状：每个空闲窗口的 2/3 处送一块数据,连送十余次,总时长远超 idle。旧实现
+// (time.Timer.Reset 复用同一枚) 在计时器已触发、回调正排在 r.mu 上等锁的 tick
+// 上会把一条正在吐字的流 Close 掉,下一次 Read 报 ErrIdleTimeout —— 引擎按
+// 可重试可冷却的 TIMEOUT 处理,**健康出口被误冷却**。
+//
+// 这条用例对时序敏感,所以把余量拉开:数据每 idle*2/3 一块,即使有几十毫秒的
+// 调度抖动也远在窗口内;判定看的是「十几轮续期之后流仍然完整」,而不是某一
+// 次 Reset 的返回值。
+func TestIdleReaderDoesNotKillAStreamThatKeepsArriving(t *testing.T) {
+	const (
+		idle   = 60 * time.Millisecond
+		chunks = 15
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f, _ := w.(http.Flusher)
+		for i := 0; i < chunks; i++ {
+			_, _ = io.WriteString(w, "x")
+			if f != nil {
+				f.Flush()
+			}
+			time.Sleep(idle * 2 / 3)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewStreamClient(nil, idle)
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("持续吐字的流被空闲读掐断了: %v（want nil）", err)
+	}
+	if len(raw) != chunks {
+		t.Fatalf("读到 %d 字节, want %d", len(raw), chunks)
+	}
+}

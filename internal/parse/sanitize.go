@@ -180,6 +180,13 @@ func SanitizeOutbound(o Outbound) (Outbound, bool) {
 			o.Transport = nil
 		} else if !knownTransportTypes[t] {
 			return Outbound{}, false
+		} else {
+			// 回写规范化后的 Type：旧实现只把 t 用于**判定**，`o.Transport.Type`
+			// 仍留着原样的大小写（"WS" / "Http" / "GRPC" 全都原样进盘）。下游按
+			// 精确匹配读它（identity 的指纹、按类型挑配置、面板渲染），于是
+			// 「knownTransportTypes 里全小写」这个前提在数据层根本不成立 ——
+			// 同一台服务器的指纹会随订阅源怎么写而变。
+			o.Transport.Type = t
 		}
 	}
 

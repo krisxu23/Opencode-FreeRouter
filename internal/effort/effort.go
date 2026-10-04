@@ -9,6 +9,9 @@ package effort
 // narrow struct instead of the catalog row keeps effort (L1) free of any
 // dependency on catalog (L1) — same layer, and the layer check forbids the
 // sibling import.
+
+import "math"
+
 type Entry struct {
 	ID            string
 	ContextWindow int64
@@ -135,6 +138,14 @@ func BudgetFor(l Level, e Entry, requested int, settingsDefault *int) int {
 	}
 	if capacity < minBudget {
 		capacity = minBudget
+	}
+	// int 是平台相关的:32 位构建上 MaxInt 是 2^31-1,而 capacity 来自
+	// int64(e.MaxOutput)。一个上限 8 万 token 的模型（远未到 2^31）在 32 位
+	// 上不会溢出,但一个上游报了荒谬 max_output、或默认上限被改成 GB 量级的
+	// 场景会 —— 溢出的 int 变负数,而调用方按「非正 = 未设置」处理,于是这个
+	// 预算被静默丢弃、请求不带 max_tokens。钳在 MaxInt 上,语义不变。
+	if capacity > math.MaxInt {
+		return math.MaxInt
 	}
 	return int(capacity)
 }
