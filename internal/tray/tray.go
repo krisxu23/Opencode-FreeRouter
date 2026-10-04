@@ -149,6 +149,18 @@ type Options struct {
 // （由调用方传中文），只有菜单项受影响。Quit 的就绪守卫见包首注释。
 
 func Run(o Options) {
+	// done 由 **Run** 持有，不由下面的 onReady 回调持有。
+	//
+	// onReady 回调一建完菜单项就立刻返回（systray.Run 自己继续阻塞整个托盘
+	// 生命周期）。所以 `defer close(done)` 绝不能写在回调里：它会在开表几微秒
+	// 后就掐掉菜单 goroutine，三个菜单项**全部失效** —— "Open panel" 不再打开
+	// 面板、"Quit" 不再退出，用户只能去任务管理器强杀。这个错一旦犯就是整条
+	// 托盘路径报废，且没有任何单元测试能在无桌面会话里看见它。
+	//
+	// 收口的正确时机是 systray.Run 返回（= 托盘结束）那一刻。
+	done := make(chan struct{})
+	defer close(done)
+
 	systray.Run(func() {
 		// Register 已经完成:放开信号桥的 Quit 许可。
 		readyOnce.Do(func() { close(ready) })
@@ -165,38 +177,45 @@ func Run(o Options) {
 
 		// 菜单 goroutine 由 done 收口：只监听三个 ClickedCh 时,菜单点击处理器
 		// 在 tray 退出后仍会留在 select 上（菜单项由 systray 持有,没人 Close
-		// 它们）,进程里就多一个永不退的 goroutine。systray.Run 返回时 close
-		// done,这一层随之结束。
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			for {
-				select {
-				case <-done:
-					return
-				case <-mOpen.ClickedCh:
-					if o.OpenPanel != nil {
-						o.OpenPanel()
-					} else if o.PanelURL != nil {
-						// 兜底：调用方没给动作时，用包内自己的
-						// OpenBrowser 开 PanelURL —— 菜单档位不许空转。
-						OpenBrowser(o.PanelURL())
-					}
-				case <-mReload.ClickedCh:
-					if o.Reload != nil {
-						o.Reload()
-					}
-				case <-mQuit.ClickedCh:
-					// 先 o.Quit()（它负责 stop()+Shutdown）再 systray.Quit()：
-					// 反过来会让消息循环先死、善后回调可能不执行
-					// （launcher:194-197 的顺序同款）。
-					if o.Quit != nil {
-						o.Quit()
-					}
-					quitOnce.Do(func() { systray.Quit() })
-					return
-				}
-			}
-		}()
+		// 它们）,进程里就多一个永不退的 goroutine。
+		go menuLoop(done, mOpen.ClickedCh, mReload.ClickedCh, mQuit.ClickedCh, o, systray.Quit)
 	}, nil)
+}
+
+// menuLoop 是托盘菜单的点击处理循环。done 关闭即返回（托盘已结束）。
+//
+// 独立成函数有三个理由：一是 Run 里只剩「谁拥有 done」这一处关键结构，读者一眼
+// 能看出它属于 Run 而不是 onReady 回调（见 Run 的注释）；二是这里可以用假
+// channel 测 —— 无交互桌面的测试环境进不去 systray.Run，但没有理由因此测不了
+// 「点 Open panel 真的会调 OpenPanel / done 一关循环就退」；三是 quitTray 成了
+// 注入点：systray.Quit() 在托盘没起来时会自锁，测试直接调它只会把测试二进制
+// 挂死（这正是本包原来一个菜单项都测不了的原因）。
+func menuLoop(done <-chan struct{}, openCh, reloadCh, quitCh <-chan struct{}, o Options, quitTray func()) {
+	for {
+		select {
+		case <-done:
+			return
+		case <-openCh:
+			if o.OpenPanel != nil {
+				o.OpenPanel()
+			} else if o.PanelURL != nil {
+				// 兜底：调用方没给动作时，用包内自己的 OpenBrowser 开
+				// PanelURL —— 菜单档位不许空转。
+				OpenBrowser(o.PanelURL())
+			}
+		case <-reloadCh:
+			if o.Reload != nil {
+				o.Reload()
+			}
+		case <-quitCh:
+			// 先 o.Quit()（它负责 stop()+Shutdown）再 systray.Quit()：
+			// 反过来会让消息循环先死、善后回调可能不执行
+			// （launcher:194-197 的顺序同款）。
+			if o.Quit != nil {
+				o.Quit()
+			}
+			quitOnce.Do(func() { quitTray() })
+			return
+		}
+	}
 }
