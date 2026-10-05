@@ -171,6 +171,11 @@
   function derive() {
     const nodes = DATA.nodes || []
     const alive = nodes.filter(n => n.state === 'alive')
+    // 2026-10-06:5秒轮询不带 nodes（?include_nodes=false），概览计数用 lastCheck。
+    // nodes 数组只在初始 bootstrap 和节点页手动刷新时有。
+    const lc = (DATA.singbox && DATA.singbox.lastCheck) || {}
+    const totalCount = lc.nodes != null ? lc.nodes : nodes.length
+    const aliveCount = lc.alive != null ? lc.alive : alive.length
     const lats = alive.map(n => n.latencyMs).filter(x => x >= 0).sort((a, b) => a - b)
     const bucketCount = {}
     for (const n of nodes) {
@@ -194,6 +199,8 @@
     const todayKey = new Date().toISOString().slice(0, 10)
     D = {
       nodes: nodes, alive: alive,
+      // 2026-10-06:概览计数用 lastCheck（轮询不带 nodes 时保持更新）
+      nodeTotal: totalCount, nodeAlive: aliveCount,
       // 车道视图直传：渲染层读 D.lanes（实时负载卡）。DATA.lanes 由
       // absorbStatus 随 /api/status 更新；缺省空对象让 laneRows 返回空串。
       lanes: DATA.lanes || {},
@@ -295,7 +302,7 @@
      ═══════════════════════════════════════════════════════════════════ */
   const NAV_MONITOR = [
     { id:'overview', label:'概览', icon:I.gauge },
-    { id:'nodes', label:'出口节点', icon:I.nodes, badge:function () { return String(D.alive.length) } },
+    { id:'nodes', label:'出口节点', icon:I.nodes, badge:function () { return String(D.nodeAlive) } },
     { id:'models', label:'免费模型', icon:I.cube, badge:function () { return String(D.models.length) } },
     { id:'usage', label:'用量', icon:I.chart },
     { id:'logs', label:'日志', icon:I.scroll }
@@ -362,7 +369,7 @@
         + (up ? 'sing-box 运行中' : 'sing-box 未运行') + '</span>'
       + (diskErr ? '<span class="sb-item" style="color:var(--warn)" title="用量统计写盘失败：' + esc(diskErr) + '">写盘失败</span>' : '')
       + (badge ? '<span class="sb-item" style="color:var(--warn)">' + esc(badge) + '</span>' : '')
-      + '<span class="sb-item">出口 ' + D.alive.length + '/' + D.nodes.length + '</span>'
+      + '<span class="sb-item">出口 ' + D.nodeAlive + '/' + D.nodeTotal + '</span>'
       + '<span class="sb-item">今日 ' + D.usage.today.req + ' 次</span>'
       + '<span class="sb-item">:' + (fw.port == null ? 3457 : fw.port) + '</span>'
   }
@@ -391,7 +398,7 @@
     + '    </div>'
     + '    <div class="kpi">'
     + '      <div class="kpi-label">可用出口</div>'
-    + '      <div class="kpi-value">' + D.alive.length + '<span class="unit">/ ' + D.nodes.length + ' 节点</span></div>'
+    + '      <div class="kpi-value">' + D.nodeAlive + '<span class="unit">/ ' + D.nodeTotal + ' 节点</span></div>'
     + '      <div class="kpi-sub"><span class="badge badge-tier badge-ok">B ' + D.tierB + '</span>'
     + '        <span class="badge badge-tier badge-neutral">A ' + D.tierA + '</span>'
     + '        <span class="dim">延迟中位 ' + fmtLat(D.latMed) + '</span></div>'
@@ -1159,7 +1166,9 @@
     if (statusBusy) return Promise.resolve()
     statusBusy = true
     const seq = ++statusSeq
-    return j('/api/status').then(function (s) {
+    // 2026-10-06:全量节点太重，5秒轮询不带 nodes（走 ?include_nodes=false），
+    // 节点列表页按需从 /api/nodes 分页加载。
+    return j('/api/status?include_nodes=false').then(function (s) {
       statusBusy = false
       if (seq !== statusSeq) return
       absorbStatus(s)

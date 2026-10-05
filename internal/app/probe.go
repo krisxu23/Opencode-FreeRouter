@@ -233,12 +233,21 @@ func (p *Parts) collectPassItems(tags []string, opts nodeprobe.ProbeOptions) []n
 // 故障判据见 applyFirstProbeGuard)。
 func (p *Parts) applyAccidentGuard(ctx context.Context, sum *PassSummary, tested, alive int) bool {
 	if tested < probeAccidentMin || float64(alive)/float64(tested) >= probeAliveFloor {
+		p.guardDiscards.Store(0)
 		return false
 	}
 	derr := p.Prober.ProbeDirect(ctx, probeDirectTimeoutMS)
 	reason := "上游闸门疑似故障"
 	if derr != nil {
 		reason = "本机断网（直连也不可达）"
+	}
+	// 2026-10-06:连续丢弃上限。热区节点曾活过，guard 保护它们不被误杀，
+	// 但无限丢弃会让热区状态永远冻结。3 轮后强制落地。
+	if n := p.guardDiscards.Add(1); n > 3 {
+		p.guardDiscards.Store(0)
+		p.lastHotOK.Store(false)
+		logger.Warn(fmt.Sprintf("热区 guard 连续 %d 轮丢弃，强制落地（%d/%d 存活）", n, alive, tested))
+		return false
 	}
 	p.lastHotOK.Store(false)
 	logger.Error(fmt.Sprintf("探测通道疑似故障（%s）：热区 %d 个节点仅 %d 个通过（%.0f%% < %.0f%% 地板）— 本轮结果整体丢弃，冷区删除冻结",
@@ -285,11 +294,21 @@ func (p *Parts) runProbeItems(ctx context.Context, items []nodeprobe.Item, max i
 // 才丢弃整轮 —— 与 1.2.x 的 ProbeDirect 语义逐字同口径。
 func (p *Parts) applyFirstProbeGuard(ctx context.Context, sum *PassSummary, tested, alive int) bool {
 	if alive > 0 || tested == 0 {
+		p.guardDiscards.Store(0)
 		return false
 	}
 	derr := p.Prober.ProbeDirect(ctx, probeDirectTimeoutMS)
 	if derr == nil {
+		p.guardDiscards.Store(0)
 		return false // 零通关但直连正常:这批新节点确实全死,判决照常落地
+	}
+	// 2026-10-06:首探放宽。新节点从没活过，误判为 dead 的成本低
+	// （cold pass 会重试复活）；无限丢弃只会让节点永远 unknown。
+	// 连续丢弃 3 轮后强制落地。
+	if n := p.guardDiscards.Add(1); n > 3 {
+		p.guardDiscards.Store(0)
+		logger.Warn(fmt.Sprintf("首探连续 %d 轮被 guard 丢弃，强制落地（%d 个新节点按 dead 处理，cold pass 会重试）", n, tested))
+		return false
 	}
 	logger.Error(fmt.Sprintf("探测通道疑似故障（首探 %d 个新节点零通关，且本机直连也不可达：%v）— 本轮结果整体丢弃，下一拍重探",
 		tested, derr))

@@ -674,8 +674,26 @@ func (p *Prober) ProbeDirect(ctx context.Context, timeoutMs int) error {
 			}
 			return true, nil
 		})
-	if reachable == nil {
-		return fmt.Errorf("no liveness source reachable over direct network")
+	if reachable != nil {
+		return nil
 	}
-	return nil
+	// 2026-10-06:TCP 降级。HTTPS liveness 全灭时，退一步测 TCP 连通性
+	// （1.1.1.1:443）。DNS 劫持/TLS 拦截的环境下 HTTPS 必失败，但 TCP 通
+	// 说明握手层没问题——节点探测走的就是 TCP 握手，结果可信。
+	// 只有 TCP 也不通时才判本机断网。
+	if tcpOK(ctx, timeoutMs) {
+		return nil
+	}
+	return fmt.Errorf("no liveness source reachable over direct network")
+}
+
+// tcpOK 直连 TCP 探测降级：HTTPS liveness 全灭时的第二判据。
+func tcpOK(ctx context.Context, timeoutMs int) bool {
+	d := net.Dialer{Timeout: time.Duration(timeoutMs) * time.Millisecond}
+	conn, err := d.DialContext(ctx, "tcp", "1.1.1.1:443")
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }

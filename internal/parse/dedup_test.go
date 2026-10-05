@@ -68,3 +68,20 @@ func TestDisambiguateTags_EmptyTagUntouched(t *testing.T) {
 		t.Fatal("空 tag 应原样保留")
 	}
 }
+
+// tag 清洗：查询串泄漏进名字的畸形 URL
+func TestSanitizeTag_QueryLeak(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"&security=none&host=xxx#EPODONIOS", "EPODONIOS"},
+		{"&a=1&b=2", ""},           // 纯查询串 → 空（触发回退tag）
+		{"EPODONIOS", "EPODONIOS"}, // 正常名字不动
+		{"🇺🇸 US-01", "🇺🇸 US-01"},   // emoji名字不动
+		{"?foo=bar#真名", "真名"},      // ?开头
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := sanitizeTag(c.in); got != c.want {
+			t.Errorf("sanitizeTag(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

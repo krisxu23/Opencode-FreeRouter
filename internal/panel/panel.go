@@ -98,6 +98,7 @@ type LimitsView struct {
 // Actions and Limits: a nil callback answers with a zero value.
 type PanelDeps struct {
 	Status        func() any
+	NodesPage     func(state, search string, limit, offset int) map[string]any // 2026-10-06:分页节点列表
 	GetSettings   func() any
 	ApplySettings func(map[string]any) (any, error)
 	Actions       PanelActions
@@ -424,7 +425,37 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 
 	case method == http.MethodGet && path == "/api/status":
-		writeJSON(w, http.StatusOK, s.deps.Status())
+		st := s.deps.Status()
+		// 2026-10-06:全量节点太重（4255 节点数 MB），5 秒轮询用
+		// ?include_nodes=false 只拿统计，节点列表走 /api/nodes 分页。
+		if r.URL.Query().Get("include_nodes") == "false" {
+			if m, ok := st.(map[string]any); ok {
+				delete(m, "nodes")
+			}
+		}
+		writeJSON(w, http.StatusOK, st)
+
+	case method == http.MethodGet && path == "/api/nodes":
+		// 2026-10-06:分页节点列表。state=alive|dead|unknown，search 模糊搜 tag/国家。
+		q := r.URL.Query()
+		limit := 50
+		if v := q.Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+				limit = n
+			}
+		}
+		offset := 0
+		if v := q.Get("offset"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+				offset = n
+			}
+		}
+		if s.deps.NodesPage == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"total": 0, "nodes": []any{}})
+			return
+		}
+		writeJSON(w, http.StatusOK, s.deps.NodesPage(
+			q.Get("state"), q.Get("search"), limit, offset))
 
 	case method == http.MethodGet && path == "/api/logs":
 		lines := []logger.Line{}

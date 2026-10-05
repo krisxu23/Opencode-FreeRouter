@@ -567,6 +567,19 @@ func (p *Parts) Status() any {
 	// 健康快照只取一次:下面的节点表与 coldCount 共用,不再二次全量拷贝
 	// (8000 节点 = 3× 全 map 拷贝 + 8000 个 map 行分配,每 5s 一轮)。
 	snapForStatus := p.Health.NodeSnapshot()
+	// 2026-10-06:节点状态统计。/api/status?include_nodes=false 时前端
+	// 拿不到 nodes 数组，概览页的 alive/total 靠这里。
+	var aliveCount, deadCount int
+	for _, o := range outs {
+		if view, ok := snapForStatus[o.Tag]; ok {
+			switch view.State {
+			case health.StateAlive:
+				aliveCount++
+			case health.StateDead:
+				deadCount++
+			}
+		}
+	}
 	singbox := map[string]any{
 		"running": true, // 零端口架构:sing-box 与本进程同生死,进程在即 running
 		"pid":     os.Getpid(),
@@ -575,6 +588,8 @@ func (p *Parts) Status() any {
 			"dropped":   dropped,
 			"filtered":  filtered,                     // 2026-10-06:地区/类型过滤丢弃数
 			"nodes":     len(outs),                    // 前端 checkAlert 的「N 个节点正常启用」读它
+			"alive":     aliveCount,                   // 2026-10-06:存活数（免全量节点）
+			"dead":      deadCount,                    // 2026-10-06:死亡数
 			"probation": p.coldCountOn(snapForStatus), // 1.3.0:观察期语义并入冷区(dead 节点数)
 			"at":        lastRebuildAt,
 			"mode":      mode,
@@ -1060,4 +1075,64 @@ func (p *Parts) coldCountOn(snap map[string]health.NodeView) int {
 // 的对应物。一次快照算完,不逐 tag 锁往返。
 func (p *Parts) coldCount() int {
 	return p.coldCountOn(p.Health.NodeSnapshot())
+}
+
+// NodesPage 分页节点列表（2026-10-06）。
+//
+// /api/status 每 5 秒返回全量节点（4255 个节点时响应体已数 MB），
+// 前端无分页无虚拟滚动，节点上万后明显卡顿。拆出独立分页接口：
+//   - state: 按健康状态过滤（alive/dead/unknown，不传则全部）
+//   - search: tag/国家模糊搜索（不区分大小写）
+//   - limit/offset: 分页（limit 上限 500）
+//
+// 返回 {total, nodes[]}，nodes 行形状与 /api/status 的 nodes 数组一致。
+func (p *Parts) NodesPage(state, search string, limit, offset int) map[string]any {
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	search = strings.ToLower(strings.TrimSpace(search))
+
+	outs := p.poolNodes()
+	snap := p.Health.NodeSnapshot()
+
+	// 过滤
+	filtered := make([]any, 0, len(outs))
+	for _, o := range outs {
+		row := map[string]any{
+			"tag":       o.Tag,
+			"country":   o.Country,
+			"state":     string(health.StateUnknown),
+			"latencyMs": -1,
+		}
+		if view, ok := snap[o.Tag]; ok {
+			view.MergeInto(row)
+		}
+		// 状态过滤
+		if state != "" && row["state"] != state {
+			continue
+		}
+		// 搜索过滤
+		if search != "" {
+			tag := strings.ToLower(o.Tag)
+			country := strings.ToLower(o.Country)
+			if !strings.Contains(tag, search) && !strings.Contains(country, search) {
+				continue
+			}
+		}
+		filtered = append(filtered, row)
+	}
+
+	total := len(filtered)
+	// 分页
+	if offset >= total {
+		return map[string]any{"total": total, "nodes": []any{}}
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return map[string]any{"total": total, "nodes": filtered[offset:end]}
 }

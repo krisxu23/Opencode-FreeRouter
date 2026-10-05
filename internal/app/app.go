@@ -157,9 +157,13 @@ type Parts struct {
 	coldRunning  atomic.Bool
 	firstRunning atomic.Bool
 	lastHotOK    atomic.Bool
-	hotNudge     chan struct{}
-	coldNudge    chan struct{}
-	firstNudge   chan struct{}
+	// guardDiscards 事故 guard 连续丢弃计数（2026-10-06）：
+	// 弱网环境下 ProbeDirect 长期失败会导致整轮持续丢弃、节点永远 unknown。
+	// 连续丢弃超过上限后强制落地，避免无限 limbo。
+	guardDiscards atomic.Int32
+	hotNudge      chan struct{}
+	coldNudge     chan struct{}
+	firstNudge    chan struct{}
 	// coldCursor 是冷区轮换抽样的游标:每轮只扫 1/3 死节点,三轮一循环。
 	// 烂水池里 900 死节点每 10 分钟全扫一次是浪费,轮换后每节点仍每 30 分钟
 	// 被扫到一次(3 轮 × 10 分钟),复活延迟可接受。
@@ -652,6 +656,7 @@ func Load(root string) (*Parts, error) {
 	closers = append(closers, panelLn.Close)
 	console := panel.New(panel.PanelDeps{
 		Status:      parts.Status,
+		NodesPage:   parts.NodesPage, // 2026-10-06:分页节点列表
 		GetSettings: func() any { return parts.SettingsView() },
 		ApplySettings: func(patch map[string]any) (any, error) {
 			// B10:错误必须透传到面板(→ 400),不能吞成一行 warn ——

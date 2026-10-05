@@ -631,7 +631,34 @@ func nodeName(uri string) string {
 	if i == -1 {
 		return ""
 	}
-	return decodeSafe(uri[i+1:])
+	return sanitizeTag(decodeSafe(uri[i+1:]))
+}
+
+// sanitizeTag 清洗订阅里的名字（2026-10-06）。
+//
+// 免费聚合订阅的 URL 经常畸形：fragment 里混进查询串
+// （如 `#&security=none&host=xxx#EPODONIOS`），nodeName 取第一个 # 之后
+// 全部就会把 `&security=none&...#EPODONIOS` 当名字，面板上看着乱。
+// 清洗规则：
+//  1. 去掉开头的 & ? ;
+//  2. 含 # 的取最后一个 # 之后（`&a=1#真名` → `真名`）
+//  3. 结果仍像查询串（含 = 且无中文/空格/emoji）→ 返回空，
+//     调用方会用 `协议://host:port` 回退 tag
+func sanitizeTag(tag string) string {
+	tag = strings.TrimLeft(tag, "&?;")
+	if idx := strings.LastIndex(tag, "#"); idx >= 0 {
+		tag = tag[idx+1:]
+	}
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return ""
+	}
+	// 查询串特征：含 = 或 &，且不含中文/空格（正常名字不会长这样）
+	if (strings.Contains(tag, "=") || strings.Contains(tag, "&")) &&
+		!strings.ContainsAny(tag, " \t\u4e00-\u9fff\U0001F300-\U0001FAFF") {
+		return ""
+	}
+	return tag
 }
 
 // b64decode 兼容 URL-safe 字母表并剥掉所有空白（订阅商爱在 base64 里插换行）。
