@@ -544,7 +544,7 @@ func (p *Parts) limitsLoop(ctx context.Context) {
 func (p *Parts) Status() any {
 	// 一次加锁读全部重建状态:lastRebuild.added/removed 原先在锁外裸读,和
 	// setRebuildResult 的写构成数据竞争(-race 下会报)。
-	lastRebuildAt, lastOK, lastErr, dropped, lastAdded, lastRemoved, mode := func() (int64, bool, string, int, int, int, string) {
+	lastRebuildAt, lastOK, lastErr, dropped, filtered, lastAdded, lastRemoved, mode := func() (int64, bool, string, int, int, int, int, string) {
 		p.rebuildStateMu.Lock()
 		defer p.rebuildStateMu.Unlock()
 		mode := ""
@@ -552,7 +552,7 @@ func (p *Parts) Status() any {
 		if p.lastRebuildAt != 0 && p.Registry.Len() == 0 && p.lastAdded == 0 && p.lastRemoved == 0 {
 			mode = "direct"
 		}
-		return p.lastRebuildAt, p.lastRebuildOK, p.lastRebuildErr, p.lastDropped, p.lastAdded, p.lastRemoved, mode
+		return p.lastRebuildAt, p.lastRebuildOK, p.lastRebuildErr, p.lastDropped, p.lastFiltered, p.lastAdded, p.lastRemoved, mode
 	}()
 
 	// lastCheck 的形状对齐 src/index.js:1070:ok 为 null 表示「还没跑过重建」,
@@ -573,6 +573,7 @@ func (p *Parts) Status() any {
 		"lastCheck": map[string]any{
 			"ok":        okValue,
 			"dropped":   dropped,
+			"filtered":  filtered,                     // 2026-10-06:地区/类型过滤丢弃数
 			"nodes":     len(outs),                    // 前端 checkAlert 的「N 个节点正常启用」读它
 			"probation": p.coldCountOn(snapForStatus), // 1.3.0:观察期语义并入冷区(dead 节点数)
 			"at":        lastRebuildAt,

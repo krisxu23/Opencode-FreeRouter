@@ -772,8 +772,12 @@ var proxyTypes = map[string]bool{
 	"socks": true, "http": true,
 }
 
-// unknownKeepLimit：无名节点纳入探测的数量上限（避免超大订阅把入站撑爆）。
-const unknownKeepLimit = 80
+// 2026-10-06:无名节点的数量**不设上限**,有多少进多少(用户裁决)。
+// 曾经的 unknownKeepLimit=80 在大订阅下会静默丢掉 99% 的无名节点 ——
+// 实测 7671 节点的上游订阅有 5790 个无名节点,80 的上限等于只取 1.4%。
+// 代价:每节点一个 sing-box outbound(内存+SyncOutbounds CPU)+首探三段探测+
+// /api/status 每 5s 全量 JSON,几万节点可跑但面板会变卡。回收靠 coldPass
+// 三振 + NeverAlive 早删,不靠数量上限。
 
 type kwRule struct {
 	re      *regexp.Regexp
@@ -873,8 +877,10 @@ func isoCountry(text string) string {
 //  3. 中英文地名关键词
 //  4. 旗帜 emoji（最不可靠，兜底）
 //
-// 没有名字的节点不会被丢弃 —— 返回空串后由 FilterByGroups 纳入"其他"桶参与
-// 探测，再由探测的出口 IP 实测归桶。
+// 没有名字的节点会不会被丢弃,取决于调用方选没选"其他"分组:返回空串后
+// FilterByGroups 只在 want["OTHER"] 时纳入,出厂默认全选(含"其他")所以默认
+// 不丢;用户若手动取消"其他",无名节点会被静默过滤(数量见面板 lastCheck.filtered)。
+// 探测后由出口 IP 实测归桶。
 func CountryOf(tag string) string {
 	if m := parenRe.FindStringSubmatch(tag); m != nil {
 		if cc, ok := name2cc[strings.TrimSpace(m[1])]; ok {
@@ -961,8 +967,8 @@ func upperASCII(c byte) byte {
 //   - 类型不在 PROXY_TYPES 的出站（selector/urltest/direct/block）不进池
 //   - 同**配置指纹**去重(R21)
 //   - tag 可识别国家的节点：所属分组被选中才保留
-//   - 无名节点（tag 识别不出国家）：只要选了"其他"就保留（最多
-//     unknownKeepLimit 个，探测后由出口 IP 实测归桶）
+//   - 无名节点（tag 识别不出国家）：只要选了"其他"就**全部**保留（2026-10-06
+//     起不设上限；探测后由出口 IP 实测归桶）
 //
 // 去重键过去是 Tag(JS sub.js:146-153 同款),实测 data/subs_cache.json 的 1246 个
 // 出站里 7 个重复 tag 压掉了 84 个真不同的节点(disney_netflix_GB 76 个只留 1),
@@ -995,9 +1001,6 @@ func FilterByGroups(outs []Outbound, groups []string) []Outbound {
 		}
 	}
 	if want["OTHER"] {
-		if len(unknown) > unknownKeepLimit {
-			unknown = unknown[:unknownKeepLimit]
-		}
 		matched = append(matched, unknown...)
 	}
 	return matched

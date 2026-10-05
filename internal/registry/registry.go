@@ -40,10 +40,14 @@ import (
 
 const (
 
-	// PoolCap 池子上限(src/registry.js:27)。订阅偶尔会给出上万条,放不下时
-	// 按加入时间淘汰最旧的。JS 用默认参数表达,Go 没有默认参数,导出给调用方
-	// 传给 EnforceCap。
-	PoolCap = 8000
+	// 2026-10-06:池上限取消 —— 有多少节点进多少(用户裁决"有多少加载多少")。
+	// 曾经的 PoolCap=8000 会在 Merge 后按健康 rank 淘汰超量节点,大订阅下
+	// "几万进、八千留",与"全量入池"的预期相悖。代价:每节点一个 sing-box
+	// outbound(内存 + 每轮 SyncOutbounds 的纯 CPU)+ 首探 N×12s/48并发 +
+	// /api/status 每 5s 全量 JSON,面板节点表无分页、几万行 DOM 会卡。
+	// EnforceCap/EnforceCapRanked 的机制保留在包里备用,不再被调用。
+	// 烂水回收靠 coldPass 三振 + NeverAlive 早删,不靠池上限。
+	_PoolCapRetired = 8000 // 历史值留档:2026-10-06 前的上限
 )
 
 // entry 池内条目。

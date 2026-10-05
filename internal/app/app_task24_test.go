@@ -1050,7 +1050,7 @@ func TestStatusSurfacesTheStatsWriteFailure(t *testing.T) {
 
 	// 订阅失败原因同样要露出来:B11 之后 lastRebuildErr 记的是这轮重建的
 	// 合并错误,面板据此给 toast,运维脚本据此告警。
-	p.setRebuildResult(0, 0, 0, errors.New("订阅源全部超时"))
+	p.setRebuildResult(0, 0, 0, 0, errors.New("订阅源全部超时"))
 	diag = p.Status().(map[string]any)["diagnostics"].(map[string]any)
 	subView := diag["subscription"].(map[string]any)
 	if got, _ := subView["lastError"].(string); got != "订阅源全部超时" {

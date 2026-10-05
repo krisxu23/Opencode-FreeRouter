@@ -26,7 +26,6 @@ import (
 	"freerouter/internal/limits"
 	"freerouter/internal/logger"
 	"freerouter/internal/parse"
-	"freerouter/internal/registry"
 	"freerouter/internal/sub"
 )
 
@@ -171,7 +170,7 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 	settings := p.settingsSnapshot()
 	before := p.Registry.Len()
 
-	picked, present, fetchErr, dropped, sourcesOK, sourcesTotal := p.fetchSubscriptions(ctx, settings)
+	picked, present, fetchErr, dropped, filtered, sourcesOK, sourcesTotal := p.fetchSubscriptions(ctx, settings)
 	if fetchErr != nil {
 		p.noteSubFailure(ctx)
 	} else {
@@ -223,24 +222,9 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 			}
 		}
 		added := p.Registry.Merge(picked)
-		// 健康感知淘汰:从没活过的死节点先出,活着/B 档后出。rank 快照在
-		// 锁外一次算好(EnforceCapRanked 只读传入的 map)。
-		//
-		// rank 查不到 = **还没有健康行**（本轮刚 Merge 进来的新订阅节点）。
-		// 给它中间档 3（unknown 行同档），绝不能落到 0：EvictRank 的 0 档本意
-		// 是「有表但无行」的池外残留，若新节点按零值 0 参与排序，池打满时
-		// 每轮新 tag 恒被最先挤掉、**永远得不到首探**——「健康感知淘汰」
-		// 退化成「新人永不进、死人永远占位」。新节点至少该拿到一次首探的
-		// 机会来证明自己；确属烂水的由 NeverAlive 2 轮早删腾位。
-		ranks := p.Health.EvictRank()
-		for _, tag := range p.Registry.EnforceCapRanked(registry.PoolCap, func(tag string) int {
-			if v, ok := ranks[tag]; ok {
-				return v
-			}
-			return 3 // 无健康行:中间档,先于 alive(4)/B(5) 出,后于任何有行的判决
-		}) {
-			p.Health.Forget(tag) // D-C1:池外节点不留健康行
-		}
+		// 2026-10-06:池上限取消,不再做健康感知淘汰 —— 有多少节点进多少。
+		// 烂水回收靠 coldPass 三振 + NeverAlive 早删。EnforceCapRanked 机制
+		// 保留在 registry 包里备用。
 		if err := p.Registry.Flush(); err != nil {
 			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
 		}
@@ -249,7 +233,7 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 		if present != nil && sourcesOK != sourcesTotal {
 			logger.Warn(fmt.Sprintf("[app] 订阅部分源失败（%d/%d 个源成功）— 本轮只合并不下架,池内现有 %d 个", sourcesOK, sourcesTotal, p.Registry.Len()))
 		}
-		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，下架 %d），池内现有 %d 个", len(picked), added, pruned, p.Registry.Len()))
+		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，下架 %d，过滤丢弃 %d），池内现有 %d 个", len(picked), added, pruned, filtered, p.Registry.Len()))
 	}
 	if dropped > 0 {
 		logger.Warn(fmt.Sprintf("[app] 订阅里有 %d 个节点 sing-box 无法使用（非法 uuid / 不认的 cipher / 未知传输），未入池", dropped))
@@ -276,7 +260,7 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 		return errors.Join(fetchErr, err)
 	}
 	rebuildErr := errors.Join(fetchErr, syncErr)
-	p.setRebuildResult(added, removed, dropped, rebuildErr)
+	p.setRebuildResult(added, removed, dropped, filtered, rebuildErr)
 	if syncErr != nil {
 		logger.Warn(fmt.Sprintf("[app] 热插出站部分失败: %v", syncErr))
 	}
@@ -306,16 +290,17 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 
 // fetchSubscriptions 拉取并筛选订阅。返回值:picked 是整形后的出站、fetchErr
 // 表示「一个源都没拉到」(要用缓存/历史节点;非 nil 才算失败)、dropped 是被
-// sing-box 拒收的节点数;sourcesOK/sourcesTotal 是成功/配置的**源**数 ——
+// sing-box 拒收的节点数、filtered 是地区/类型过滤丢弃的节点数(面板可见,免得
+// "几万变几千"无迹可查);sourcesOK/sourcesTotal 是成功/配置的**源**数 ——
 // 九审:差集删只在 sourcesOK == sourcesTotal(全员到齐)时执行,部分源失败
 // 时 present 残缺,只能合并不能下架。
 //
 // B11:从前这里回的是 bool,而 Rebuild 无论订阅成不成、出站热插有没有报错都
 // `return nil`。于是面板「刷新」永远 toast 成功、托盘 Reload 永远静默 ——
 // 哪怕订阅全军覆没。现在把失败原样交出去,由 Rebuild 聚合后上报。
-func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]parse.Outbound, map[string]bool, error, int, int, int) {
+func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]parse.Outbound, map[string]bool, error, int, int, int, int) {
 	if len(settings.SubURLs) == 0 {
-		return nil, nil, nil, 0, 0, 0
+		return nil, nil, nil, 0, 0, 0, 0
 	}
 	exits := p.subExits()
 	budget, cancel := context.WithTimeout(ctx, subFetchBudget)
@@ -323,8 +308,13 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 	res, err := sub.Fetch(budget, settings.SubURLs, exits)
 	if err != nil {
 		logger.Warn(fmt.Sprintf("[app] 订阅失败，沿用 %d 个已知出口: %v", p.Registry.Len(), err))
-		return nil, nil, err, 0, 0, len(settings.SubURLs)
+		return nil, nil, err, 0, 0, 0, len(settings.SubURLs)
 	}
+	// 2026-10-06:重名 tag 消歧。免费聚合订阅里成千上万个不同节点共用
+	// 同一个名字（"EPODONIOS" x7207），Registry 以 tag 为主键会原位覆盖，
+	// 1.5 万节点只剩 214 进池。消歧必须在 present 名单构建之前，
+	// 否则下架判据（按 tag 差集）会把消歧后的条目当"不在订阅里"删掉。
+	res.Outbounds = parse.DisambiguateTags(res.Outbounds)
 	// present 是订阅原始全量的 tag 集(过滤前):差集删除的判据。被用户地区
 	// 选择过滤掉的节点仍在订阅里,不删 —— 与 boot 路径同口径。
 	present := make(map[string]bool, len(res.Outbounds))
@@ -336,6 +326,9 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 	// (2026-10-05 实测:30 源只成 1 个,4328 节点含全部活节点被删,热区
 	// 归零后借不到出口复拉,恶性循环)。所以源成功数必须透传给调用方裁决。
 	picked := parse.FilterByGroups(res.Outbounds, settings.Countries)
+	// filtered:过滤丢了多少。res.Outbounds 与 picked 都按同一 IdentityOf 去重,
+	// 差值就是地区/类型过滤的丢弃数 —— 面板 lastCheck.filtered 展示它。
+	filtered := len(res.Outbounds) - len(picked)
 	clean := make([]parse.Outbound, 0, len(picked))
 	dropped := 0
 	for _, o := range picked {
@@ -346,7 +339,7 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 		}
 		clean = append(clean, sanitized)
 	}
-	return clean, present, nil, dropped, res.SourcesOK, res.SourcesTotal
+	return clean, present, nil, dropped, filtered, res.SourcesOK, res.SourcesTotal
 }
 
 // openingSubscription 是 Load 第 6.5 步的 goroutine 体:开机后台拉一轮订阅,
@@ -366,12 +359,12 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 func (p *Parts) openingSubscription(ctx context.Context, cur Settings) {
 	if len(cur.SubURLs) == 0 {
 		logger.Info(fmt.Sprintf("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（%d 个）；注册表为空则以纯直连兜底模式启动", p.Registry.Len()))
-		p.setRebuildResult(0, 0, 0, nil)
+		p.setRebuildResult(0, 0, 0, 0, nil)
 		return
 	}
-	clean, present, ferr, dropped, sourcesOK, sourcesTotal := p.fetchSubscriptions(ctx, cur)
+	clean, present, ferr, dropped, filtered, sourcesOK, sourcesTotal := p.fetchSubscriptions(ctx, cur)
 	if ferr != nil {
-		p.setRebuildResult(0, 0, 0, ferr)
+		p.setRebuildResult(0, 0, 0, 0, ferr)
 		return
 	}
 	// 成员资格跟随订阅(1.3.0):拉取成功后,不在**任何源**里的节点
@@ -403,21 +396,7 @@ func (p *Parts) openingSubscription(ctx context.Context, cur Settings) {
 		return
 	}
 	merged := p.Registry.Merge(clean)
-	// 健康感知淘汰(与周期 Rebuild 同口径):开场时健康表刚 Load,rank 快照有效。
-	// 查不到行的新 tag 显式给中间档 3(与 rebuild.go 同一裁决,理由见彼处注释)。
-	ranks := p.Health.EvictRank()
-	evicted := p.Registry.EnforceCapRanked(registry.PoolCap, func(tag string) int {
-		if v, ok := ranks[tag]; ok {
-			return v
-		}
-		return 3
-	})
-	for _, tag := range evicted {
-		// 池子外的节点不该留健康行:D-C1 —— Forget 掉,否则被淘汰者的行
-		// 永远留在 node-health.json(PruneStale 只在探测轮里跑,这里不补
-		// 就没有回收点)。
-		p.Health.Forget(tag)
-	}
+	// 2026-10-06:池上限取消,开场不再做健康感知淘汰(与周期 Rebuild 同口径)。
 	if err := p.Registry.Flush(); err != nil {
 		logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
 	}
@@ -434,12 +413,12 @@ func (p *Parts) openingSubscription(ctx context.Context, cur Settings) {
 	}
 	if serr != nil {
 		logger.Warn(fmt.Sprintf("[app] 热插出站失败: %v", serr))
-		p.setRebuildResult(syncAdded, syncRemoved, dropped, serr)
+		p.setRebuildResult(syncAdded, syncRemoved, dropped, filtered, serr)
 		return
 	}
-	p.setRebuildResult(syncAdded, syncRemoved, dropped, nil)
-	logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，淘汰 %d），池内现有 %d 个（热插 %d，撤下 %d）",
-		len(clean), merged, len(evicted), p.Registry.Len(), syncAdded, syncRemoved))
+	p.setRebuildResult(syncAdded, syncRemoved, dropped, filtered, nil)
+	logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d），池内现有 %d 个（热插 %d，撤下 %d）",
+		len(clean), merged, p.Registry.Len(), syncAdded, syncRemoved))
 }
 
 // subExits 是拉订阅时可以借用的出口。只取健康表判活的节点,且最多
@@ -504,12 +483,15 @@ func (p *Parts) noteSubFailure(ctx context.Context) {
 // setRebuildResult 记录最近一次热插的结果,面板的「上次重建」与「上次检查」都显示
 // 它。dropped 是订阅里被 sing-box 拒收的节点数 —— 前端 checkBadge 的「剔除 N 个
 // 坏节点」和 checkAlert 的整句都读它,不记就等于那条告警永远不出现。
-func (p *Parts) setRebuildResult(added, removed, dropped int, err error) {
+// filtered 是地区/类型过滤丢弃的节点数(2026-10-06 新增):过去"几万变几千"在
+// 面板上无迹可查,现在 lastCheck.filtered 展示它。
+func (p *Parts) setRebuildResult(added, removed, dropped, filtered int, err error) {
 	p.rebuildStateMu.Lock()
 	defer p.rebuildStateMu.Unlock()
 	p.lastAdded = added
 	p.lastRemoved = removed
 	p.lastDropped = dropped
+	p.lastFiltered = filtered
 	p.lastRebuildAt = p.nowMS()
 	p.lastRebuildOK = err == nil
 	if err != nil {

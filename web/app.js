@@ -326,7 +326,10 @@
     if (!lc || lc.ok == null) return ''
     if (lc.ok === false) return '配置未启用'
     if (lc.mode === 'direct') return '直连兜底'
-    if (lc.dropped > 0) return '剔除 ' + lc.dropped + ' 个坏节点'
+    const parts = []
+    if (lc.filtered > 0) parts.push('过滤丢弃 ' + lc.filtered + ' 个')
+    if (lc.dropped > 0) parts.push('剔除 ' + lc.dropped + ' 个坏节点')
+    if (parts.length) return parts.join('，')
     return ''
   }
 
@@ -338,7 +341,10 @@
     const at = when ? '（' + when + ' 检测）' : ''
     if (lc.ok === false) return '配置没有启用：' + esc(lc.error || '未知原因') + '。当前实例继续沿用上一份配置' + at + '。'
     if (lc.mode === 'direct') return '所有节点都不可用，已进入纯直连兜底模式' + (lc.dropped ? '（本轮剔除 ' + lc.dropped + ' 个无法加载的节点）' : '') + at + '。'
-    if (lc.dropped > 0) return '本轮 ' + lc.dropped + ' 个节点未通过 sing-box 配置校验、已被剔除；' + lc.nodes + ' 个节点正常启用' + at + '。'
+    const notes = []
+    if (lc.filtered > 0) notes.push('本轮 ' + lc.filtered + ' 个节点因地区未选中/类型不支持被过滤，未入池')
+    if (lc.dropped > 0) notes.push('本轮 ' + lc.dropped + ' 个节点未通过 sing-box 配置校验、已被剔除')
+    if (notes.length) return notes.join('；') + '；' + lc.nodes + ' 个节点正常启用' + at + '。'
     return ''
   }
 

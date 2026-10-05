@@ -182,6 +182,7 @@ type Parts struct {
 	lastAdded      int
 	lastRemoved    int
 	lastDropped    int
+	lastFiltered   int // 2026-10-06:地区/类型过滤丢弃数,面板 lastCheck.filtered 展示
 	lastRebuildAt  int64
 	lastRebuildOK  bool
 	lastRebuildErr string
@@ -241,10 +242,14 @@ func (p *Parts) noteEgressChanged() { p.egressGen.Add(1) }
 // never had the key still comes out enabled.
 func defaultSettings() Settings {
 	return Settings{
-		ForwardPort:        3457,
-		PanelPort:          3458,
-		SubURLs:            []string{},
-		Countries:          []string{"US", "JP", "HK", "TW", "KR", "SG"},
+		ForwardPort: 3457,
+		PanelPort:   3458,
+		SubURLs:     []string{},
+		// 2026-10-06:出厂默认全选 8 个分组 = 地区过滤默认不丢节点。过去默认只
+		// 选 6 个(不含 OTHER),无名节点被 FilterByGroups 静默丢弃 —— 实测大订阅
+		// 75% 的节点名识别不出国家,默认设置下 94% 的节点进不了池。地区选择现在
+		// 是纯粹的"回退优先级"语义,想过滤才手动取消。
+		Countries:          []string{"US", "JP", "HK", "TW", "KR", "SG", "EU", "OTHER"},
 		Enabled:            true,
 		ProbeEnabled:       true,
 		ProbeWorkers:       48,
