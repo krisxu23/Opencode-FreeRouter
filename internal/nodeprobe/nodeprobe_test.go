@@ -479,28 +479,30 @@ func TestFullProbeDoesUseEcho(t *testing.T) {
 // 拨号能回来，但请求体永远不落地，客户端的 cancel 与 client.Timeout 都无法让
 // 这一发收口（只有传输层的 close 能，而这一层不理会）。
 //
-// R3:Read 必须是一次性把假头交出去(t0 行)、之后**永久阻塞**(select{})。
-// 过去这里是 `copy(p, …)` 而不看 p 有多长(64) —— Go Transport 的 readLoop 在
-// 连接空闲时会先 Peek(1) 探活:64 字节的 buf 只读走 1 字节,剩下 63 字节留
-// 在桩里;下一个请求复用同一连接时读到的就是残缺头,readResponse 报
-// unexpected EOF,readLoop 进 peekFailLocked 关连接,那一发以
-// readLoopPeekFailLocked 收场(echo 合法失败 → alive)。约 10% 概率撞上。
-// 修法:头一次性交清(调用方 buf 恒 ≥4KB,64 字节必一次装下)。
+// R4:Read 必须**跨多次调用**把假头交清、之后永久阻塞(select{})。这条桩换过
+// 三版，每一版都是被真实 Transport 的读法打回来的：
+//   - v1 `copy(p, …)` 不看 p 有多长：空闲探活 Peek(1) 只取走 1 字节，剩下 63
+//     字节留在桩里；下一次请求复用同一连接读到残缺头，readResponse 报
+//     unexpected EOF、readLoop 进 peekFailLocked，那一发以
+//     readLoopPeekFailLocked 收场(echo 合法失败 → alive)。约 10% 概率。
+//   - v2 「头一次性交清」+「buf 小于头长就报错」：把概率 flake 变成了**必然
+//     的错误路径** —— 只要 Transport 某次用小于 64 字节的 buf 调 Read，桩当场
+//     返回错误，echo 请求在毫秒级合法失败、判成 alive，而用例断言的是 unknown
+//     (2026-10-05 CI 上就是这样红的：`--- FAIL: TestIncompleteIsNotDead (0.01s)`)。
+//   - v3 现在这版：不猜调用方 buf 有多大，把假头当成字节流，谁要多少给多少，
+//     交完才永久阻塞。Read 只能返回 (n>0, nil) 或永远不返回，没有第三条路 ——
+//     用例要钉的「拨号后读不回来、Close 也无人理会」才是唯一可能的形状。
 type stubbornConn struct {
-	sentHead bool
+	sent int // 已交付的假头字节数(必须指针接收者：值接收者会从头重发)
 }
 
 var stubbornHead = []byte("HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")
 
 func (c *stubbornConn) Read(p []byte) (int, error) {
-	if !c.sentHead {
-		c.sentHead = true
-		if len(p) < len(stubbornHead) {
-			// 防御:调用方 buf 比头还小(现实中不会发生,Transport 读头用 4KB)。
-			// 截断交出去等于复刻旧 bug,直接报错让测试响亮失败而不是随机 flake。
-			return 0, fmt.Errorf("stubbornConn: buf %d < head %d", len(p), len(stubbornHead))
-		}
-		return copy(p, stubbornHead), nil
+	if c.sent < len(stubbornHead) {
+		n := copy(p, stubbornHead[c.sent:])
+		c.sent += n
+		return n, nil // n 可能为 0(len(p)==0)：合法退化，不动状态、不阻塞
 	}
 	select {} // 永久阻塞：头发完了就永远不返回，也不理会 Close
 }
@@ -517,6 +519,58 @@ type stubAddr struct{}
 
 func (stubAddr) Network() string { return "stub" }
 func (stubAddr) String() string  { return "stub" }
+
+// TestStubbornConnDeliversHeadAcrossPartialReads 钉住 R4 桩的契约，直接对
+// 2026-10-05 的 CI 红灯：调用方 buf 多小都不许出错。v2 桩对 len(p) < 头长
+// 返回 error，于是任何一次小 buf 读都会让 echo 请求在毫秒级合法失败、探针以
+// alive 收场，而 TestIncompleteIsNotDead 断言的是 unknown —— 表现为那条用例
+// 在 0.01s 内 FAIL（本地跑十次未必复现，CI 2 核必现）。
+func TestStubbornConnDeliversHeadAcrossPartialReads(t *testing.T) {
+	c := &stubbornConn{}
+	var got []byte
+	for len(got) < len(stubbornHead) {
+		buf := make([]byte, 1) // 一次只要 1 字节：最坏的分片形状
+		n, err := c.Read(buf)
+		if err != nil {
+			t.Fatalf("已读 %d/%d 字节后出错: %v", len(got), len(stubbornHead), err)
+		}
+		if n != 1 {
+			t.Fatalf("n = %d, want 1（已读 %d 字节）", n, len(got))
+		}
+		got = append(got, buf[0])
+	}
+	if string(got) != string(stubbornHead) {
+		t.Fatalf("逐字节读到的假头 = %q, want %q", got, stubbornHead)
+	}
+	// 混合形状：先 3 字节、再一次性 4KB，合起来必须仍是完整假头。
+	c2 := &stubbornConn{}
+	head := make([]byte, 3)
+	if n, err := c2.Read(head); err != nil || n != 3 {
+		t.Fatalf("小 buf 读: n=%d err=%v, want 3, nil", n, err)
+	}
+	if string(head) != string(stubbornHead[:3]) {
+		t.Fatalf("前 3 字节 = %q, want %q", head, stubbornHead[:3])
+	}
+	rest := make([]byte, 4096)
+	n, err := c2.Read(rest)
+	if err != nil {
+		t.Fatalf("大 buf 读剩下: %v", err)
+	}
+	if string(rest[:n]) != string(stubbornHead[3:]) {
+		t.Fatalf("剩余 = %q, want %q", rest[:n], stubbornHead[3:])
+	}
+	// 头交完必须永久阻塞：50ms 内返回即失败（Close/Deadline 都是空操作）。
+	done := make(chan int, 1)
+	go func() {
+		n, _ := c2.Read(make([]byte, 4096))
+		done <- n
+	}()
+	select {
+	case n := <-done:
+		t.Fatalf("头交完后 Read 返回了 n=%d，必须永久阻塞", n)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
 
 // hangServer 的 /live 秒回 204，/echo 永远不回（等客户端自己取消）：stage-1
 // 快速通过、echo 挂满 8s 的 echoBudgetMS。
@@ -581,11 +635,13 @@ func TestIncompleteIsNotDead(t *testing.T) {
 	// 用例就退化成「客户端自己的 shot ctx 能取消」的形状，兜底自然不会触发。
 	// 拨号器收到的 addr 是 host:port：echo 源与 live 源分端口，所以按 addr 判定
 	// 「这一发是 echo 段」，比数拨号次数更贴合真实形状（一次请求可能重拨多次）。
+	var echoDials atomic.Int64
 	dial := httpclient.Dialer(func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if strings.HasSuffix(addr, strings.TrimPrefix(echoSrv.URL, "http://")) {
 			// 只有「拨号后读不回来、Close 也无人理会」才是真的不响应取消：
 			// 光让 DialContext 挂起不够 —— client.Timeout 的定时器会让 do() 提前
 			// 返回（它并不需要拨号结束），那一发照样收口。
+			echoDials.Add(1)
 			return &stubbornConn{}, nil
 		}
 		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
@@ -599,11 +655,9 @@ func TestIncompleteIsNotDead(t *testing.T) {
 	// 空操作）。若 echo 的单发预算先到期，transport 会放弃这一发、ProbeNode
 	// 立刻以 alive 收场 —— 用例就退化成「客户端自己能取消」的形状。
 	//
-	// R3:预算提到 5000ms（兜底≈5600ms，外层 15s 不动）。直接诱因是桩的
-	// Read 不看 buf 长度：Go Transport 的 readLoop 空闲探活用 Peek(1) 只读走
-	// 1 字节，残缺头让下一发以 readLoopPeekFailLocked 收场、echo 合法失败回
-	// alive（约 10% 概率，见 stubbornConn 注释）。桩已修（头原子交付），
-	// 5000ms 纯作调度抖动保险 —— race 并行满载下 1s 级停顿并非不可能。
+	// R4:5000ms 只是「别让自己的调度把 echo 头掐了」的保险，判定权在兜底。
+	// 2026-10-05 的 CI 红灯不是这里的余量不够，而是桩把「buf 小于头长」当错误
+	// 返回（见 stubbornConn 注释）—— 探针 10ms 就拿到确定判决，压根没等预算。
 	p.echoBudgetMS = 5000   // echo 单发预算：只要头在这之内到达即可
 	p.backstopSlackMS = 500 // 兜底 ≈ 100 + 5000 + 500
 	items := []Item{{Tag: "slow", Dial: dial, Options: ProbeOptions{TimeoutMS: 100, Attempts: 1}}}
@@ -613,7 +667,8 @@ func TestIncompleteIsNotDead(t *testing.T) {
 	}
 	r := res[0]
 	if r.Result.State != StateUnknown {
-		t.Fatalf("State = %q, want unknown（unknown 不是 dead）", r.Result.State)
+		t.Fatalf("State = %q, want unknown（unknown 不是 dead）；echo 拨号 %d 次，LatencyMS=%d Incomplete=%v ExitIP=%q",
+			r.Result.State, echoDials.Load(), r.Result.LatencyMS, r.Result.Incomplete, r.Result.ExitIP)
 	}
 	if !r.Result.Incomplete {
 		t.Errorf("Incomplete = false, want true")

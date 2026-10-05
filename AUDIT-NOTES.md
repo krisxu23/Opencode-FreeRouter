@@ -49,6 +49,33 @@ commitPickSweep 删除循环与 fileMu 拆分新增了并发用例（sweep 非�
 交错），但**未经检测器执行**。hermes 环境有 GCC 16.2.0（见下节），其 23 包 -race
 通过是对 v1.3.x 代码的覆盖。v1.4.1/v1.5.0 的锁模型改动需要在下一次有 cgo 的环境补跑。
 
+## 2026-10-05（v1.5.1 热修）：测试桩的「快速失败路径」把 CI 打成红
+
+**症状**：bf0c52f（1.5.0）推送后 release 工作流 gates 作业在 `Go tests` 一步红
+（`Process completed with exit code 1.`），Build/Smoke/release 全 skipped ⇒ **v1.5.0
+没有发布**。CI 日志读不到（`gh` 不在 PATH、未鉴权的 job logs 接口一律 403），只能靠
+本地复现：`go clean -testcache` 后跑 CI 同一条命令，复现
+`--- FAIL: TestIncompleteIsNotDead (0.01s)`。
+
+**根因**：测试桩 `stubbornConn.Read`（internal/nodeprobe/nodeprobe_test.go）在
+`len(p) < len(stubbornHead)`（64 字节）时 **返回 error**。这条「防御」是上一轮为了
+治另一个 flake（`copy(p,…)` 不看 p 长度 → Peek(1) 只取走 1 字节 → 残缺头）加的，
+方向对但落点错：一旦 Transport 某次用小 buf 读，echo 请求就在**毫秒级合法失败**，
+按设计「echo 合法失败回 alive」→ 探针给 alive，而用例断言 unknown ⇒ 0.01s 内 FATAL。
+时长证据：失败包 10.163s vs 全绿 15.75s，正好差一个 5.60s 的兜底等待 —— 说明它压根
+没等预算。本地十次未必复现（8 核），CI 2 核必现。
+
+**修法**：桩改成**流式交付**假头（`sent int` 计数，要多少给多少，头交完才 `select{}`），
+Read 只有 (n>0, nil) 与「永不返回」两种可能，不再有第三条错误路径。新增
+`TestStubbornConnDeliversHeadAcrossPartialReads`（1 字节逐字节读满 + 3/4KB 混合形状 +
+头交完后必须阻塞）直接钉住该契约；`TestIncompleteIsNotDead` 的失败信息补上 echo 拨号
+次数与 LatencyMS/Incomplete/ExitIP 诊断。
+
+**版本决策**：发布契约要求「动了产品路径就必须在同一次 push 里让 version 前进」，
+bf0c52f 已把版本用到 1.5.0，再改 internal/** 只能继续前进 ⇒ 本版为 **v1.5.1**，
+**v1.5.0 永远不会发布**（1.5.0 的代码内容除这条测试桩外与 1.5.1 相同）。force-push
+不回退版本号也不行：gates 读的 `github.event.before` 仍是 bf0c52f 的 1.5.0。
+
 ## 2026-10-05：第七轮复审追加（两路对抗复审发现的 6 项）
 
 对上一节同一批未提交改动再做两路只读对抗复审（app/engine/tracelog、pick/forward/logger），

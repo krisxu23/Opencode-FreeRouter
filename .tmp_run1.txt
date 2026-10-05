@@ -1,0 +1,29 @@
+ok  	freerouter/cmd/freerouter	0.035s
+?   	freerouter/difftest	[no test files]
+ok  	freerouter/internal/adapter	2.353s
+ok  	freerouter/internal/app	35.647s
+ok  	freerouter/internal/catalog	0.036s
+ok  	freerouter/internal/check	0.017s
+ok  	freerouter/internal/effort	0.015s
+ok  	freerouter/internal/engine	1.528s
+ok  	freerouter/internal/errors	0.015s
+ok  	freerouter/internal/forward	1.122s
+ok  	freerouter/internal/gate	1.345s
+ok  	freerouter/internal/health	0.517s
+ok  	freerouter/internal/httpclient	3.168s
+ok  	freerouter/internal/limits	0.014s
+ok  	freerouter/internal/logger	0.546s
+ok  	freerouter/internal/messages	0.012s
+ok  	freerouter/internal/nodeprobe	15.760s
+ok  	freerouter/internal/panel	0.134s
+ok  	freerouter/internal/parse	0.017s
+ok  	freerouter/internal/persistence	0.136s
+ok  	freerouter/internal/registry	0.034s
+ok  	freerouter/internal/sbx	0.183s
+ok  	freerouter/internal/stats	0.751s
+ok  	freerouter/internal/stream	0.086s
+ok  	freerouter/internal/sub	0.116s
+ok  	freerouter/internal/tracelog	0.119s
+ok  	freerouter/internal/tray	0.035s
+ok  	freerouter/internal/upstream	0.022s
+?   	freerouter/web	[no test files]

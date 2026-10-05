@@ -1,0 +1,28 @@
+=== RUN   TestProbeAllReportsEveryItemOnce
+--- PASS: TestProbeAllReportsEveryItemOnce (0.00s)
+=== RUN   TestGateURLIsHTTPS
+--- PASS: TestGateURLIsHTTPS (0.00s)
+=== RUN   TestLivenessURLsAreDistinctAndAtLeastFour
+--- PASS: TestLivenessURLsAreDistinctAndAtLeastFour (0.00s)
+=== RUN   TestDeadProbeReturnsFast
+--- PASS: TestDeadProbeReturnsFast (0.00s)
+=== RUN   TestOptionsPerItem
+--- PASS: TestOptionsPerItem (1.50s)
+=== RUN   TestAttemptsBudget
+--- PASS: TestAttemptsBudget (2.44s)
+=== RUN   TestMultiSegmentBodySurvivesFetchVia
+--- PASS: TestMultiSegmentBodySurvivesFetchVia (0.07s)
+=== RUN   TestSuccessfulProbeCollectsMinLatency
+--- PASS: TestSuccessfulProbeCollectsMinLatency (0.51s)
+=== RUN   TestUpstreamOnlyContract
+--- PASS: TestUpstreamOnlyContract (0.12s)
+=== RUN   TestFullProbeDoesUseEcho
+--- PASS: TestFullProbeDoesUseEcho (0.00s)
+=== RUN   TestIncompleteIsNotDead
+--- PASS: TestIncompleteIsNotDead (5.60s)
+=== RUN   TestOversizedGateBodyIsRejected
+--- PASS: TestOversizedGateBodyIsRejected (0.08s)
+=== RUN   TestAbortStopsTheZombie
+--- PASS: TestAbortStopsTheZombie (5.60s)
+PASS
+ok  	freerouter/internal/nodeprobe	16.040s
