@@ -84,26 +84,44 @@ func (b *catalogBox) set(list []catalog.Model) {
 // bootJoinTimeout(5s,R12)。留一个算好却没人用的数字,只会让人以为开机有那条
 // 上限。
 
+// errRebuildQueued 是「重建已在进行,本轮请求已排队补跑」的哨兵。它必须是
+// error 而不是 nil:排上的这一手还没跑过,回 nil 会让面板把「已排队」显示
+// 成「刷新成功」(第六轮审计)。调用方(面板 /api/refresh、托盘 Reload)把
+// 它当非致命提示处理:文案自带答案。
+var errRebuildQueued = errors.New("重建已在进行中,本轮请求已排队补跑")
+
 // Rebuild 重拉订阅、热插出站、刷新目录。它不重启任何东西:sing-box 的
 // SyncOutbounds 本身就是热插,换出口不需要重启进程,在途连接因此不断。
 func (p *Parts) Rebuild(ctx context.Context) error {
 	if p.Host == nil || p.Registry == nil {
 		return nil
 	}
-	// 入口互斥:并发的两轮重建会让出站集合在 SyncOutbounds 里互相覆盖。
-	// 第二个进来的只记 queued,等本轮结束补一轮,不并发跑。
+	// queued 短路不谎报成功(第六轮审计):排上队的这一手**还没有跑过**,
+	// 把它直接回成 nil 会让面板把「已排队」显示成「刷新成功」。返回一个
+	// 可识别的错误,调用方(app 面板 Actions.Refresh、托盘 Reload)照旧记
+	// 日志/提示,语义诚实。
 	p.rebuildMu.Lock()
 	if p.rebuilding {
 		p.rebuildQueued = true
 		p.rebuildMu.Unlock()
-		return nil
+		return errRebuildQueued
 	}
 	p.rebuilding = true
 	p.rebuildMu.Unlock()
 	// 补重建用循环不用递归:持续被 queue 时 defer 内递归栈深度无界。
+	//
+	// 返回值以**末轮**为准(第七轮复审更正):此前把各轮错误 Join 累积,结果是
+	// 「首轮失败 + 补跑轮成功」时 Rebuild 抛错而 setRebuildResult 已被补跑轮
+	// 覆写成 OK —— 同一事实在 /api/status(成功)与 /api/refresh(500 红字)
+	// 两处结论相反。轮换语义下补跑轮重做了同一件事,世界已收敛,返回值必须与
+	// 落盘的状态记录同源。前轮失败**不静默**:noteSubFailure 已经为每一失败轮
+	// 打过 Warn,这里再补一条说明它已被后续轮覆盖。
 	var lastErr error
 	for {
 		if err := p.rebuildOnce(ctx); err != nil {
+			if lastErr != nil {
+				logger.Warn(fmt.Sprintf("[app] 上一轮重建失败但已被本轮的排队补跑覆盖: %v", lastErr))
+			}
 			lastErr = err
 		} else {
 			lastErr = nil
@@ -111,7 +129,14 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 		p.rebuildMu.Lock()
 		again := p.rebuildQueued
 		p.rebuildQueued = false
-		if !again || ctx.Err() != nil {
+		if again && ctx.Err() != nil {
+			// 哨兵承诺的是「已排队补跑」,而关停把它丢了 —— 不能再让调用方
+			// 按已受理处理(托盘/面板会显示成功,实际这一手没跑)。
+			p.rebuilding = false
+			p.rebuildMu.Unlock()
+			return errors.Join(lastErr, fmt.Errorf("app: 关停中,排队的一轮重建未执行: %w", ctx.Err()))
+		}
+		if !again {
 			p.rebuilding = false
 			p.rebuildMu.Unlock()
 			break
@@ -159,10 +184,18 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 			logger.Info("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（0 个）；注册表为空则以纯直连兜底模式启动")
 		}
 	} else {
-		added := p.Registry.Merge(picked)
-		// 成员资格跟随订阅(与 boot 路径同语义):拉取成功后,不在任何源里
-		// 的节点删干净。订阅下架的节点平时只靠 coldPass 三振,关探测则永久
-		// 残留占池位和探测预算。先落盘再 Sync(崩溃语义:盘上先一致)。
+		// 成员资格跟随订阅:拉取成功后,不在任何源里的节点删干净。订阅下架
+		// 的节点平时只靠 coldPass 三振,关探测则永久残留占池位和探测预算。
+		//
+		// **先删、后 Merge** —— 与 boot 路径(app.go 的 629→649)逐字同序,
+		// 这个次序是承重的:Merge 按**身份**去重而差集删按 **tag** 判,订阅商
+		// 改名节点(US-01→US-02,免费池常态)时,若先 Merge,新 tag 因身份被
+		// 还占着池的旧 tag 挡住、被当别名跳过不入池;随后旧 tag 不在 present
+		// 被删 —— 该节点整轮从池中消失,健康判决(B 档/延迟/streak)一起清零,
+		// 下轮才以新 tag 复活重走首探。先删则旧身份当场让位,新 tag 同一轮
+		// 入池,成员不断。
+		// 判据仍是对**过滤前**的原始源算 present:被用户地区选择滤掉的节点
+		// 仍在订阅里,不删 —— 与 boot 同口径。
 		pruned := 0
 		if present != nil {
 			for _, o := range p.Registry.All() {
@@ -174,11 +207,22 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 				}
 			}
 		}
+		added := p.Registry.Merge(picked)
 		// 健康感知淘汰:从没活过的死节点先出,活着/B 档后出。rank 快照在
 		// 锁外一次算好(EnforceCapRanked 只读传入的 map)。
+		//
+		// rank 查不到 = **还没有健康行**（本轮刚 Merge 进来的新订阅节点）。
+		// 给它中间档 3（unknown 行同档），绝不能落到 0：EvictRank 的 0 档本意
+		// 是「有表但无行」的池外残留，若新节点按零值 0 参与排序，池打满时
+		// 每轮新 tag 恒被最先挤掉、**永远得不到首探**——「健康感知淘汰」
+		// 退化成「新人永不进、死人永远占位」。新节点至少该拿到一次首探的
+		// 机会来证明自己；确属烂水的由 NeverAlive 2 轮早删腾位。
 		ranks := p.Health.EvictRank()
 		for _, tag := range p.Registry.EnforceCapRanked(registry.PoolCap, func(tag string) int {
-			return ranks[tag]
+			if v, ok := ranks[tag]; ok {
+				return v
+			}
+			return 3 // 无健康行:中间档,先于 alive(4)/B(5) 出,后于任何有行的判决
 		}) {
 			p.Health.Forget(tag) // D-C1:池外节点不留健康行
 		}
@@ -332,7 +376,7 @@ func (p *Parts) noteSubFailure(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := p.Rebuild(ctx); err != nil {
+		if err := p.Rebuild(ctx); err != nil && !errors.Is(err, errRebuildQueued) {
 			logger.Warn(fmt.Sprintf("[app] 订阅补偿重试失败: %v", err))
 		}
 	})
@@ -751,7 +795,11 @@ func (p *Parts) Reload(ctx context.Context) error {
 	}
 	// 顺序固定:先设置,再重建出站,最后刷新目录。反过来会让目录与新出站
 	// 代际错配一轮 —— 目录决定哪些模型可用,而出站决定它们经谁出去。
-	if err := p.Rebuild(ctx); err != nil {
+	//
+	// errRebuildQueued 在这一点**不是失败**(六审):设置已经 setSettings
+	// 落地,排队的补跑轮用的正是新设置 —— 面板收到错误会 toast「保存失败」,
+	// 而改动其实全在。吞掉它,其余错误原样上抛。
+	if err := p.Rebuild(ctx); err != nil && !errors.Is(err, errRebuildQueued) {
 		return err
 	}
 	p.refreshCatalog(ctx)

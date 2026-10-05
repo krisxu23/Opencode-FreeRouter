@@ -17,7 +17,19 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { execFile } from 'node:child_process'
 import { TAGS, ROOT, runGo, goEnv } from './go-build.mjs'
+
+/** 在仓库根跑一条外部命令并拿 stdout(不共享 go 的 GOPROXY 等 env:gofmt 是
+ *  本地工具,越干净越好;失败时 reject 带 stdout/stderr)。 */
+function execFileText(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { cwd: ROOT, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) reject(Object.assign(error, { stdout, stderr }))
+      else resolve({ stdout, stderr })
+    })
+  })
+}
 
 /** Layer -> package names. A package at layer n may import layer <= n. */
 // 修正案（docs/superpowers/plans/2026-10-01-plan-corrections.md §1）：
@@ -161,6 +173,24 @@ export async function checkGo() {
   // 「测试必须同代码形状」同一理由)。
   try { vet = (await runGo(['vet', '-tags', TAGS, './...'], { env: goEnv() })).stdout } catch (e) { vet = String(e.stdout ?? e.message ?? e) }
   for (const line of String(vet).split('\n')) if (line.trim()) errors.push(`go vet: ${line.trim()}`)
+
+  // gofmt 闸(第六轮审计 F12):对齐风格是 Go 的编译前事实,而编辑路径不带
+  // 格式化时,一次「自称 gofmt 干净」的提交可以实际混进对齐回归 —— 这道闸
+  // 此前根本不存在,所以混过了 CI。**只列不改**:check 是读侧,把文件改了
+  // 的副作用会污染并行的构建/测试。gofmt 不是 go 子命令,直接 exec 工具链
+  // 里的 gofmt(GOROOT/bin 兜底 PATH)。
+  const GOHOME = process.env.GOROOT || ''
+  const GOFMT = GOHOME ? path.join(GOHOME, 'bin', process.platform === 'win32' ? 'gofmt.exe' : 'gofmt') : 'gofmt'
+  let unformatted = ''
+  try {
+    unformatted = (await execFileText(GOFMT, ['-l', 'internal', 'cmd', 'web'])).stdout
+  } catch (e) {
+    errors.push(`gofmt 闸无法执行(${e.message})—— 闸本身失败也要拦,风格未验证的树不发版`)
+  }
+  for (const line of String(unformatted).split('\n')) {
+    const f = line.trim()
+    if (f) errors.push(`gofmt 未格式化: ${f}（跑 gofmt -w internal cmd web）`)
+  }
 
   return { errors: errors.length, warns: 0, lines: errors }
 }

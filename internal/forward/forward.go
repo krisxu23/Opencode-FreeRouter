@@ -52,7 +52,7 @@ const (
 // 项目里有三个用途不同、**不要求一致**的重试码集合,别把它们混成一个:
 //   - 这里 = 已经轮换完整个池子之后,值不值得让调用方自己再试;
 //   - engine 的 retryOn = 哪些失败值得换个出口重来(**含 quota**);
-//   - adapter 的 providerRetryPolicy = 上游 harness 自己的重试策略,1:1 移植。
+//   - engine 的 attemptCapByCode = 哪些码允许加码多试几次(⊂ retryOn)。
 //
 // 上一版注释把这里写成「与 adapter 保持一致」,那句话是错的:quota 不在本集合
 // 里,因为配额按出口 IP 计(用户拍板:换 IP 额度就是全新的),把配额报成可重试
@@ -391,8 +391,12 @@ func KeyMatches(presented, expected string) bool {
 	// 填充比较(防时序侧信道,见上);缓冲走池,不在热路径上每次 make。
 	x := getKeyBuf(n)
 	y := getKeyBuf(n)
-	defer keyBufPool.Put(x[:0])
-	defer keyBufPool.Put(y[:0])
+	// 归还前清零(第六轮审计):x/y 里是密钥明文(presented 与 expected 各
+	// 一份)。不清零直接 Put,密钥就随池的 backing array 常驻进程内存 ——
+	// 热路径免 make 的收益,买不回一份「本来请求一完就该消失」的明文。
+	// 几十字节的 memset 相对一次 TLS 常数时间比较可忽略。
+	defer putKeyBuf(x)
+	defer putKeyBuf(y)
 	copy(x, a)
 	copy(y, b)
 	equal := subtle.ConstantTimeCompare(x, y) == 1
@@ -401,6 +405,14 @@ func KeyMatches(presented, expected string) bool {
 
 // keyBufPool 复用 KeyMatches 的填充缓冲:密钥短(几十字节),池里常驻两份。
 var keyBufPool = sync.Pool{New: func() any { return make([]byte, 0, 128) }}
+
+// putKeyBuf 清零后归还。
+func putKeyBuf(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+	keyBufPool.Put(b[:0])
+}
 
 // getKeyBuf 取 n 字节的清零缓冲(池不够大时现造,不污染池)。
 func getKeyBuf(n int) []byte {
@@ -423,19 +435,78 @@ func getKeyBuf(n int) []byte {
 func (s *Server) readBody(w *writer, r *http.Request) (map[string]any, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	// 流式解码:8MB 全量驻留 + Unmarshal 两遍(一次 []byte、一次 map)是
-	// 每请求的固定税;Decoder 只走一遍,且超限在 MaxBytesReader 处即停。
+	// 每请求的固定税;Decoder 只走一遍。但 Decode **只读第一个 JSON 值**
+	// ——单独用它会把旧语义的三道闸全拆掉(第六轮审计 F-413,实测):
+	//   1. `{"model":"m"}`+数 GB 垃圾尾巴:decoder 不读越首值,
+	//      MaxBytesReader 根本不触发 → 请求完整跑一轮 engine **烧真配额**,
+	//      之后才在 drain 撞限掐连接。旧 ReadAll 语义是撞限 413 且不进
+	//      Complete(TestBodyOverEightMegabytesIs413 钉的就是"超大体绝不
+	//      到达 Complete")。
+	//   2. 尾随垃圾/双文档(`{...} junk`、`{a}{b}`):旧 Unmarshal 报语法
+	//      错 → 400;Decode 静默取首值、垃圾连同第二个文档蒸发。JS 权威侧
+	//      JSON.parse 对这两种都抛错。
+	//   3. 纯空白体:旧 `len(raw)==0` 只认真空体,空白 400;新 EOF 分支把
+	//      空白也放成了合法空 map。
+	// 三道闸按旧语义补齐:①首字节窥探区分「零字节体(合法)」与「空白体
+	// (400)」—— 旧 len(raw)==0 只认真空;②Decode 后再解一个 token 并要求
+	// io.EOF:尾随垃圾/双文档 400(旧 Unmarshal 报语法错),超大尾巴被
+	// MaxBytesReader 拦下则 413 —— ②同时闭合闸 1:首值之后流必须读尽或
+	// 撞限,数 GB 的尾巴在这里(而不是 engine 里)被拒。
+	// `{...}+超大非 JSON 尾巴` 现在报 400 而旧语义 413:两版都在进
+	// Complete 前拒绝、都不烧配额,状态码差异记于测试。
+	first := make([]byte, 1)
+	// 用 ReadFull 而不是裸 Read:Read 的 (0, nil) 是 io.Reader 的**合法**
+	// 返回值(契约含义是「什么都没发生,请重试」,明确不是 EOF),而裸 Read
+	// 这里只调用一次就把 (0,nil) 当成坏体判 400 —— 只有把 r.Body 换成
+	// 自定义 Reader 的中间件/包装器(限速、解密、审计)才会触发,但那读法
+	// 合法。ReadFull 对 (0,nil) 重试,与旧 io.ReadAll 版同语义;空体仍返回
+	// (0, io.EOF) 走合法空 map 分支。
+	n, perr := io.ReadFull(r.Body, first)
+	if n == 0 {
+		if errors.Is(perr, io.EOF) {
+			// 零字节体:与旧语义一致,合法空 map。
+			return map[string]any{}, true
+		}
+		var tooLarge *http.MaxBytesError
+		if errors.As(perr, &tooLarge) {
+			openAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
+			return nil, false
+		}
+		openAIError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
+		return nil, false
+	}
+	dec := json.NewDecoder(io.MultiReader(bytes.NewReader(first[:n]), r.Body))
 	var parsed any
-	if err := json.NewDecoder(r.Body).Decode(&parsed); err != nil {
+	badJSON := false
+	if err := dec.Decode(&parsed); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			openAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
 			return nil, false
 		}
-		// 空体是合法的(旧语义 len(raw)==0 → 空 map):EOF 单独回空 map,
-		// 其余读错/语法错按 4xx 固定短语回。
-		if errors.Is(err, io.EOF) {
-			return map[string]any{}, true
+		// 读到过字节却解不出值(纯空白、截断、语法错):旧语义 Unmarshal 报
+		// "unexpected end of JSON input"/语法错 → 400。EOF 在这一支不可能
+		// 是被 MaxBytes 挡的:它已在上面分支判过。
+		badJSON = true
+	}
+	if !badJSON {
+		// 尾随检查(无条件的:parsed 即使是 null 也要要求流读尽)。
+		var extra any
+		switch err := dec.Decode(&extra); {
+		case errors.Is(err, io.EOF):
+			// 流读尽:没有尾随文档,干净。
+		case err == nil:
+			badJSON = true // 第二个 JSON 文档:旧语义 400
+		default:
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				openAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
+				return nil, false
+			}
+			badJSON = true // 尾随垃圾(`{...} junk`)
 		}
+	}
+	if badJSON {
 		openAIError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
 		return nil, false
 	}

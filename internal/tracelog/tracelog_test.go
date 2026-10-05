@@ -118,6 +118,51 @@ func TestRecordKeepsBackdatedRowsOnTheirOwnDay(t *testing.T) {
 	if !strings.Contains(string(b), "回拨的一行") {
 		t.Fatalf("昨天的文件里没有那一条: %s", b)
 	}
+	// 字节账记在**当前轮转日**的额度上(保守裁决,见实现注释):两条都扣。
+	mu.RLock()
+	q := dayBytes
+	mu.RUnlock()
+	if q <= 0 {
+		t.Fatalf("dayBytes = %d, want >0(两行都真实落盘才扣)", q)
+	}
+}
+
+// TestFusesResetOnDayRollover 与跨天重置块配套:熔过的日子过去后,新的一天
+// 计数从 0 起 —— 单独成例是因为它需要把 writeOff 先熔满(与
+// TestWriteOffRevives 的重叠路径容易互相遮蔽)。
+func TestFusesResetOnDayRollover(t *testing.T) {
+	dir := t.TempDir()
+	Init(dir)
+	today := time.Now().UTC()
+	block := filepath.Join(dir, today.Format("2006-01-02")+".jsonl")
+	if err := os.Mkdir(block, 0o755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for i := 0; i < maxConsecFails; i++ {
+		Record(Route{Result: "熔", At: today.UnixMilli()})
+	}
+	mu.RLock()
+	off := writeOff
+	mu.RUnlock()
+	if !off {
+		t.Fatal("熔满后 writeOff 应为真")
+	}
+	if err := os.Remove(block); err != nil {
+		t.Fatalf("unblock: %v", err)
+	}
+	// 新的一天:reset 块必须同时清 writeOff 与 consecFails。
+	tomorrow := today.AddDate(0, 0, 1)
+	Record(Route{Result: "明天", At: tomorrow.UnixMilli()})
+	mu.RLock()
+	fails := consecFails
+	off = writeOff
+	mu.RUnlock()
+	if off {
+		t.Fatal("跨天后 writeOff 应复活(旧 B6 语义保持)")
+	}
+	if fails != 0 {
+		t.Fatalf("跨天后 consecFails = %d, want 0(六审 F6)", fails)
+	}
 }
 
 func TestRecordNeverPanicsOnGarbage(t *testing.T) {
@@ -218,5 +263,70 @@ func TestWriteOffRevivesWhenTheFileBecomesWritableAgain(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "恢复") {
 		t.Fatalf("明天的文件里没有新记录: %s", b)
+	}
+
+	// 六审 F6 的回归主体:跨天块必须把 consecFails 一起清零。漏清的话,熔过
+	// 的坏天把计数留在 ≥maxConsecFails,第二天第 1 次瞬时抖动就重新熔掉整天
+	// —— 「一次抖动不丢一天」只对首个坏天成立。在**新的一天**再制造 1 次
+	// 失败:writeOff 必须仍是 false、计数只到 1。(明天的文件此刻是刚才
+	// 「恢复」那一行建出来的普通文件:删掉换成目录,OpenFile 必失败。)
+	tomorrowFile := filepath.Join(dir, tomorrow.Format("2006-01-02")+".jsonl")
+	if err := os.Remove(tomorrowFile); err != nil {
+		t.Fatalf("unblock tomorrow: %v", err)
+	}
+	if err := os.Mkdir(tomorrowFile, 0o755); err != nil { // 用目录占住明天的文件
+		t.Fatalf("block tomorrow: %v", err)
+	}
+	Record(Route{Result: "新的一天抖一下", At: tomorrow.Add(time.Hour).UnixMilli()})
+	mu.RLock()
+	off = writeOff
+	fails = consecFails
+	mu.RUnlock()
+	if off {
+		t.Fatal("跨天后第 1 次失败就整日停写:consecFails 没有随日重置(六审 F6)")
+	}
+	if fails != 1 {
+		t.Fatalf("跨天后 consecFails = %d, want 1(新的一天从头数)", fails)
+	}
+	_ = os.Remove(tomorrowFile)
+}
+
+// 复审 B(第七轮):历史日期的记录**不得**清零当前轮转日的账。
+//
+// 旧判据是 `day != lastPruneDay`:一条 At 早于当前轮转日的记录(时钟回拨、
+// 上游回放、调用方显式给历史时刻)会把 lastPruneDay 拉回旧日期,并把
+// dayBytes/writeOff/consecFails 一起清零 —— 在两天之间交替的 At 能把 32MB/天
+// 的配额账无限重置,而写的是不同日名的文件,连「撞限」都不会发生。生产不可达
+// (唯一调用点的 At ≡ nowMS()),但账本不该有这条路:今天已经熔断的日子,不能
+// 被一条历史的记录洗白。
+func TestBackdatedRowDoesNotResetTheDayLedger(t *testing.T) {
+	dir := t.TempDir()
+	Init(dir)
+	today := time.Now().UTC()
+	yesterday := today.AddDate(0, 0, -1)
+	// 用同名目录占住今天的日文件,把 writeOff 熔满(maxConsecFails 次)。
+	block := filepath.Join(dir, today.Format("2006-01-02")+".jsonl")
+	if err := os.Mkdir(block, 0o755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	for i := 0; i < maxConsecFails; i++ {
+		Record(Route{Result: "熔", At: today.UnixMilli()})
+	}
+	mu.RLock()
+	off := writeOff
+	mu.RUnlock()
+	if !off {
+		t.Fatal("前置:今天的 writeOff 应先熔上")
+	}
+	// 一条昨天的记录:它不得把今天的 writeOff(以及 dayBytes/consecFails)
+	// 洗掉。注意 writeOff 期间这条本身仍被丢弃(`off` 早退) —— 闸门是「今天
+	// 的追踪停写」,不是「只允许写今天」;旧实现在这里会先被跨天块把 writeOff
+	// 清成 false,于是不但账被洗白,这条历史行还会顺着昨天的文件写出去。
+	Record(Route{Result: "回拨", At: yesterday.UnixMilli()})
+	mu.RLock()
+	off = writeOff
+	mu.RUnlock()
+	if !off {
+		t.Fatal("一条历史日期的记录把今天的 writeOff 洗掉了:每日配额账被回拨重置")
 	}
 }

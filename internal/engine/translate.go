@@ -445,6 +445,11 @@ func materializeToolCalls(out *Outcome) {
 		// Arguments 已就位、argsSB 为 nil,不碰。重复调用幂等(回填同一值)。
 		if call.argsSB != nil {
 			call.Arguments = call.argsSB.String()
+			// 回填即断奶(第六轮审计):留着已写过的 Builder,值拷贝进
+			// dropBrokenToolCalls 的 kept 后若有任何人再写,strings.Builder
+			// 的 copyCheck 会 panic 或静默错值 —— 安全性过去只靠「物化后
+			// 循环已停」的惯例维持,现在变成结构不变量。
+			call.argsSB = nil
 		}
 	}
 }

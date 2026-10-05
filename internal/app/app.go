@@ -125,9 +125,9 @@ type Parts struct {
 	cancel        context.CancelFunc
 	// cancelStop 是 lifeCtx 与调用方 ctx 之间桥接的 Stop 句柄:StartTimers 在
 	// lifeCtx 已存在时登记,Shutdown 时显式 Stop,不让调用方 ctx 一直持有回调。
-	cancelStop    func() bool
-	shutdownOnce  sync.Once
-	shutdownErr   error
+	cancelStop   func() bool
+	shutdownOnce sync.Once
+	shutdownErr  error
 
 	// ---- 生命周期(B9) ----
 	//
@@ -164,14 +164,14 @@ type Parts struct {
 	// coldCursor 是冷区轮换抽样的游标:每轮只扫 1/3 死节点,三轮一循环。
 	// 烂水池里 900 死节点每 10 分钟全扫一次是浪费,轮换后每节点仍每 30 分钟
 	// 被扫到一次(3 轮 × 10 分钟),复活延迟可接受。
-	coldCursor   atomic.Uint64
-	tierGate     *gate.Gate
-	tierBuckets  tierChains
+	coldCursor  atomic.Uint64
+	tierGate    *gate.Gate
+	tierBuckets tierChains
 
 	// ---- 订阅重建状态(rebuild.go) ----
-	rebuildMu       sync.Mutex
-	rebuilding      bool
-	rebuildQueued   bool
+	rebuildMu     sync.Mutex
+	rebuilding    bool
+	rebuildQueued bool
 	// subFetchRetries 是订阅补偿重试计数:Rebuild 串行化保证同一时刻只有一轮
 	// 在跑,当前靠串行偶然安全;改 atomic 后任何未来并发 Rebuild 也不竞态。
 	subFetchRetries atomic.Int64
@@ -249,9 +249,9 @@ func defaultSettings() Settings {
 		Enabled:            true,
 		ProbeEnabled:       true,
 		ProbeWorkers:       48,
-		ProbeIntervalMin:   30, // 1.2.x 遗留:运行时不再读取,见字段注释
-		RefreshIntervalMin: 15, // 烂水池:失效率快,补货频率跟上死亡频率
-		HotIntervalSec:     45, // 烂水池:活节点死得快,复检便宜(百节点秒级),高频保新鲜
+		ProbeIntervalMin:   30,  // 1.2.x 遗留:运行时不再读取,见字段注释
+		RefreshIntervalMin: 15,  // 烂水池:失效率快,补货频率跟上死亡频率
+		HotIntervalSec:     45,  // 烂水池:活节点死得快,复检便宜(百节点秒级),高频保新鲜
 		ColdIntervalSec:    600, // 死节点 5 分钟内复活≈彩票,10 分钟扫一次省一半开销
 		EffortLevel:        effort.DefaultLevel,
 		DefaultMaxTokens:   nil,
@@ -648,9 +648,13 @@ func Load(root string) (*Parts, error) {
 		}
 		merged := reg.Merge(clean)
 		// 健康感知淘汰(与周期 Rebuild 同口径):开场时健康表刚 Load,rank 快照有效。
+		// 查不到行的新 tag 显式给中间档 3(与 rebuild.go 同一裁决,理由见彼处注释)。
 		ranks := h.EvictRank()
 		evicted := reg.EnforceCapRanked(registry.PoolCap, func(tag string) int {
-			return ranks[tag]
+			if v, ok := ranks[tag]; ok {
+				return v
+			}
+			return 3
 		})
 		for _, tag := range evicted {
 			// 池子外的节点不该留健康行:D-C1 —— Forget 掉,否则被淘汰者的行
@@ -768,7 +772,16 @@ func Load(root string) (*Parts, error) {
 			Refresh: func() error {
 				parts.timersWG.add()
 				defer parts.timersWG.done()
-				return parts.Rebuild(parts.ctx())
+				err := parts.Rebuild(parts.ctx())
+				if errors.Is(err, errRebuildQueued) {
+					// 与 ProbeNow 同语义的**异步受理**:已有一轮在跑,本轮
+					// 已排队补跑(用的正是最新订阅/设置)。对面板这是成功
+					// 受理,不是 500 —— 报失败会诱导用户在重建中途连点,而
+					// 每次连点都只是把 queued 再置一次 true。
+					logger.Info("[app] 重建已在进行 — 手动刷新已排队补跑")
+					return nil
+				}
+				return err
 			},
 			RefreshLimits: func() error {
 				parts.timersWG.add()
@@ -876,6 +889,16 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 				return p.StatsStore.Flush()
 			}},
 		}
+		// 错误**全量聚合**(六审):旧写法每项都有 `shutdownErr == nil` 闸,
+		// 4 个 flush + box.Close 里只有第一个失败进得了返回值 —— registry
+		// 写失败会掩盖 health/stats 的同样失败,运维看到一条日志以为只是
+		// 磁盘抖了一下,实际三份账都没落地。Join 之后一条错误串全在。
+		var shutdownErrs []error
+		capture := func(err error) {
+			if err != nil {
+				shutdownErrs = append(shutdownErrs, err)
+			}
+		}
 		for _, f := range flushes {
 			done := make(chan error, 1)
 			go func(fn func() error) { done <- fn() }(f.fn)
@@ -885,8 +908,8 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 			case <-time.After(10 * time.Second):
 				err = fmt.Errorf("app: 关停时落盘 %s 超时(10s)", f.name)
 			}
-			if err != nil && p.shutdownErr == nil {
-				p.shutdownErr = fmt.Errorf("app: 关停时落盘 %s: %w", f.name, err)
+			if err != nil {
+				capture(fmt.Errorf("app: 关停时落盘 %s: %w", f.name, err))
 			}
 		}
 		if p.Host != nil {
@@ -898,15 +921,14 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 			go func() { done <- p.Host.Close() }()
 			select {
 			case err := <-done:
-				if err != nil && p.shutdownErr == nil {
-					p.shutdownErr = fmt.Errorf("app: 关停 sing-box: %w", err)
+				if err != nil {
+					capture(fmt.Errorf("app: 关停 sing-box: %w", err))
 				}
 			case <-time.After(30 * time.Second):
-				if p.shutdownErr == nil {
-					p.shutdownErr = fmt.Errorf("app: 关停 sing-box 超时(30s),已放行退出")
-				}
+				capture(fmt.Errorf("app: 关停 sing-box 超时(30s),已放行退出"))
 			}
 		}
+		p.shutdownErr = errors.Join(shutdownErrs...)
 	})
 	return p.shutdownErr
 }

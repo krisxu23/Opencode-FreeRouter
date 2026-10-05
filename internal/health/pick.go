@@ -119,22 +119,38 @@ func (h *Health) Pick(req PickRequest) *Picked {
 	snap := h.pickSnapshot(now, req.StickyNode, req.Pool)
 
 	// 锁外 rank:纯计算,零共享写。ranked 行从池里复用,排序只排索引。
+	// 归还必须还**真正长成了的那一条**:buf 起步 cap 256,现场池 1700-8000,
+	// append 必然换 backing 数组 —— 旧写法无条件 Put(buf[:0]) 归还的是原始
+	// 小数组,长大的一条每次进 GC,"池复用"名不副实(第六轮审计 F3)。
 	buf := rankedPool.Get().([]ranked)
 	rankedAll := buf[:0]
-	// sticky 先按 tag 索引 O(1) 命中,不再线性扫池。
+	defer func() {
+		if cap(rankedAll) > cap(buf) {
+			buf = rankedAll
+		}
+		rankedPool.Put(buf[:0])
+	}()
+	// 两段式的第一段:pickSnapshot 带 sticky 时只拷了那一个节点(若有)。
+	// 对它 rank 成功 → 整池拷贝当场省掉(见 pickSnapshot 注释);失败或
+	// 无 sticky → fill 补齐其余池节点。
 	stickyHit := (*ranked)(nil)
-	if req.StickyNode != "" && snap.poolIdx != nil {
-		if idx, ok := snap.poolIdx[req.StickyNode]; ok {
-			if r, ok2 := rankNode(snap.nodes[idx], req, snap, now); ok2 {
-				rankedAll = append(rankedAll, r)
-				stickyHit = &rankedAll[len(rankedAll)-1]
-			}
+	if req.StickyNode != "" && len(snap.nodes) > 0 && snap.nodes[0].tag == req.StickyNode {
+		if r, ok2 := rankNode(snap.nodes[0], req, snap); ok2 {
+			rankedAll = append(rankedAll, r)
+			stickyHit = &rankedAll[0]
 		}
 	}
 	var want []string
 	var byGroup map[string][]int
 	var allIdx []int
 	if stickyHit == nil {
+		// 两段式的第二段:带 sticky 但首段没定案时**整体重取**一份同刻快照
+		// (表与行必须来自同一时刻,见 fillPoolSnapshot 注释)。无 sticky 时
+		// pickSnapshot 已经给了全量同刻快照,这里什么都不补 —— 过去无条件调
+		// fill 会让无 sticky 的请求白拷两份(表一趟、行一趟),且两趟不同刻。
+		if req.StickyNode != "" {
+			h.fillPoolSnapshot(snap, now, req.Pool)
+		}
 		want = make([]string, 0, len(req.Countries))
 		seen := map[string]bool{}
 		for _, g := range req.Countries {
@@ -149,7 +165,7 @@ func (h *Health) Pick(req PickRequest) *Picked {
 		allIdx = make([]int, 0, len(snap.nodes))
 		for i := range snap.nodes {
 			// sticky 已命中则不会走到这里;未命中时 sticky 节点仍参与池排。
-			r, ok := rankNode(snap.nodes[i], req, snap, now)
+			r, ok := rankNode(snap.nodes[i], req, snap)
 			if !ok {
 				continue
 			}
@@ -212,13 +228,14 @@ func (h *Health) Pick(req PickRequest) *Picked {
 
 	// 选中后短写锁提交:把快照期发现的过期键一次删掉(懒删的合法性:这些键
 	// 在快照时刻已过期,删除只影响内存回收,不改变 rank 结论)。
+	// ranked 的归还全部交给上面的 defer —— 这里**绝不能再 Put 一次**:
+	// 双 Put 会让池里出现两个共享同一 backing 的切片,两个后来的 Pick 各
+	// 自 Get 到同一底层数组 → 互相覆盖(第六轮改造中途引入过这一处,删)。
 	if hitIdx < 0 {
-		rankedPool.Put(buf[:0])
 		h.commitPickSweep(snap)
 		return nil
 	}
 	out := pickRanked(&rankedAll[hitIdx], rankedSlice(rankedAll, orderIdx), req.StickyNode)
-	rankedPool.Put(buf[:0])
 	h.commitPickSweep(snap)
 	return out
 }
@@ -237,38 +254,100 @@ func rankedSlice(all []ranked, idx []int) []*ranked {
 // 行是值拷贝;ttft/busy/sticky 的指针只读(写侧整行替换,旧值自洽)。
 // sweep* 是快照期发现的已过期键,提交阶段短写锁删掉。
 type pickSnap struct {
-	nodes    []snapNode
-	poolIdx  map[string]int
-	busy     map[string]int
-	quotaIps map[string]bool
-	busyTbl  map[string]int
-	sweepCool  []string
-	sweepBusy  []string
+	nodes       []snapNode
+	busy        map[string]int
+	quotaIps    map[string]bool
+	busyTbl     map[string]int
+	sweepCool   []string
+	sweepBusy   []string
 	sweepSticky []string
 	sweepQuota  []string
 }
 
 type snapNode struct {
-	tag     string
-	country string
-	row     row
-	hasRow  bool
-	coolOk  bool // true = 可用(cool 缺席或已过期);false = 冷却中
-	expiredCool bool // cool 已过期,待删
-	ttft    int64
-	hasTtft bool
-	exitIP  string
+	tag       string
+	country   string
+	row       row
+	hasRow    bool
+	coolOk    bool // true = 可用(cool 缺席或已过期);false = 冷却中
+	ttft      int64
+	hasTtft   bool
+	exitIP    string
 	quotaSelf bool // 自身配额记号新鲜
 }
 
 // pickSnapshot 在 RLock 下拷贝 rank 的全部输入,不做任何删除。
-// pool 来自调用方(req.Pool):只为池内 tag 拷贝行 + 建 tag 索引。
+//
+// **两段式**(第六轮审计 F2,第七轮复审 A1 修正同刻性):带 sticky 的请求
+// (稳态下的主流形状)先只拷那一个节点的 snapNode 进 nodes[0];它 rank 成功
+// 就到此为止,整池 8000 行的拷贝当场省掉。它 rank 失败时由 Pick 调
+// fillPoolSnapshot **整体重取**一份快照(第二次 RLock,罕见路径付两趟可接受)。
+//
+// 无 sticky 的请求在这里一次取全 —— 这既是省一趟拷贝,更是同刻性要求:
+// 若也走「第一段只取表、第二段补行」,聚合表(busy/busyTbl/quotaIps)与逐行
+// 数据来自两个时刻,而间隙可能被写者持整表锁拉长;间隙里节点重探换了
+// exitIP、或旧 IP 被并发 NoteExitBusy/NoteQuota 推过阈值,rankNode 就会拿
+// 旧表算新行,把「正忙、已被限流」的节点算成零负载而赢下分组 —— 那不是
+// 「稍旧」,是错误选路(且硬不变量没破,查不出来)。表与行必须同刻。
 func (h *Health) pickSnapshot(now int64, ownSticky string, pool []PoolNode) *pickSnap {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	snap := h.pickAggLocked(now, ownSticky)
+	if ownSticky != "" {
+		for _, node := range pool {
+			if node.Tag == ownSticky {
+				snap.nodes = append(snap.nodes, h.snapNodeLocked(now, node, snap))
+				break
+			}
+		}
+		return snap
+	}
+	h.appendPoolLocked(snap, now, pool)
+	return snap
+}
+
+// appendPoolLocked 在当前 RLock 下把池里全部节点拷进 snap(与聚合表同刻)。
+//
+// 一次性给足容量:满池 8000 节点若沿用 pickAggLocked 的 256 起步会连realloc
+// 好几次(每次都是一段 ~200B×n 的拷贝,六审 F3 控的正是这个)。
+func (h *Health) appendPoolLocked(snap *pickSnap, now int64, pool []PoolNode) {
+	if cap(snap.nodes)-len(snap.nodes) < len(pool) {
+		grown := make([]snapNode, 0, len(snap.nodes)+len(pool))
+		grown = append(grown, snap.nodes...)
+		snap.nodes = grown
+	}
+	for _, node := range pool {
+		snap.nodes = append(snap.nodes, h.snapNodeLocked(now, node, snap))
+	}
+}
+
+// fillPoolSnapshot 在 sticky 没能定案时**整体重取**一份完整快照:聚合表与
+// 逐行数据在同一个 RLock 内产出,并整体替换第一段的结果(第一段那个 sticky
+// 节点也丢弃重拷,池排里自然只有它一份)。
+//
+// 两个被这条整体重取一起消掉的形状(第七轮复审 A):
+//   - 表/行不同刻(见 pickSnapshot 注释)会错误选路;
+//   - 旧写法靠 `node.Tag == skip` 跳过第一段已拷的节点,而 ownSticky 不在池里
+//     时 skip 是零值 "",于是池中 tag 为空的节点被一起静默跳过、从候选里消失
+//     (tag 由 app.go 直接透传 Registry,未校验非空)。
+//
+// sweep 列表也必须整体替换,不能只覆盖 busy 表:它们与三张表同刻同源,
+// 混着两份会导致 commitPickSweep 漏删或多删(漏删由下一轮补,多删会误清
+// 新鲜的 cool/busy 记号)。
+func (h *Health) fillPoolSnapshot(snap *pickSnap, now int64, pool []PoolNode) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	fresh := h.pickAggLocked(now, "")
+	fresh.nodes = snap.nodes[:0]
+	h.appendPoolLocked(fresh, now, pool)
+	*snap = *fresh
+}
+
+// pickAggLocked 拷 rank 公式需要的聚合表与 sweep 列表。调用方必须持 RLock。
+func (h *Health) pickAggLocked(now int64, ownSticky string) *pickSnap {
 	snap := &pickSnap{
-		nodes:   make([]snapNode, 0, len(pool)),
-		busy:    map[string]int{},
+		nodes:    make([]snapNode, 0, 256),
+		busy:     map[string]int{},
 		quotaIps: map[string]bool{},
 		busyTbl:  map[string]int{},
 	}
@@ -283,48 +362,7 @@ func (h *Health) pickSnapshot(now int64, ownSticky string, pool []PoolNode) *pic
 		}
 		snap.busyTbl[ip] = b.Count
 	}
-	for _, node := range pool {
-		r, hasRow := h.nodes[node.Tag]
-		sn := snapNode{tag: node.Tag, country: node.Country, row: r, hasRow: hasRow}
-		// cool:冷却中不可用;过期只记不删。
-		if c, ok := h.cool[node.Tag]; ok {
-			if c.Until > now {
-				sn.coolOk = false
-			} else {
-				sn.coolOk = true
-				sn.expiredCool = true
-				snap.sweepCool = append(snap.sweepCool, node.Tag)
-			}
-		} else {
-			sn.coolOk = true
-		}
-		// ttft:只读中位数(写侧已算好,见 ttftRow 注释)。
-		if t, ok := h.ttft[node.Tag]; ok && t.hasMedian && now-t.At <= ttftFresh {
-			sn.ttft, sn.hasTtft = t.median, true
-		}
-		// exitIP:信任窗口内才有效(与 exitIpOfLocked 同口径,只读不续命)。
-		if hasRow && r.ExitIP != "" {
-			at := r.ExitIPAt
-			if at == 0 {
-				at = r.LastProbeAt
-			}
-			if now-at <= exitIPTTL {
-				sn.exitIP = r.ExitIP
-			}
-		}
-		// 自身配额记号。
-		sn.quotaSelf = hasRow && r.LastQuotaAt > 0 && now-r.LastQuotaAt < quotaMark
-		snap.nodes = append(snap.nodes, sn)
-	}
-	// poolIdx 只在 sticky 命中路径需要:无 sticky 会话的请求(大多数)不付
-	// 建表成本。建表只在需要时做,见 Pick 的 sticky 分支。
-	if ownSticky != "" {
-		snap.poolIdx = make(map[string]int, len(snap.nodes))
-		for i := range snap.nodes {
-			snap.poolIdx[snap.nodes[i].tag] = i
-		}
-	}
-	// busy:sticky 全扫在快照里做(读侧),过期只记不删。
+	// sticky 全扫(读侧),过期只记不删。
 	for session, hit := range h.sticky {
 		if hit == nil || now-hit.At > ttlOf(hit) {
 			snap.sweepSticky = append(snap.sweepSticky, session)
@@ -379,11 +417,44 @@ func (h *Health) pickSnapshot(now int64, ownSticky string, pool []PoolNode) *pic
 	return snap
 }
 
+// snapNodeLocked 拷单个池节点的 rank 输入(含 sweepCool 记账)。调用方持 RLock。
+func (h *Health) snapNodeLocked(now int64, node PoolNode, snap *pickSnap) snapNode {
+	r, hasRow := h.nodes[node.Tag]
+	sn := snapNode{tag: node.Tag, country: node.Country, row: r, hasRow: hasRow}
+	// cool:冷却中不可用;过期只记不删。
+	if c, ok := h.cool[node.Tag]; ok {
+		if c.Until > now {
+			sn.coolOk = false
+		} else {
+			sn.coolOk = true
+			snap.sweepCool = append(snap.sweepCool, node.Tag)
+		}
+	} else {
+		sn.coolOk = true
+	}
+	// ttft:只读中位数(写侧已算好,见 ttftRow 注释)。
+	if t, ok := h.ttft[node.Tag]; ok && t.hasMedian && now-t.At <= ttftFresh {
+		sn.ttft, sn.hasTtft = t.median, true
+	}
+	// exitIP:信任窗口内才有效(与 exitIpOfLocked 同口径,只读不续命)。
+	if hasRow && r.ExitIP != "" {
+		at := r.ExitIPAt
+		if at == 0 {
+			at = r.LastProbeAt
+		}
+		if now-at <= exitIPTTL {
+			sn.exitIP = r.ExitIP
+		}
+	}
+	// 自身配额记号。
+	sn.quotaSelf = hasRow && r.LastQuotaAt > 0 && now-r.LastQuotaAt < quotaMark
+	return sn
+}
+
 // rankNode 是 rankLocked 的无锁版:同一公式,只读快照。ok=false 的两种情形
 // 与旧函数一致:节点不可用(dead/冷却中)、受限模型遇到非 B。
-func rankNode(sn snapNode, req PickRequest, snap *pickSnap, now int64) (ranked, bool) {
+func rankNode(sn snapNode, req PickRequest, snap *pickSnap) (ranked, bool) {
 	var zero ranked
-	_ = now
 	if sn.hasRow && sn.row.State == StateDead {
 		return zero, false
 	}
@@ -496,6 +567,7 @@ func (h *Health) commitPickSweep(snap *pickSnap) {
 		}
 	}
 }
+
 // orderRowOf 把 ranked 压成落盘的 OrderRow:哨兵值在这里变 0 —— JS 写 null,
 // Go 的 int 写不了 null,0 读起来就是「没量到」,9223372036854775807 在面板上
 // 是个看不出含义的魔数(计划修正:不得写 MaxInt64)。

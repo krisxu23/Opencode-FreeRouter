@@ -43,6 +43,35 @@ func pinExitIpAt(h *Health, nodeKey string, at int64) {
 	h.nodes[nodeKey] = r
 }
 
+// TestFirstProbeDeathAfterQuotaRowStillNeverAlive 钉六审 F4:NoteQuota 给还没
+// 被首探的节点造了 {state:unknown} 临时行;该节点首探判死时,漏标 NeverAlive
+// 会让它按「曾活过」拿满 3 轮宽限(承诺是 2 轮)。unknown 不是「曾活过」的
+// 证据 —— 判死时按无行同待,置 NeverAlive=true。
+func TestFirstProbeDeathAfterQuotaRowStillNeverAlive(t *testing.T) {
+	h := NewHealth("")
+	h.NoteQuota("nq") // 造 unknown 临时行
+	if got := h.HealthOf("nq"); got != StateUnknown {
+		t.Fatalf("NoteQuota 后 = %v, want unknown", got)
+	}
+	h.MarkProbe("nq", deadRes()) // 首探判死
+	snap := h.NodeSnapshot()
+	if snap["nq"].State != StateDead || !snap["nq"].NeverAlive {
+		t.Fatalf("unknown 行首探判死: state=%v neverAlive=%v, want dead+true(拿 2 轮门槛,不是 3 轮)",
+			snap["nq"].State, snap["nq"].NeverAlive)
+	}
+	// 对照:曾 alive 过的行被重判 dead,保持 NeverAlive=false(3 轮宽限是对的)。
+	h.MarkProbe("was", aliveRes(10, "1.1.1.1", "US"))
+	h.MarkProbe("was", deadRes())
+	if s := h.NodeSnapshot()["was"]; s.NeverAlive {
+		t.Fatal("曾活过的行被判死不该打成 never-alive —— 它配拿冷区宽限")
+	}
+	// alive 清标志(MarkProbe(alive) 路径)。
+	h.MarkProbe("nq", aliveRes(10, "1.1.1.1", "US"))
+	if s := h.NodeSnapshot()["nq"]; s.NeverAlive {
+		t.Fatal("复活后 NeverAlive 必须清掉")
+	}
+}
+
 func TestMarkProbeKeepsTheLastExitIPWhenEchoFails(t *testing.T) {
 	h := NewHealth("")
 	// 带空白与小写国家码:量测值按 JS 一样 trim/上截 2 位大写(src/health.js:267-268)
@@ -652,10 +681,15 @@ func TestTtftIsDroppedOnForget(t *testing.T) {
 	if len(h.TtftSnapshot()) != 0 {
 		t.Fatalf("ttft rows after Forget = %d, want 0", len(h.TtftSnapshot()))
 	}
-	// 非正数忽略(JS 的 ms <= 0 return)
-	h.NoteTtft("n2", 0)
+	// 负数才是「没量到」;0 是合法量测(第六轮口径统一:stats 侧已裁决
+	// 「0 也算一次真实量测」,两侧必须一致)。
+	h.NoteTtft("n2", -1)
 	if len(h.TtftSnapshot()) != 0 {
-		t.Fatalf("ms=0 created a row, want none")
+		t.Fatalf("ms=-1 created a row, want none")
+	}
+	h.NoteTtft("n3", 0)
+	if len(h.TtftSnapshot()) != 1 {
+		t.Fatalf("ms=0 must be recorded as a real (fast) measurement, got %d rows", len(h.TtftSnapshot()))
 	}
 }
 
@@ -759,6 +793,20 @@ func TestConcurrentPickAndNotesDoNotRace(t *testing.T) {
 		h.MarkProbe(tag, aliveRes(lat, ips[tag], "US"))
 		pool = append(pool, PoolNode{Tag: tag, Country: "US"})
 	}
+	// 六审 F8-1 的未测轴:commitPickSweep 的四个删除循环在原形状里**零执行**
+	// (TTL 全是分钟级,500 迭代内没有键会过期)。预置一批「已过期」的
+	// sticky/cool/quota 行,并把 NoteSticky/NoteCooldown 混进写侧 —— 删除循环
+	// 从此每轮都有活干,而且与并发续命(提交前重验)真正交叠,这正是 -race
+	// 需要看的形状。
+	for i := 0; i < 8; i++ {
+		s := fmt.Sprintf("s%d", i)
+		h.NoteSticky(s, tags[i%len(tags)], false)
+		pinStickyAt(h, s, 1) // 拨到 1970:pickSnapshot 立刻判过期、进 sweep
+	}
+	for i := 0; i < 4; i++ {
+		h.NoteCooldown(tags[i], 0)
+		pinCoolUntil(h, tags[i], 1)
+	}
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)
@@ -770,10 +818,35 @@ func TestConcurrentPickAndNotesDoNotRace(t *testing.T) {
 				h.NoteQuota(tags[i%len(tags)])
 				ip := h.NoteExitBusy("1.1.1.1")
 				h.ReleaseExitBusy(ip)
+				if i%10 == 0 {
+					// 写侧同时续命:被 sweep 的键可能在快照与提交之间被
+					// NoteSticky/NoteCooldown 刷新 —— 提交的重验必须挡住误删,
+					// 而 -race 盯着这条交错。
+					h.NoteSticky(fmt.Sprintf("s%d", i%8), tags[(i+1)%len(tags)], true)
+					h.NoteCooldown(tags[i%len(tags)], 0)
+				}
 			}
 		}(g)
 	}
 	wg.Wait()
+}
+
+// pinStickyAt / pinCoolUntil 把 sticky/cool 行的时间戳拨到过期。同文件顶部的
+// pinExitIpAt 家族:Go 没有时钟注入,同包测试直接改写行内字段。
+func pinStickyAt(h *Health, session string, at int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if s, ok := h.sticky[session]; ok {
+		s.At = at
+	}
+}
+
+func pinCoolUntil(h *Health, nodeKey string, until int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if c, ok := h.cool[nodeKey]; ok {
+		c.Until = until
+	}
 }
 
 // TestPruneStaleReclaimsTtftAndCoolingRows 钉住 R17:池子每轮 churn 掉上千个 tag,

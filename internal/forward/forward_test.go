@@ -355,6 +355,82 @@ func TestBodyOverEightMegabytesIs413(t *testing.T) {
 	}
 }
 
+// 六审回归:Decoder 只读第一个 JSON 值,旧实现因此拆掉了三道闸(尾随垃圾
+// 静默接受、`{...}+巨大尾巴` 绕 413 烧配额、空白体放行)。逐一钉死补齐后的
+// 行为 —— 全部在 readBody 内拦截,engine 零调用。
+func TestBodyTrailingGarbageIs400(t *testing.T) {
+	st := newStub()
+	ts := st.serve(t)
+	res, _ := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m"} junk`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("尾随垃圾 status %d, want 400(旧 Unmarshal 语义)", res.StatusCode)
+	}
+	if st.callsN() != 0 {
+		t.Fatalf("坏体不得到达 Complete (%d)", st.callsN())
+	}
+}
+
+func TestBodyDoubleDocumentIs400(t *testing.T) {
+	st := newStub()
+	ts := st.serve(t)
+	res, _ := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"a"}{"model":"b"}`)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("双文档 status %d, want 400(第二个文档不是被静默丢弃)", res.StatusCode)
+	}
+}
+
+func TestSmallJSONWithGiantTailNeverReachesComplete(t *testing.T) {
+	// 配额闸门的回归主体(六审):`{"model":"m"}` + 巨大尾巴。旧 Decoder 实现
+	// 读不到越首值,MaxBytesReader 不触发,请求完整烧一轮 engine;现在尾巴
+	// 在 readBody 里被拒。裁决按尾巴的形状分两种,但共同点必须钉死:
+	// **engine 零调用、不烧配额**。
+	//   - 直接紧跟非法字符(`+zzz`):scanner 在第一个坏字节判语法错 → 400,
+	//     不必读尽(旧语义是 413;两者都是进 Complete 前的 4xx)。
+	//   - 巨大空白 + 内容:跳过空白必须穿过 MaxBytesReader → 撞限 → 413。
+	st := newStub()
+	ts := st.serve(t)
+	for name, body := range map[string]int{
+		"garbage": http.StatusBadRequest,
+		"blanket": http.StatusRequestEntityTooLarge,
+	} {
+		var payload string
+		if name == "garbage" {
+			payload = `{"model":"m"}` + strings.Repeat("z", 9<<20)
+		} else {
+			payload = `{"model":"m"}` + strings.Repeat(" ", 9<<20) + "x"
+		}
+		res, _ := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), payload)
+		if st.callsN() != 0 {
+			t.Fatalf("%s: 超大尾巴绝不允许到达 Complete (%d calls)", name, st.callsN())
+		}
+		if res.StatusCode != body {
+			t.Fatalf("%s: status %d, want %d", name, res.StatusCode, body)
+		}
+	}
+}
+
+func TestWhitespaceBodyIs400(t *testing.T) {
+	st := newStub()
+	ts := st.serve(t)
+	res, _ := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), "   ")
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("纯空白体 status %d, want 400(旧 len(raw)==0 只认零字节)", res.StatusCode)
+	}
+}
+
+func TestEmptyBodyIsValidJSONMap(t *testing.T) {
+	// 零字节体:旧语义合法空 map → 走到 model 校验 400(而不是 JSON 错)。
+	st := newStub()
+	ts := st.serve(t)
+	res, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), "")
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", res.StatusCode)
+	}
+	if got := decode(t, body)["error"].(map[string]any)["message"]; got != "`model` is required" {
+		t.Fatalf("空体应走到 model 校验,实得 %v", got)
+	}
+}
+
 func TestModelIsRequired(t *testing.T) {
 	ts := newStub().serve(t)
 	res, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"stream":false}`)
@@ -1163,6 +1239,37 @@ func TestEmptyTextDeltaIsNotForwarded(t *testing.T) {
 	}
 }
 
+// TestResponsesUsageOnlyStillOpensWithCreated 钉 C-新2 不变量的 usage-only
+// 半边(六审 3A 测试缺口):一整轮只有 usage 帧、没有任何内容块时,completed
+// 仍不能是流上的第一个事件 —— created/in_progress 生命周期头必须补上。
+func TestResponsesUsageOnlyStillOpensWithCreated(t *testing.T) {
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		u := stream.Usage{In: 3, Out: 2, HasUsage: true}
+		if err := onChunk(engine.Chunk{Kind: engine.ChunkUsage, Usage: u}); err != nil {
+			return engine.Outcome{}, err
+		}
+		return engine.Outcome{Usage: u}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/responses", auth(), `{"model":"m","stream":true}`)
+	evs := responsesSSEEvents(t, body)
+	if len(evs) < 3 {
+		t.Fatalf("usage-only 轮只有 %d 帧, want created+in_progress+completed ≥3: %v", len(evs), evs)
+	}
+	if evs[0]["type"] != "response.created" {
+		t.Fatalf("首事件 = %v, want response.created(usage 不算内容,但头不能省)", evs[0]["type"])
+	}
+	if evs[len(evs)-1]["type"] != "response.completed" {
+		t.Fatalf("末事件 = %v, want completed", evs[len(evs)-1]["type"])
+	}
+	resp, _ := evs[len(evs)-1]["response"].(map[string]any)
+	usage, ok := resp["usage"].(map[string]any)
+	if !ok || usage["input_tokens"] == nil {
+		t.Fatalf("completed 必须带 usage(它没有别的投递通道): %v", resp)
+	}
+}
+
 // TestJSONResponsesCarryCORS 是协议审计 M5 的钉:OPTIONS 预检承诺了跨源可用,
 // 实际 JSON 响应(非流式)必须带 Access-Control-Allow-Origin,否则浏览器在
 // 预检通过之后仍把响应拦在 CORS 之外,跨源 harness 连错误体都读不到。
@@ -1459,4 +1566,64 @@ func TestChatTidyNoEmptyToolCallsArray(t *testing.T) {
 			t.Fatalf("delta 出现空 tool_calls 数组(chattidy 形状4): %s", raw)
 		}
 	})
+}
+
+// zeroNilThenBytes 第一次 Read 返回 (0, nil) —— io.Reader 契约里这是**合法**
+// 返回值(含义是「什么都没发生,请重试」,明确不是 EOF),之后正常吐字节。
+type zeroNilThenBytes struct {
+	data []byte
+	sent bool
+}
+
+func (z *zeroNilThenBytes) Read(p []byte) (int, error) {
+	if !z.sent {
+		z.sent = true
+		return 0, nil
+	}
+	if len(z.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, z.data)
+	z.data = z.data[n:]
+	return n, nil
+}
+
+func (z *zeroNilThenBytes) Close() error { return nil }
+
+// 复审 A-低(第七轮):裸 Read 只调用一次,于是 (0, nil) 被当成坏体判 400。
+// 只有把 r.Body 换成自定义 Reader 的中间件/包装器(限速、解密、审计)才会
+// 这样返回,但那读法合法;旧 io.ReadAll 版对这种 reader 是重试。改用
+// io.ReadFull 后与旧语义一致:重试拿到首字节,合法 JSON 照常受理。
+func TestBodyReaderReturningZeroNilIsRetriedNotRejected(t *testing.T) {
+	s := &Server{}
+	rec := httptest.NewRecorder()
+	w := &writer{ResponseWriter: rec}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = &zeroNilThenBytes{data: []byte(`{"model":"m"}`)}
+
+	got, ok := s.readBody(w, req)
+	if !ok {
+		t.Fatalf("readBody 把 (0,nil) 之后的合法 JSON 拒了: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got["model"] != "m" {
+		t.Fatalf("model = %v, want m", got["model"])
+	}
+}
+
+// 反过来钉住空体语义没被 ReadFull 改坏:零字节体仍是合法空 map(不是 400
+// JSON 错),这与旧 io.ReadAll 版逐字一致。
+func TestEmptyBodyIsStillAValidEmptyMapAfterReadFull(t *testing.T) {
+	s := &Server{}
+	rec := httptest.NewRecorder()
+	w := &writer{ResponseWriter: rec}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Body = http.NoBody
+
+	got, ok := s.readBody(w, req)
+	if !ok {
+		t.Fatalf("零字节体被拒: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(got) != 0 {
+		t.Fatalf("got = %v, want 空 map", got)
+	}
 }

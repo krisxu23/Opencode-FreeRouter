@@ -385,6 +385,56 @@ func TestFirstProbeZeroAliveWithDeadDirectIsDropped(t *testing.T) {
 // TestFirstProbeZeroAliveAppliesWhenDirectOK 钉判据的另一半:零通关但直连
 // 正常 = 这批订阅节点真的全是死的,是**合法观测**,判决照常落地 —— 否则
 // 一个纯死订阅会让首探永远空转(每 30s 全量重测再丢弃,死循环)。
+// TestFirstProbeIncludesUnknownRow 钉六审 F3-1:NoteQuota 给「首探前撞了真
+// 流量 429」的节点造了 {state:unknown} 临时行。hotPass 只收 alive、coldPass
+// 只收 dead,首探若只收「无行」节点,这个 unknown 行就是三档 pass 的联合盲区:
+// 整进程寿命不探测、不删除,还照常可被 Pick 选中。首探的圈定必须含 unknown。
+func TestFirstProbeIncludesUnknownRow(t *testing.T) {
+	p := newProbeParts(t, 3)
+	fp := p.Prober.(*fakeProber)
+	fp.failedTags = map[string]bool{}
+	// n0 造一行 unknown(NoteQuota),n1/n2 保持无行。
+	p.Health.NoteQuota("n0")
+	if got := p.Health.HealthOf("n0"); got != health.StateUnknown {
+		t.Fatalf("NoteQuota 后 = %v, want unknown", got)
+	}
+	// 三发全部判死:unknown 的 n0 必须也被首探扫到并判死。
+	for _, tag := range []string{"n0", "n1", "n2"} {
+		fp.failedTags[tag] = true
+	}
+	sum := p.firstProbePass(context.Background())
+	if sum.Scanned != 3 {
+		t.Fatalf("首探扫了 %d 个, want 3(unknown 行必须进首探圈定,否则是探测盲区)", sum.Scanned)
+	}
+	v := p.Health.NodeSnapshot()["n0"]
+	if v.State != health.StateDead || !v.NeverAlive {
+		t.Fatalf("unknown 行首探判死: state=%v neverAlive=%v, want dead+true(六审 F4:unknown 不是「曾活过」的证据)",
+			v.State, v.NeverAlive)
+	}
+}
+
+// TestColdPassDeleteBumpsEgressGen 钉六审(cold pass 的 sync 收尾):冷区删除
+// 后的 SyncOutbounds 成功必须 bump **egressGen**(缓存 client 的拨号闭包绑着
+// 被删出站,不换代则请求在已撤出站上白烧一次 transport 失败 —— 这是
+// noteEgressChanged 的 O3 契约)。落盘路径同理由 rebuild 的 Flush 测试覆盖。
+func TestColdPassDeleteBumpsEgressGen(t *testing.T) {
+	p := newProbeParts(t, 2)
+	fp := p.Prober.(*fakeProber)
+	fp.failedTags = map[string]bool{"n0": true}
+	p.Health.MarkProbe("n0", deadResult()) // 冷区、NeverAlive(门槛 2)
+	p.Health.MarkProbe("n1", aliveResult("8.8.8.8"))
+	p.lastHotOK.Store(true) // 开删除闸
+	genBefore := p.egressGen.Load()
+	p.coldPass(context.Background()) // 第 1 轮:n0 streak 1,未删
+	p.coldPass(context.Background()) // 第 2 轮:n0 streak 2 → 删除 + Sync
+	if p.Registry.Has("n0") {
+		t.Fatal("夹具没配到删除形状:n0 应已被删")
+	}
+	if p.egressGen.Load() == genBefore {
+		t.Fatal("冷区删除同步出站后必须 bump egressGen —— 缓存 client 不得再服务已撤出站")
+	}
+}
+
 func TestFirstProbeZeroAliveAppliesWhenDirectOK(t *testing.T) {
 	p := newProbeParts(t, 20)
 	fp := p.Prober.(*fakeProber)
@@ -649,6 +699,35 @@ func TestProbeNowIsSerialized(t *testing.T) {
 }
 
 // ---- 订阅重建(9 条) ----
+
+// TestRebuildRenameKeepsMembership 钉六审 Top-1:订阅商把节点改名(US-01 →
+// US-02,免费池常态)时,成员必须**不断档**。旧实现先 Merge 后差集删:Merge
+// 按身份去重(改名前后 server/uuid 相同 → 同一物理节点),新 tag 因旧 tag 还
+// 占着身份被当别名跳过,随后差集删按 tag 判、旧 tag 不在 present 被删 ——
+// 该节点这一整轮从池里消失,下轮才回来。boot 路径本来就是先删后 Merge,
+// rebuild 与它对齐后此洞闭合。
+func TestRebuildRenameKeepsMembership(t *testing.T) {
+	p := newProbeParts(t, 1) // 池里有 n0
+	swallowTimers(p)
+	// 一条「同物理节点、新名字」的订阅:vlink("renamed") 与 vnode("n0") 的
+	// server/uuid 不同,得手工造同身份改名的形状:server/uuid 一律用 n0 的,
+	// 只换 tag。
+	one := "vless://aeaeaeae-aeae-4aea-8aea-aeaeaeaeaeae@n0.example:443?type=ws&security=tls&sni=n0.example#renamed"
+	url := subAndCatalogServer(t, one, `{"data":[]}`, http.StatusOK)
+	p.Settings.SubURLs = []string{url}
+	if err := p.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if !p.Registry.Has("renamed") {
+		t.Fatal("改名后的新 tag 必须**本轮**入池(先删后 Merge 让身份当场让位;旧顺序下它被当别名跳过,节点整轮蒸发)")
+	}
+	if p.Registry.Has("n0") {
+		t.Fatal("旧 tag 该被差集删掉(不在订阅里了)")
+	}
+	if p.Registry.Len() != 1 {
+		t.Fatalf("池子长度 = %d, want 1(改名不换数量)", p.Registry.Len())
+	}
+}
 
 func TestRebuildReplacesOutboundsInPlace(t *testing.T) {
 	p := newProbeParts(t, 1) // n0 已在池内

@@ -333,15 +333,17 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 	}
 	wallClock := settings.MaxWallClockMS
 	if wallClock < 0 {
-		wallClock = 0 // 0 = 不限(默认),见 maxWallClockDefault
+		wallClock = 0 // 显式负数归 0=不限;出厂默认见 maxWallClockDefault(180s)
 	}
 
 	// 会前失败(首字节之前)就换下一个出口,直到健康池扫完。为什么不是固定
 	// 2 次:无标识的调用方所有请求原本会落进同一个 session、粘在同一个出口
 	// 上,一次失败就没有第二次机会;改成扫池之后,一个出口不行不会让整个
-	// 请求失败。终止条件取先到:pick 返回 nil(池里没有可用出口了)或尝试
-	// 次数达到 attemptCap。**没有墙钟上限**(默认)—— 这是明确的选择,代价
-	// 是连续命中慢超时节点时总耗时可能很长,所以每次轮换都会打一行汇总日志。
+	// 请求失败。终止条件取先到:pick 返回 nil(池里没有可用出口了)、尝试
+	// 次数达到 attemptCap、或墙钟超过 maxWallClockDefault(180s —— v1.4.1 从
+	// 「不限」改来,只掐病态长扫池,正常长尾在大 prompt 多轮重试下仍远够用;
+	// settings 显式 0 仍是不限)。代价是连续命中慢超时节点时总耗时受这个上限
+	// 约束,所以每次轮换都打一行汇总日志留证。
 	excluded := map[string]bool{}
 	// 各失败码已用掉的次数,用于 attemptCapByCode 的独立额度。
 	codeAttempts := map[string]int{}
@@ -362,12 +364,12 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 	var wheelEntry effort.Entry
 	wheelEntry, clientEffort = buildEffortEntry(*entry, clientEffort, settings.EffortLevel)
 	wheelReq := buildAttemptRequest(attemptInput{
-		messages:   msgs,
-		tools:      tools,
-		settings:   settings,
-		session:    session,
-		openAi:     openAi,
-		turnSeed:   turnSeed,
+		messages: msgs,
+		tools:    tools,
+		settings: settings,
+		session:  session,
+		openAi:   openAi,
+		turnSeed: turnSeed,
 	}, clientEffort)
 	var wheelPrebuilt *adapter.PrebuiltBody
 	{
@@ -383,8 +385,12 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 		probeDeps.Entry = wheelEntry
 		if pb, err := adapter.NewAdapter(probeDeps).BuildBody(wheelReq); err == nil {
 			wheelPrebuilt = pb
+		} else {
+			// 预建失败不致命:attempt 回落本地组装(与旧语义一致)。但也不能
+			// 静默 —— 失败意味着这一轮每次 attempt 都白付全量 build+Marshal
+			// (正是本优化要消灭的税),零观测就永远没人知道它在退化(六审)。
+			e.logf(fmt.Sprintf("engine: 轮首预建失败,本轮退回逐 attempt 组装: %v", err))
 		}
-		// 预建失败不致命:attempt 回落本地组装(与旧语义一致)。
 	}
 
 	attempt := 0
@@ -398,9 +404,9 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 		}
 		attemptStartedAt := nowMS()
 		if attempt > attemptCap {
-			// 放弃路径也必须打汇总 —— 这正是「只限次数、不设墙钟」这个决定
-			// 需要的数据(试了几个、各花多久)。漏了它,那个决定就没有依据
-			// 可回头评估。
+			// 放弃路径也必须打汇总 —— 轮换终止(次数帽/墙钟帽)需要的数据(试了
+			// 几个、各花多久)全在这一行里。漏了它,上限怎么定的就永远没有
+			// 依据可回头评估。
 			e.logRotation(trail, fmt.Sprintf("放弃（cap %d）", attemptCap), startedAt, tr)
 			// 给粘性出口记一次熔断分:每轮 attempt 都会把 sticky 重钉在最新
 			// 的出口上,放弃路径不清账,会话就钉在最后一个已知失败的出口上,
@@ -508,18 +514,18 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			defer releaseLane()
 			defer snapshot.Health.ReleaseExitBusy(busyIP)
 			outcome, finish, sawContent, failure = e.attempt(ctx, attemptInput{
-				snapshot:   snapshot,
-				entry:      entry,
-				messages:   msgs,
-				tools:      tools,
-				picked:     picked,
-				settings:   settings,
-				withinTurn: withinTurn,
-				session:    session,
-				openAi:     openAi,
-				turnSeed:   turnSeed,
-				onChunk:    onChunk,
-				prebuilt:   wheelPrebuilt,
+				snapshot:     snapshot,
+				entry:        entry,
+				messages:     msgs,
+				tools:        tools,
+				picked:       picked,
+				settings:     settings,
+				withinTurn:   withinTurn,
+				session:      session,
+				openAi:       openAi,
+				turnSeed:     turnSeed,
+				onChunk:      onChunk,
+				prebuilt:     wheelPrebuilt,
 				clientEffort: clientEffort,
 				effortEntry:  wheelEntry,
 			})
@@ -563,9 +569,9 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 			IP:      exitIP, // 复用 attempt 初的 exitIP,不二次查询:探测轮可能
 			// 在请求跑着时改判,二次查会把同一轮记成两个 IP;trace 要的是
 			// 「这一轮走的出口」,不是记录时刻的最新量测。
-			Code:    tryCodeOf(failure),
-			MS:      attemptMS,
-			Served:  sawContent,
+			Code:   tryCodeOf(failure),
+			MS:     attemptMS,
+			Served: sawContent,
 		})
 		if failure == nil && (finish == FinishStop || finish == FinishToolCalls || finish == FinishMaxTokens) {
 			// 真实流量是地区矩阵的权威判决,与主动探针同一待遇:gated 模型

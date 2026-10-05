@@ -34,10 +34,10 @@ func transport(d Dialer) *http.Transport {
 	// transport 本来就是按出口建的(一个 client 一个池),所以每主机的上限与
 	// 总量取同一个数才是这里的语义(主机数恒为 1,Go 默认 2 的坑见 O3)。
 	tr := &http.Transport{
-		DialContext:           d,
-		MaxIdleConns:          32,
-		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       60 * time.Second,
+		DialContext:         d,
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     60 * time.Second,
 		// 握手 5s:免费池的慢出口多,10s 串行 Dial+TLS 最坏 20s 才判死一个
 		// 出口;5s 足够覆盖正常握手(P95 远小于此),烂握手早死早换出口。
 		TLSHandshakeTimeout:   5 * time.Second,

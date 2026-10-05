@@ -185,9 +185,12 @@ type ttftRow struct {
 	hasMedian bool
 }
 
-// Health is the whole scheduling state. Every exported method takes h.mu;
-// Pick holds it for its whole body and releases on return. No method here
-// ever blocks on IO: Persist snapshots under the lock and writes outside it.
+// Health is the whole scheduling state. Every exported method takes h.mu
+// briefly: Pick reads a snapshot under RLock, ranks it **outside** the lock,
+// and commits lazy deletions under a short write lock (六审 F7 同步:旧注释说
+// "Pick holds it for its whole body" 是 1.2.x 的写锁模型,读锁化后已不成立).
+// No method here ever blocks on IO: Persist snapshots under the lock and
+// writes outside it.
 //
 // 持久化裁决(对计划类型块的有意偏离):计划写的是 sync.Mutex +
 // *persistence.Store,但 Store 的值类型是 map[string]any,与 row 不匹配,逐方法
@@ -319,8 +322,13 @@ func (h *Health) Persist() error {
 // 30ms 与 3000ms 的节点在 liveness 探测下毫无区别,在真实请求下差两个数量级。
 // 只做同 bucket 内的次序修正,不改门槛也不改分桶。
 // 不落盘:TTFT 是当前质量信号,跨重启的旧值比没有更糟(src/health.js:154-155)。
+//
+// 判据是 <0 而不是 <=0(第六轮审计):0ms 是**合法量测**(本机回环/极快出口
+// 上 time.Since 真的会取到 0),旧写法把它连同负数一起丢掉,而 stats 侧早已
+// 裁决「0 也算一次真实量测」—— 两侧口径必须一致,否则快出口的 TTFT 样本
+// 系统性偏大(只有慢的进得了窗口)。
 func (h *Health) NoteTtft(nodeKey string, ms int64) {
-	if nodeKey == "" || ms <= 0 {
+	if nodeKey == "" || ms < 0 {
 		return
 	}
 	h.mu.Lock()
@@ -665,13 +673,17 @@ func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
 
 	// NeverAlive:无行首探判死 → true(从没证明过价值);alive → 清掉;
 	// 其余(已有行的 dead 重判)保持原值 —— 曾经活过的不应被打回。
+	// unknown 行的判死同样置 true:unknown 只能来自 NoteQuota 临时行或
+	// 半程行(state==alive/dead 的行不会变回 unknown),它从未拿到过可达性
+	// 结论,"prev.NeverAlive=false" 只是没被标过、不是"曾活过"的证据;
+	// 漏标会让这类首探判死的节点白拿 3 轮宽限(承诺是 2 轮)。
 	neverAlive := false
 	if hasPrev {
 		neverAlive = prev.NeverAlive
 	}
 	if alive {
 		neverAlive = false
-	} else if !hasPrev {
+	} else if !hasPrev || prev.State == StateUnknown {
 		neverAlive = true
 	}
 
@@ -920,9 +932,12 @@ type TierCount struct {
 	B     int `json:"b"`
 }
 
-// EvictRank 给注册表淘汰用:分越小越先被挤掉。0=无行(未知),
-// 1=从未活过的死节点,2=活过但现在死的,3=unknown/冷却中,
-// 4=alive,5=B 档。调用方(registry.EnforceCapRanked)在锁外按快照算好传入。
+// EvictRank 给注册表淘汰用:分越小越先被挤掉。0=池外残留(既无行也不在
+// 池里的历史判决),1=从未活过的死节点,2=活过但现在死的,3=unknown/冷却中,
+// 4=alive,5=B 档。**调用方负责给「本轮新入池、还没有行」的 tag 显式中
+// 间档**（rebuild/boot 传 3）：map 零值恰是 0=最先挤掉,新节点若按零值
+// 参与排序,池满时每轮新 tag 恒被首驱、永远得不到首探——「健康感知淘汰」
+// 退化成「新人永不进」。调用方(registry.EnforceCapRanked)在锁外按快照算好传入。
 func (h *Health) EvictRank() map[string]int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

@@ -155,7 +155,21 @@ func (a *Adapter) Complete(ctx context.Context, req Request, onChunk func(Delta)
 	var renames map[string]string
 	if req.Prebuilt != nil {
 		// engine 轮首已预建:同轮重试只换头,不重建 body。
-		body, payload, renames = req.Prebuilt.Body, req.Prebuilt.Payload, req.Prebuilt.Renames
+		//
+		// **顶层浅拷贝**再接手(第六轮审计):exchange 的 stale-reasoning 重放
+		// 会对 t.body 做 StripStaleReasoningInputs —— 就地 delete + 整槽替换
+		// payload["input"]。直接把 Prebuilt.Body 交出去,一次「被出口 A 的
+		// 400 修过」的身体就会泄漏给同轮全部后续 attempt(改前每 attempt
+		// 私有 body,剥字段只影响当发)。当前 build 从不写
+		// previous_response_id、input 是类型化切片而 strip 断言 []any,该
+		// 路径不可达 —— 但契约破坏是真实的:任何给 body 加会话接续的改动
+		// 都会让它立刻变活。strip 只做顶层 delete/顶层整键赋值,顶层克隆
+		// 即完全隔离(Payload/Renames build 后只读,无需拷)。
+		body = make(map[string]any, len(req.Prebuilt.Body))
+		for k, v := range req.Prebuilt.Body {
+			body[k] = v
+		}
+		payload, renames = req.Prebuilt.Payload, req.Prebuilt.Renames
 	} else {
 		var err error
 		body, err = a.build(req)

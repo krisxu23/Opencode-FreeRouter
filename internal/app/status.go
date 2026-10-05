@@ -10,6 +10,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -498,6 +499,13 @@ func (p *Parts) rebuildLoop(ctx context.Context) {
 			return
 		}
 		if err := p.Rebuild(ctx); err != nil {
+			if errors.Is(err, errRebuildQueued) {
+				// 定时重建撞上正在跑的一轮(手动/补偿重试):排队补跑就是
+				// 正确结局,不是失败 —— Warn 会让 6h 周期的日志在每次人为
+				// 刷新附近多一条假警报。
+				logger.Info("[app] 定时重建撞上一轮在跑的重建 — 已排队补跑")
+				continue
+			}
 			logger.Warn(fmt.Sprintf("[app] 定时重建失败: %v", err))
 		}
 	}
@@ -565,7 +573,7 @@ func (p *Parts) Status() any {
 		"lastCheck": map[string]any{
 			"ok":        okValue,
 			"dropped":   dropped,
-			"nodes":     len(outs),               // 前端 checkAlert 的「N 个节点正常启用」读它
+			"nodes":     len(outs),                    // 前端 checkAlert 的「N 个节点正常启用」读它
 			"probation": p.coldCountOn(snapForStatus), // 1.3.0:观察期语义并入冷区(dead 节点数)
 			"at":        lastRebuildAt,
 			"mode":      mode,

@@ -17,6 +17,11 @@
 // 日期口径与 src/tracelog.js 的 dayKey 一致：**UTC** 的 YYYY-MM-DD（
 // toISOString().slice(0,10)），不是本地时区——本地时区会让东八区 08:00 前
 // 的记录落到前一天的文件里，跨天排障时文件对不上。
+//
+// 掉电裁决(六审 F11,有意为之):每行 open-append-close 不含 FlushFileBuffers,
+// 进程崩溃/被杀一行不丢,掉电或 BSOD 丢最后 ~1s 窗口的行。路由轨迹是排障
+// 素材,同 logger 的取舍 —— 不为每行一次 fsync 的代价买单;账本类文件走
+// persistence.WriteJSONFile(数据 + 目录 fsync)。
 package tracelog
 
 import (
@@ -29,8 +34,8 @@ import (
 )
 
 const (
-	historyDays     = 30
-	maxBytesPerDay  = 32 << 20
+	historyDays    = 30
+	maxBytesPerDay = 32 << 20
 	// maxTotalBytes 是 route 目录的总量上限:32MB/天 × 30 天 ≈ 960MB 无人管。
 	// prune 按总量从老删,总量超 200MB 时删到 150MB 水位线。
 	maxTotalBytes   = 200 << 20
@@ -149,13 +154,27 @@ func Record(r Route) {
 	// 最坏情况是每天失败一次后再次停写，既不会静默永久停摆，也不会退化成
 	// 每条记录一次的错误风暴。
 	day := time.UnixMilli(r.At).UTC().Format("2006-01-02")
-	if dir != "" && day != lastPruneDay {
+	// 只在**日期前进**时轮转并重置每日账(第七轮复审 B):旧判据是
+	// `day != lastPruneDay`,于是一条 At 早于当前轮转日的记录(时钟回拨、
+	// 上游回放、调用方显式给历史时刻)会把 lastPruneDay 拉回旧日期,并把
+	// dayBytes/writeOff/consecFails 一起清零 —— 反复在两天之间交替的 At 能
+	// 把 32MB/天的配额账无限重置(写的是不同日名的文件,所以连不上限都不撞)。
+	// 生产不可达(唯一调用点的 At ≡ nowMS()),但账本不该有一条「历史时刻
+	// 即清零今日配额」的路。历史日的记录照旧写它自己那天的文件,只是不再
+	// 参与轮转判定,字节仍记在当前轮转日账上(保守口径,见下方 F7)。
+	if dir != "" && (lastPruneDay == "" || day > lastPruneDay) {
 		pruneLocked(day)
 		lastPruneDay = day
-		// 每日字节配额按天重置。不重置的话，昨天攒下的计数会把今天
-		// 提前顶到 32MB 上限，整个新的一天都静默停写。
+		// 每日字节配额与保险丝按天重置。不重置配额的话,昨天攒下的计数会把
+		// 今天提前顶到 32MB 上限,整个新的一天都静默停写。
+		//
+		// consecFails 必须一起清:跨天块过去只清 writeOff/dayBytes 漏清它,
+		// 于是某个坏天熔满 5 次后计数永远挂着,此后**每天** 1 次瞬时抖动
+		// (AV 扫一下盘)就立刻重新熔掉一整天 —— 「一次抖动不丢一天」只对
+		// 首个坏天成立的回归(第六轮审计 F6)。
 		dayBytes = 0
 		writeOff = false
+		consecFails = 0
 	}
 	d := dir
 	off := writeOff
@@ -169,8 +188,8 @@ func Record(r Route) {
 	}
 	b = append(b, '\n')
 
-	// I21:配额判定与扣账在 mu 的短临界区里完成,写本身在 writeMu 下按
-	// 到达序落盘(见 writeMu 注释)。
+	// I21:配额预检在 mu 的短临界区里完成,写与最终扣账在 writeMu 下按到达序
+	// 进行(见 writeMu 注释;扣账落盘后补,见下方 F7 注释)。
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	mu.Lock()
@@ -194,26 +213,31 @@ func Record(r Route) {
 		mu.Unlock()
 		return
 	}
-	// 扣账放在开文件**之后**:OpenFile 失败时下面记一次失败(连续 5 次才整日
-	// 停写,见 maxConsecFails),扣没扣都一样;而真开成的这一行才计入当天额度,
-	// 账目与盘上内容一一对应,不会出现「配额被没落地的行吃掉」。OpenFile 仍
-	// 在 mu 内(本地文件一次 open 毫秒级,换来账实一致;Recent 是 RLock,短挡可接受)。
+	// 扣账与保险丝复位都以**真落盘**为准(第六轮审计 F7):旧写法在 OpenFile
+	// 成功处就清零 consecFails 并扣账,而「开得出、写不进」的形状(盘满:
+	// O_APPEND 开既有文件不需要空间,f.Write 才报 ENOSPC)每行都把计数清零
+	// 再 +1 —— 保险丝永不熔断,幻影配额还照涨。writeMu 串行化了整段
+	// open→write→记账,所以补扣(按实际落盘字节 n)与重验之间没有其他写者。
 	f, err := os.OpenFile(filepath.Join(d, day+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		noteFailLocked()
 		mu.Unlock()
 		return
 	}
-	dayBytes += int64(len(b))
-	consecFails = 0
 	mu.Unlock()
-
-	if _, err := f.Write(b); err != nil {
-		mu.Lock()
-		noteFailLocked()
-		mu.Unlock()
-	}
+	n, werr := f.Write(b)
 	_ = f.Close()
+	mu.Lock()
+	dayBytes += int64(n) // 按实际落盘的字节入账:账不高于盘
+	if werr != nil {
+		// 写失败(盘满最现实:O_APPEND 开既有文件不需要空间,f.Write 才
+		// ENOSPC)不再像旧实现那样被上一行的 open 成功清零 —— 熔断只在
+		// **连续写不进**时熔,「开得出、写不进」的形状烧满 5 行即整日停写。
+		noteFailLocked()
+	} else {
+		consecFails = 0
+	}
+	mu.Unlock()
 }
 
 // noteFailLocked 记一次写失败:连续 maxConsecFails 次才整日停写。瞬时抖动

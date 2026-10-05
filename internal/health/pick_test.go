@@ -427,3 +427,88 @@ func TestNoGlobalFailureCodeCoolsTheExit(t *testing.T) {
 		t.Fatal("NoteQuota 不得让节点不可用")
 	}
 }
+
+// 复审 A(第七轮):两段式快照的**表与行必须同刻**,结构上的可断言不变量是
+// 「池里每个 tag 恰好一份」。旧 fillPoolSnapshot 把第二段的行拼在第一段的
+// 聚合表上,并靠 `node.Tag == skip` 跳过第一段已拷的 sticky —— 而 ownSticky
+// 不在池里时 skip 是零值 "",于是池中 tag 为空的节点被一起静默跳过、从候选
+// 里消失(tag 由 app.go 直接透传 Registry,未校验非空)。
+func TestFillPoolSnapshotKeepsEveryTagExactlyOnce(t *testing.T) {
+	h := newPickFixture(t)
+	now := time.Now().UnixMilli()
+	// 池里额外放一个空 tag 节点:旧实现在这条路径上会把它吃掉。
+	pool := append(pickPool(allTags...), PoolNode{Tag: "", Country: "US"})
+
+	// 第一段:带 sticky 只拷它一个。
+	snap := h.pickSnapshot(now, "n3", pool)
+	if len(snap.nodes) != 1 || snap.nodes[0].tag != "n3" {
+		t.Fatalf("第一段 nodes = %+v, want 只有 n3", snap.nodes)
+	}
+	// 第二段:整体重取。
+	h.fillPoolSnapshot(snap, now, pool)
+	if got := len(snap.nodes); got != len(pool) {
+		t.Fatalf("fill 后 nodes = %d, want %d(空 tag 节点不得被跳过)", got, len(pool))
+	}
+	seen := map[string]int{}
+	for _, n := range snap.nodes {
+		seen[n.tag]++
+	}
+	for tag, c := range seen {
+		if c != 1 {
+			t.Fatalf("tag %q 出现 %d 次, want 1(重复 = Order 双行)", tag, c)
+		}
+	}
+	if len(seen) != len(pool) {
+		t.Fatalf("不同 tag 数 = %d, want %d", len(seen), len(pool))
+	}
+	// 表必须仍在:fill 整体替换 snapshot,不能只换行不换表。
+	if snap.busy == nil || snap.busyTbl == nil || snap.quotaIps == nil {
+		t.Fatal("fill 后三张聚合表必须仍有值")
+	}
+
+	// 旧实现真正的漏子在这里:sticky **不在池里**时第一段没拷任何节点,
+	// fill 的 skip 保持零值 "",`node.Tag == skip` 会把池中空 tag 的节点
+	// 一起跳过 —— 它从候选里静默消失(不 panic、不报错,只是永远选不上)。
+	h2 := newPickFixture(t)
+	snap2 := h2.pickSnapshot(now, "nX", pool)
+	if len(snap2.nodes) != 0 {
+		t.Fatalf("sticky 不在池里时第一段 nodes = %d, want 0", len(snap2.nodes))
+	}
+	h2.fillPoolSnapshot(snap2, now, pool)
+	if got := len(snap2.nodes); got != len(pool) {
+		t.Fatalf("fill 后 nodes = %d, want %d(空 tag 节点被 skip=\"\" 吃掉了)", got, len(pool))
+	}
+	empties := 0
+	for _, n := range snap2.nodes {
+		if n.tag == "" {
+			empties++
+		}
+	}
+	if empties != 1 {
+		t.Fatalf("空 tag 节点出现 %d 次, want 1", empties)
+	}
+}
+
+// 无 sticky 的请求在 pickSnapshot 里**一次取全**(单次 RLock):过去它也要走
+// fill,于是聚合表(第一段)与逐行数据(第二段)来自两个时刻 —— 间隙里节点
+// 重探换了 exitIP、或旧 IP 被并发 NoteExitBusy/NoteQuota 推过阈值,rankNode
+// 就会拿旧表算新行,把「正忙、已被限流」的节点算成零负载而赢下分组。
+func TestPickSnapshotWithoutStickyTakesTheWholePoolAtOnce(t *testing.T) {
+	h := newPickFixture(t)
+	now := time.Now().UnixMilli()
+	pool := append(pickPool(allTags...), PoolNode{Tag: "", Country: "US"})
+	snap := h.pickSnapshot(now, "", pool)
+	if got := len(snap.nodes); got != len(pool) {
+		t.Fatalf("nodes = %d, want %d(无 sticky 时一次取全)", got, len(pool))
+	}
+	if snap.nodes[0].tag != "n1" {
+		t.Fatalf("nodes[0] = %q, want n1(按池序)", snap.nodes[0].tag)
+	}
+	seen := map[string]int{}
+	for _, n := range snap.nodes {
+		seen[n.tag]++
+	}
+	if seen[""] != 1 {
+		t.Fatalf("空 tag 节点出现 %d 次, want 1", seen[""])
+	}
+}

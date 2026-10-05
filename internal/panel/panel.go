@@ -678,13 +678,17 @@ func readBodyJSON(w http.ResponseWriter, r *http.Request) (map[string]any, error
 	return out, nil
 }
 
-// securityHeaders 是面板全站的安全头:防 MIME 嗅探、防本机他端口页面的
-// iframe 点击劫持。CSP 不设 script-src(内联脚本是面板自身的,不值得为它
-// 建 nonce 管线),只钉 frame-ancestors。
+// securityHeaders 是面板全站的安全头:防 MIME 嗅探、防任意页面(含本机他
+// 端口)的 iframe 点击劫持。CSP 不设 script-src(内联脚本是面板自身的,不值得
+// 为它建 nonce 管线),只钉 frame-ancestors。
+//
+// 'none' 而非 'self'(第六轮审计:提交信息一直写的是 none,代码却是 'self',
+// 对账单会错位;收紧到 none 零成本 —— 面板全文没有任何 iframe 自嵌需求,
+// 而 'self' 会把「同源即可全权操控」这个更宽的口子留在防点击劫持的头里)。
 func securityHeaders(h http.Header) {
 	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("X-Frame-Options", "SAMEORIGIN")
-	h.Set("Content-Security-Policy", "frame-ancestors 'self'")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Content-Security-Policy", "frame-ancestors 'none'")
 }
 
 // writeJSON mirrors src/panel.js's json(): the charset is spelled out (unlike

@@ -220,13 +220,16 @@ function rewriteNotice(rows) {
 // 放 zip 的地方，源码包混进二进制就没人核对「源码就是二进制里那份」了）；data/
 // 里有用户的订阅 URL 与 forward key；node_modules/ 与 archive/ 属于已冻结的 MIT
 // 作品；difftest/（fixtures 含别人订阅节点的身份与口令，.gitignore 同款裁定）与
-// difftest-tmp/ 是工装目录；docs/ 整棵不要，只单列其中的验收报告
-// （见 EXTRA_DIRS）。
+// difftest-tmp/ 是工装目录；docs/ 整棵不要 —— 第一轮审计（d23a0d0）裁定它是
+// 「重写计划、评审与验收记录，含本机路径与实例数据，不上公网」，判据测试
+// （make-source-tarball_test 的 docs 断言）与 .gitignore 都按这条走。
+// 初始提交 924def1 在这里留过一个 EXTRA_DIRS=docs/accept 的「单列验收报告」
+// 例外，与上述裁定**直接矛盾**：CI 检出没有 docs/（gitignored）所以从未暴露，
+// 但本地跑 npm run release 会把验收数据打进分发包。第七轮审计删除该例外。
 const EXCLUDE_NAMES = new Set(['node_modules', 'data', 'archive', 'release', 'difftest', 'difftest-tmp', 'dist', '.git', 'docs'])
 // rel 路径精确排除:scripts/diff-accept.mjs 是内部差分工装(.gitignore 裁定
 // 不上公网),不能靠名字排除 —— scripts/ 整体要进包(构建契约进产物)。
 const EXCLUDE_FILES = new Set(['scripts/diff-accept.mjs'])
-const EXTRA_DIRS = [[path.join(ROOT, 'docs', 'accept'), 'docs/accept']]
 
 /** 源码包的文件清单（确定性排序）。 */
 export function sourceFiles() {
@@ -243,7 +246,6 @@ export function sourceFiles() {
     }
   }
   walk(ROOT, '')
-  for (const [dir, prefix] of EXTRA_DIRS) if (fs.existsSync(dir)) walk(dir, prefix)
   out.sort((a, b) => a[1].localeCompare(b[1]))
   return out
 }

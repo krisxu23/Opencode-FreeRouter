@@ -465,11 +465,33 @@ func (p *Parts) coldPass(ctx context.Context) PassSummary {
 			}
 		}
 	}
-	if len(deletedTags) > 0 && p.Host != nil {
+	if len(deletedTags) > 0 {
+		// 落盘与 box 同步是**两件事**,顺序也定死为「先落盘、后同步」:
+		//
+		// 落盘必须无条件执行(第七轮复审更正)。旧写法把 Flush/Persist 挂在
+		// SyncOutbounds 成功分支里,而候选集来自**内存 registry**,被删 tag 当场
+		// 就离开了候选 —— 下一轮 coldPass 的 deletedTags **必然为空**,永远不再
+		// 有第二次机会补写。订阅长期全挂时 rebuildOnce 也不跑 → 重启后这批已删
+		// 节点从盘上复活继续占位,要再凑一次冷区三振才清得掉。成员账是内存事实
+		// 的镜像,与 box 有没有同步成功无关(box 留在旧出站也只是多跑一轮,
+		// 重启后 registry 载入即自洽)。
+		if err := p.Registry.Flush(); err != nil {
+			logger.Warn(fmt.Sprintf("[app] cold pass 注册表落盘失败: %v", err))
+		}
+		if err := p.Health.Persist(); err != nil {
+			logger.Warn(fmt.Sprintf("[app] cold pass 健康表落盘失败: %v", err))
+		}
 		// 删掉的出站必须同步摘掉 sing-box 内的出站,否则残留出站占着
 		// 端口段与内存直到下次 Rebuild,而 Rebuild 只在订阅刷新时跑。
-		if _, _, err := p.Host.SyncOutbounds(p.Registry.All()); err != nil {
-			logger.Warn(fmt.Sprintf("[app] cold pass 同步出站失败: %v", err))
+		if p.Host != nil {
+			if _, _, err := p.Host.SyncOutbounds(p.Registry.All()); err == nil {
+				// 换代必须 bump(六审):缓存 client 的拨号闭包绑着被删出站,
+				// 不换代的话 noteEgressChanged 的契约(O3:旧代 client 不得再服务
+				// 请求)对这批 tag 失效,请求会在已撤出站上白烧一次 transport 失败。
+				p.noteEgressChanged()
+			} else {
+				logger.Warn(fmt.Sprintf("[app] cold pass 同步出站失败: %v", err))
+			}
 		}
 	}
 	sum.Tested = len(items)
@@ -478,6 +500,13 @@ func (p *Parts) coldPass(ctx context.Context) PassSummary {
 		"cold pass: %d scanned · 复活 %d · 删除 %d（删除闸门 %s）in %.1fs",
 		sum.Scanned, sum.Revived, sum.Deleted, map[bool]string{true: "开", false: "冻结"}[deletionsAllowed],
 		float64(sum.MS)/1000))
+	if !deletionsAllowed && sum.Scanned > 0 {
+		// 六审 F3-2:闸门冻结 + 有冷区待清 = 静默吸收态(全池皆死、热区无
+		// 样本可开窗),每轮冷区失败只计数不删 —— 用 Warn 喊出来并给出
+		// 解锁路径,运维不必从两行 Info 里自己拼因果。
+		logger.Warn(fmt.Sprintf(
+			"[app] 冷区删除闸门持续冻结(热区无健康样本),%d 个死节点只计不删 — 解锁需热区出一轮 alive 或首探通关;长期如此请检查订阅质量或点「立即探测」", sum.Scanned))
+	}
 	return sum
 }
 
@@ -499,7 +528,19 @@ func (p *Parts) firstProbePass(ctx context.Context) PassSummary {
 	snap := p.Health.NodeSnapshot()
 	var tags []string
 	for _, n := range p.poolNodes() {
-		if _, ok := snap[n.Tag]; !ok {
+		// 圈定「还没有判决」的节点：无行，**或** unknown 行。unknown 行的
+		// 唯一生产来源是 NoteQuota（节点在被首探前撞了一发真流量 429，
+		// health.go 的 NoteQuota 给它造了 {state:unknown} 临时行），以及粗探
+		// 自己判出 StateUnknown 的那些形状。hotPass 只收 alive、coldPass 只收
+		// dead，若首探也只收「无行」，带 unknown 行的节点就是三档 pass 的
+		// **联合盲区**：永不探测、v1.4.1 起也永不计数删除，一直挂到进程重启
+		// （Load 白名单丢行）才回队 —— 期间它照常可被 Pick 选中。
+		//
+		// 注意这里**没有**「刚探过就跳过」的节流：unknown 判决会被 MarkProbe
+		// 开头的早退整行丢弃（连 LastProbeAt 都不刷），所以这类节点每一拍都会
+		// 重新进候选，直到探出 alive/dead 为止 —— 这正是自愈路径，不是漏洞
+		// （代价与一个从未探过的节点相同）。
+		if view, ok := snap[n.Tag]; !ok || view.State == health.StateUnknown {
 			tags = append(tags, n.Tag)
 		}
 	}
