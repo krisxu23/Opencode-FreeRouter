@@ -398,6 +398,19 @@ func (p *Parts) coldPass(ctx context.Context) PassSummary {
 			tags = append(tags, n.Tag)
 		}
 	}
+	// 轮换抽样:死节点多时每轮只扫 1/3,三轮覆盖全池。排序后按游标切,
+	// 复活延迟最多多两轮(20 分钟),探测开销降 2/3。
+	sort.Strings(tags)
+	if len(tags) > 30 {
+		slot := int(p.coldCursor.Add(1)-1) % 3
+		kept := make([]string, 0, len(tags)/3+1)
+		for i, tag := range tags {
+			if i%3 == slot {
+				kept = append(kept, tag)
+			}
+		}
+		tags = kept
+	}
 	items := p.collectPassItems(tags, nodeprobe.ProbeOptions{
 		TimeoutMS: coldProbeTimeoutMS, Attempts: 1, UpstreamOnly: true,
 	})
@@ -432,6 +445,7 @@ func (p *Parts) coldPass(ctx context.Context) PassSummary {
 	}
 
 	deletionsAllowed := p.lastHotOK.Load()
+	deletedTags := make([]string, 0, 8)
 	for _, r := range results {
 		switch r.Result.State {
 		case nodeprobe.StateAlive:
@@ -444,10 +458,18 @@ func (p *Parts) coldPass(ctx context.Context) PassSummary {
 			case "delete":
 				p.Registry.Remove(r.Tag)
 				p.Health.Forget(r.Tag)
+				deletedTags = append(deletedTags, r.Tag)
 				sum.Deleted++
 			case "demote":
 				// 冷区节点不会再降档(已经是冷区);防御性忽略。
 			}
+		}
+	}
+	if len(deletedTags) > 0 && p.Host != nil {
+		// 删掉的出站必须同步摘掉 sing-box 内的出站,否则残留出站占着
+		// 端口段与内存直到下次 Rebuild,而 Rebuild 只在订阅刷新时跑。
+		if _, _, err := p.Host.SyncOutbounds(p.Registry.All()); err != nil {
+			logger.Warn(fmt.Sprintf("[app] cold pass 同步出站失败: %v", err))
 		}
 	}
 	sum.Tested = len(items)
@@ -459,8 +481,8 @@ func (p *Parts) coldPass(ctx context.Context) PassSummary {
 	return sum
 }
 
-// firstProbePass 给「还没有健康行」的节点做全量首探(三段 + echo),通关的
-// 随后烧 B 档认证。完成后的节点拥有健康行,进入热/冷双循环。
+// firstProbePass 给「还没有健康行」的节点做全量首探(三段 + echo),通关即
+// 进入热/冷双循环。B 档认证不在这里烧 —— hot 复检补验(见下)。
 func (p *Parts) firstProbePass(ctx context.Context) PassSummary {
 	started := p.nowMS()
 	sum := PassSummary{Kind: "first", At: started}
@@ -508,7 +530,10 @@ func (p *Parts) firstProbePass(ctx context.Context) PassSummary {
 			// 首探判死:进冷区,连败从 0 开始数。
 		}
 	}
-	sum.NewGated = p.runTierPipeline(ctx, items, results)
+	// 首探不烧 B 档认证:刚通关的节点还没证明稳定性,活不过 60 秒的照样烧
+	// 真配额。B 是准入,hot 复检(hotPass 的 runTierPipeline)会在它活过一轮
+	// 后补验 —— 不稳定的节点在验 B 之前就被降冷,配额不浪费。
+	sum.NewGated = 0
 	sum.Tested = len(items)
 	sum.MS = p.nowMS() - started
 	logger.Info(fmt.Sprintf(

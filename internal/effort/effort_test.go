@@ -95,8 +95,8 @@ func TestBudgetForExplicitValuesWin(t *testing.T) {
 		{"deep inherits capacity", LevelExtra, TUNABLE, 0, ptr(32768), 32768, []string{"budgetFor('deep', TUNABLE, undefined, 32768) === 32768"}},
 		{"no menu ignores any level", LevelLow, NO_MENU, 0, ptr(32768), 32768, []string{"budgetFor('light', NO_MENU, undefined, 32768) === 32768"}},
 		{"no menu honours requested", LevelNone, NO_MENU, 4096, ptr(32768), 4096, []string{"budgetFor(undefined, NO_MENU, 4096, 32768) === 4096"}},
-		{"floor: answer must land", LevelLow, Entry{ID: "x", MaxOutput: 100, SupportsReasoning: true}, 0, nil, 512, []string{"budgetFor('light', {reasoning:true, maxOutput:100}, undefined, undefined) === MIN_BUDGET"}},
-		{"floor: tiny capacity", LevelExtra, Entry{ID: "x", MaxOutput: 1, SupportsReasoning: true}, 0, ptr(1), 512, []string{"budgetFor('deep', {reasoning:true, maxOutput:1}, undefined, 1) === MIN_BUDGET"}},
+		{"floor: answer must land", LevelLow, Entry{ID: "x", MaxOutput: 100, SupportsReasoning: true}, 0, nil, 100, []string{"budgetFor('light', {reasoning:true, maxOutput:100}, undefined, undefined) === 100(下限不超模型上限,旧 512 会超上游上限→400)"}},
+		{"floor: tiny capacity", LevelExtra, Entry{ID: "x", MaxOutput: 1, SupportsReasoning: true}, 0, ptr(1), 1, []string{"budgetFor('deep', {reasoning:true, maxOutput:1}, undefined, 1) === 1(同上)"}},
 		{"zero entry means default capacity", LevelExtra, Entry{}, 0, nil, 32768, []string{"budgetFor('deep', undefined, undefined, undefined) === 32768"}},
 	}
 	for _, tc := range cases {

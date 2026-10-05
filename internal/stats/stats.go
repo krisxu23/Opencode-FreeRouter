@@ -115,10 +115,14 @@ type HistoryRow struct {
 // Stats is the board plus the file it lands in. A zero file means
 // memory-only, which is what the tests use to keep 2500 writes cheap.
 type Stats struct {
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	file    string
 	snap    Snapshot
 	lastErr error
+	// lastPruneMS 是上次在 Record 侧做 Days 定期修剪的时刻(UnixMilli)。
+	// pruneDays 只管落盘副本的话内存 Days 会随运行天数无限涨(约 365 键/年);
+	// 但每条 Record 都全量扫一遍 Days 又是浪费,所以按天节流:最多每天剪一次。
+	lastPruneMS int64
 	// timer 是去抖写(O1)的挂起定时器。nil 表示当前没有待写的改动。
 	// dirty 表示内存比磁盘新,到期或 Flush 时才需要真正写一次。
 	timer *time.Timer
@@ -312,6 +316,11 @@ func (s *Stats) Record(r Record) {
 	}
 
 	s.dirty = true
+	// 内存 Days 定期修剪(每天最多一次):只修落盘副本的话内存 map 无限涨。
+	if now := time.Now().UnixMilli(); now-s.lastPruneMS > msPerDay {
+		s.lastPruneMS = now
+		pruneDays(s.snap, now)
+	}
 	if s.file != "" && s.timer == nil {
 		s.timer = time.AfterFunc(flushDelay, s.flushPending)
 	}
@@ -361,8 +370,8 @@ func (s *Stats) persist(snap Snapshot) {
 // may keep or mutate what it gets, and the JS version's `get()` hands out the
 // live object, which is precisely how the two versions drift apart.
 func (s *Stats) Snapshot() Snapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return clone(s.snap)
 }
 
@@ -432,8 +441,8 @@ func (s *Stats) History(days int, now int64) []HistoryRow {
 	}
 	out := make([]HistoryRow, 0, days)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for i := days - 1; i >= 0; i-- {
 		date := dayKey(now - int64(i)*msPerDay)
 		b := s.snap.Days[date]
@@ -478,8 +487,8 @@ func (s *Stats) Flush() error {
 // information entirely, so a board that silently stopped updating looked
 // identical to one with nothing to report.
 func (s *Stats) LastError() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.lastErr == nil {
 		return ""
 	}

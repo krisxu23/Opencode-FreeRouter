@@ -68,6 +68,9 @@ const (
 	ttftSamples      = 8
 	ttftMinSamples   = 3
 	ttftFresh        = 6 * 60 * 60 * 1000
+	// stickyFailCap 是单会话粘性连败计数的上限:熔断阈值 2,正常语义下计数
+	// 到 2 即换出口,不再增长;上限纯防 session 可控键的溢出。
+	stickyFailCap = 1 << 20
 )
 
 // row is one node's health, and the exact on-disk shape of
@@ -94,6 +97,10 @@ type row struct {
 	Streak      int   `json:"streak,omitempty"`
 	Tier        Tier  `json:"tier,omitempty"`
 	LastQuotaAt int64 `json:"lastQuotaAt,omitempty"`
+	// NeverAlive 标记「从未活过」:首探判死的行置 true,第一次 alive 清掉。
+	// 烂水池里这类行占 90%+,冷区删除对它们用更短的门槛(2 轮),别让从没证明
+	// 过价值的节点占着池位和探测预算。落盘(重启后仍记得谁没活过)。
+	NeverAlive bool `json:"neverAlive,omitempty"`
 }
 
 // NodeView is row plus the cooling overlay the panel shows. It is a separate
@@ -130,6 +137,9 @@ func (v NodeView) MergeInto(row map[string]any) {
 	}
 	if v.LastQuotaAt != 0 {
 		row["lastQuotaAt"] = v.LastQuotaAt
+	}
+	if v.NeverAlive {
+		row["neverAlive"] = true
 	}
 	if v.CoolingUntil != 0 {
 		row["coolingUntil"] = v.CoolingUntil
@@ -408,11 +418,13 @@ func (h *Health) Forget(nodeKey string) {
 	h.forgetLocked(nodeKey)
 }
 
-// forgetLocked 是三张按节点建键的表的统一回收点:判决行、TTFT 观测、冷却。
+// forgetLocked 是按节点建键的表的统一回收点:判决行、TTFT 观测、冷却、
+// 配额索引。quotaTags 漏删会让索引只增不减(静默期无 Pick 搭车时泄漏)。
 func (h *Health) forgetLocked(nodeKey string) {
 	delete(h.nodes, nodeKey)
 	delete(h.ttft, nodeKey)
 	delete(h.cool, nodeKey)
+	delete(h.quotaTags, nodeKey)
 }
 
 // ClearQuotaMark 测试钩子:忘掉一个节点的配额记号,不动行的其余部分。
@@ -424,6 +436,7 @@ func (h *Health) ClearQuotaMark(nodeKey string) {
 		r.LastQuotaAt = 0
 		h.nodes[nodeKey] = r
 	}
+	delete(h.quotaTags, nodeKey)
 }
 
 // ---- 粗探 -------------------------------------------------------------------
@@ -444,6 +457,7 @@ func (h *Health) MarkPassSuccess(nodeKey string) {
 	r.State = StateAlive
 	r.Streak = 0
 	r.LastProbeAt = now
+	r.NeverAlive = false // 数据面成功同样是「活过」的证据
 	h.nodes[nodeKey] = r
 }
 
@@ -477,7 +491,13 @@ func (h *Health) MarkPassFail(nodeKey string, allowDelete bool) string {
 			return ""
 		}
 		r.Streak++
-		if r.Streak >= coldDeleteAfter {
+		// 从未活过的行早删(2 轮):烂水池里它们占 90%+,3 轮是给「曾经活过、
+		// 可能只是暂时抖动」的宽限,从没证明过价值的不配拿满。
+		threshold := coldDeleteAfter
+		if r.NeverAlive {
+			threshold = coldDeleteNeverAliveAfter
+		}
+		if r.Streak >= threshold {
 			delete(h.nodes, nodeKey)
 			return "delete"
 		}
@@ -514,6 +534,8 @@ func (h *Health) MarkPassFail(nodeKey string, allowDelete bool) string {
 const (
 	hotDemoteAfter  = 2
 	coldDeleteAfter = 3
+	// coldDeleteNeverAliveAfter 是「从未活过」行的冷区删除门槛:2 轮。
+	coldDeleteNeverAliveAfter = 2
 )
 
 func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
@@ -538,9 +560,13 @@ func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
 	//      窗口里失效。
 	//   3. 变为 dead → 清掉 IP 与国家(连同 exitIpAt)。不存在的出口谈不上出口 IP。
 	measuredIp := strings.TrimSpace(res.ExitIP)
-	measuredCc := strings.ToUpper(res.ExitCountry) // 上截 2 位大写
-	if len(measuredCc) > 2 {
-		measuredCc = measuredCc[:2]
+	// 国家码按 rune 上截 2 位:字节截会把 CJK 等非 ASCII 撕成非法串。
+	measuredCc := strings.ToUpper(res.ExitCountry)
+	if rs := []rune(measuredCc); len(rs) > 2 {
+		measuredCc = string(rs[:2])
+	}
+	if measuredCc != "" && !isASCIILetters(measuredCc) {
+		measuredCc = ""
 	}
 	var exitIp, exitCountry string
 	if alive {
@@ -637,6 +663,18 @@ func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
 		streak = prev.Streak
 	}
 
+	// NeverAlive:无行首探判死 → true(从没证明过价值);alive → 清掉;
+	// 其余(已有行的 dead 重判)保持原值 —— 曾经活过的不应被打回。
+	neverAlive := false
+	if hasPrev {
+		neverAlive = prev.NeverAlive
+	}
+	if alive {
+		neverAlive = false
+	} else if !hasPrev {
+		neverAlive = true
+	}
+
 	h.nodes[nodeKey] = row{
 		State:       NodeState(res.State),
 		LatencyMS:   latMS,
@@ -649,7 +687,23 @@ func (h *Health) MarkProbe(nodeKey string, res nodeprobe.ProbeResult) {
 		Tier:        tier,
 		LastQuotaAt: lastQuotaAt,
 		Streak:      streak,
+		NeverAlive:  neverAlive,
 	}
+}
+
+// isASCIILetters 报告 s 是否全由 ASCII 字母组成:国家码只可能是两位字母,
+// 非 ASCII 串(截断撕裂的 CJK、emoji)一律按缺失处理,不进分桶与 geo 判定。
+func isASCIILetters(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z') {
+			return false
+		}
+	}
+	return true
 }
 
 // ExitIPOf 这个节点当前可信的出口 IP,空串表示「没有可用量测」。
@@ -866,6 +920,37 @@ type TierCount struct {
 	B     int `json:"b"`
 }
 
+// EvictRank 给注册表淘汰用:分越小越先被挤掉。0=无行(未知),
+// 1=从未活过的死节点,2=活过但现在死的,3=unknown/冷却中,
+// 4=alive,5=B 档。调用方(registry.EnforceCapRanked)在锁外按快照算好传入。
+func (h *Health) EvictRank() map[string]int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make(map[string]int, len(h.nodes))
+	now := time.Now().UnixMilli()
+	for tag, r := range h.nodes {
+		switch {
+		case r.State == StateAlive && r.Tier == TierB:
+			out[tag] = 5
+		case r.State == StateAlive:
+			out[tag] = 4
+		case r.State == StateDead && r.NeverAlive:
+			out[tag] = 1
+		case r.State == StateDead:
+			out[tag] = 2
+		default:
+			out[tag] = 3
+		}
+		if c, ok := h.cool[tag]; ok && c.Until > now {
+			// 冷却中降一档:别把正在退避的活节点当健康挤掉别人。
+			if out[tag] > 0 {
+				out[tag]--
+			}
+		}
+	}
+	return out
+}
+
 // TierCounts 只数 alive 的行。
 func (h *Health) TierCounts() TierCount {
 	h.mu.RLock()
@@ -916,6 +1001,11 @@ func (h *Health) PruneStale(activeKeys []string) {
 	for key := range h.cool {
 		if !on[key] {
 			delete(h.cool, key)
+		}
+	}
+	for key := range h.quotaTags {
+		if !on[key] {
+			delete(h.quotaTags, key)
 		}
 	}
 }
@@ -1215,13 +1305,22 @@ func (h *Health) StickyTTL(session string) (int64, bool) {
 
 // NoteStickyFailure 记一次从粘性出口出发、未出内容就失败的尝试。
 // (src/health.js:699-703)
+//
+// 无 sticky 行的会话不建键:session 客户端可控,无行也建等于任由调用方
+// 把表撑大;且没有粘性可熔断时记数毫无意义。计数值封顶(熔断阈值 2,
+// 封顶 1<<20 纯防溢出,正常语义 2 即换出口、计数不再增长)。
 func (h *Health) NoteStickyFailure(session string) {
 	if session == "" {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.stickyFail[session]++
+	if _, ok := h.sticky[session]; !ok {
+		return
+	}
+	if h.stickyFail[session] < stickyFailCap {
+		h.stickyFail[session]++
+	}
 }
 
 // ClearStickyFailures 一轮出了内容即清零连败。(src/health.js:705-709)

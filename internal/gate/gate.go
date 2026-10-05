@@ -21,7 +21,7 @@ import (
 // Gate 保证两次放行之间至少隔 gapMS 毫秒。并发调用各自领到不同时隙,
 // 因此天然串成间隔序列。
 type Gate struct {
-	mu     sync.Mutex
+	mu     sync.RWMutex
 	gapMS  int64
 	nextAt int64 // 下一个待分配时隙(UnixMilli;0 = 还没排过任何时隙)
 }
@@ -90,8 +90,9 @@ func (g *Gate) Wait(ctx context.Context) error {
 }
 
 // NextAt 返回下一个待分配的时隙(UnixMilli;从未排过为 0)。测试与面板用。
+// 只读:RLock,不挡 Wait 的分配路径。
 func (g *Gate) NextAt() int64 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.nextAt
 }

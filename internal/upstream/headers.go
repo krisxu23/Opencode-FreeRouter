@@ -28,6 +28,13 @@ import (
 // 变量下一次调用立即生效,测试可行性不丢。返回的是共享缓存,调用方只读。
 func headerOverrides() map[string]string {
 	raw := os.Getenv("OUR_FREE_MODEL_HEADERS_JSON")
+	overridesMu.RLock()
+	if overridesHas && overridesRaw == raw {
+		p := overridesParsed
+		overridesMu.RUnlock()
+		return p
+	}
+	overridesMu.RUnlock()
 	overridesMu.Lock()
 	defer overridesMu.Unlock()
 	if overridesHas && overridesRaw == raw {
@@ -41,7 +48,7 @@ func headerOverrides() map[string]string {
 }
 
 var (
-	overridesMu     sync.Mutex
+	overridesMu     sync.RWMutex
 	overridesRaw    string
 	overridesParsed map[string]string
 	overridesHas    bool
@@ -162,15 +169,15 @@ type HeaderOptions struct {
 // x-opencode-client 在这是 desktop(OpenChamber 路径;CLI 默认是 cli,见
 // runtime-flags.ts)。
 func GatewayHeaders(o HeaderOptions) map[string]string {
-	headers := map[string]string{
-		"content-type":       "application/json",
-		"authorization":      "Bearer public",
-		"user-agent":         UserAgent(),
-		"x-opencode-client":  ClientKind,
-		"x-opencode-session": o.Session,
-		"x-opencode-request": o.RequestID,
-		"x-opencode-project": "global",
-	}
+	ov := headerOverrides()
+	headers := make(map[string]string, 8+len(ov))
+	headers["content-type"] = "application/json"
+	headers["authorization"] = "Bearer public"
+	headers["user-agent"] = UserAgent()
+	headers["x-opencode-client"] = ClientKind
+	headers["x-opencode-session"] = o.Session
+	headers["x-opencode-request"] = o.RequestID
+	headers["x-opencode-project"] = "global"
 	if o.Accept != "" {
 		headers["accept"] = o.Accept
 	} else if o.Stream {
@@ -178,7 +185,7 @@ func GatewayHeaders(o HeaderOptions) map[string]string {
 	} else {
 		headers["accept"] = "*/*"
 	}
-	for name, value := range headerOverrides() {
+	for name, value := range ov {
 		headers[name] = value // 覆盖键已归一成小写,直接压过默认值
 	}
 	if o.ParentSession != "" {

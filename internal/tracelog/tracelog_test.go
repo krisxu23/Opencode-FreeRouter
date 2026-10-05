@@ -186,9 +186,24 @@ func TestWriteOffRevivesWhenTheFileBecomesWritableAgain(t *testing.T) {
 	Record(Route{Result: "写不进去", At: today.UnixMilli()})
 	mu.RLock()
 	off := writeOff
+	fails := consecFails
+	mu.RUnlock()
+	if off {
+		t.Fatal("单次 OpenFile 失败不应整日停写:瞬时抖动只丢几行,连续 5 次才停")
+	}
+	if fails != 1 {
+		t.Fatalf("consecFails = %d, want 1", fails)
+	}
+
+	// 再来 4 次连续失败才整日停写。
+	for i := 0; i < maxConsecFails-1; i++ {
+		Record(Route{Result: "还是写不进去", At: today.UnixMilli()})
+	}
+	mu.RLock()
+	off = writeOff
 	mu.RUnlock()
 	if !off {
-		t.Fatal("OpenFile 失败后 writeOff 应为真")
+		t.Fatalf("连续 %d 次失败后 writeOff 应为真", maxConsecFails)
 	}
 
 	// 障碍排除(文件被释放)+ 新的一天:两个条件合起来必须恢复。

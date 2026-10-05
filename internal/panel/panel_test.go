@@ -389,8 +389,7 @@ func TestRootWithoutShellIsFiveHundred(t *testing.T) {
 	}
 }
 
-// TestUnknownRouteIsFourOhFourWithMethodAndPath:兜底 404 必须带上方法与路径，
-// 否则前端只能看到一句无信息量的 "not found"。
+// TestUnknownRouteIsFourOhFour:兜底 404 用固定文案,不反射 method+path。
 func TestUnknownRouteIsFourOhFourWithMethodAndPath(t *testing.T) {
 	dir := writeAssets(t, goodShell, "console.log('app')\n")
 	base := startPanel(t, baseDeps(dir))
@@ -399,16 +398,16 @@ func TestUnknownRouteIsFourOhFourWithMethodAndPath(t *testing.T) {
 	if status != http.StatusNotFound {
 		t.Fatalf("GET /foo = %d, want 404", status)
 	}
-	if !strings.Contains(body, "no route for GET /foo") {
-		t.Errorf("body = %q", body)
+	if !strings.Contains(body, `"not found"`) {
+		t.Errorf("GET body = %q", body)
 	}
 
 	status, _, body = do(t, http.MethodPost, base+"/bar", "")
 	if status != http.StatusNotFound {
 		t.Fatalf("POST /bar = %d, want 404", status)
 	}
-	if !strings.Contains(body, "no route for POST /bar") {
-		t.Errorf("body = %q", body)
+	if !strings.Contains(body, `"not found"`) {
+		t.Errorf("POST body = %q", body)
 	}
 }
 

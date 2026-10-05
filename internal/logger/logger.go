@@ -52,7 +52,17 @@ var (
 	mu   sync.RWMutex
 	ring []Line
 	file string
-	size int64
+	// fileMu 串行化文件写:write 过去全程持 mu 做 open/write/close/rename,
+	// 面板 Recent(RLock 轮询)被磁盘 IO 排队。ring 锁只保内存;size/轮转/退避
+	// 的文件状态统一收进 fileMu,与 ring 锁解耦 —— fileMu 内永不取 mu。
+	fileMu sync.Mutex
+	size   int64
+	// lastStamp 按秒缓存时间戳:800 行/轮 × Format 是浪费,同一秒内复用。
+	lastStampSec  int64
+	lastStampStr string
+	// lastRenameFailMS 是上次 rename 失败的时刻:AV 常驻锁定时每行重试一次
+	// rename 是每行一次失败 syscall,1s 内不再试。
+	lastRenameFailMS int64
 )
 
 // Init points the logger at file. An empty path or an unopenable path leaves
@@ -62,15 +72,22 @@ var (
 // Go 的包内测试共享进程，不清空会把上一个测试的行数漏进下一个断言。
 func Init(f string) {
 	mu.Lock()
-	defer mu.Unlock()
 	ring = nil
 	file = f
+	mu.Unlock()
+	fileMu.Lock()
+	defer fileMu.Unlock()
 	size = 0
+	lastRenameFailMS = 0
+	lastStampSec = 0
+	lastStampStr = ""
 	if f == "" {
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		mu.Lock()
 		file = ""
+		mu.Unlock()
 		return
 	}
 	if st, err := os.Stat(f); err == nil {
@@ -86,17 +103,15 @@ func write(level string, parts ...any) {
 	}
 	now := time.Now()
 	line := Line{T: now.UnixMilli(), Level: level, Msg: msg}
-	// 本地时间戳，与 src/logger.js 的 localStamp 同款（面板与文件同一时区，
-	// 对齐排障不用心算时差）；精度到秒，与 JS 完全一致。
-	stamp := now.Format("2006-01-02 15:04:05")
 
 	mu.Lock()
-	defer mu.Unlock()
 	ring = append(ring, line)
 	if len(ring) > ringMax {
 		ring = ring[len(ring)-ringMax:]
 	}
-	if file == "" {
+	fpath := file
+	mu.Unlock()
+	if fpath == "" {
 		return
 	}
 	// 先写、再轮转。旧顺序是「先 rename 轮转、再 OpenFile 写这一行」：
@@ -107,7 +122,22 @@ func write(level string, parts ...any) {
 	//
 	// 代价是轮转边界后移一行（文件最多到 maxFileBytes + 一行），
 	// 这与「不丢日志」相比是可以接受的取舍。
-	f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	//
+	// 文件写走 fileMu,不占 ring 锁(mu):面板 Recent(RLock 轮询)不再被
+	// 磁盘 IO 排队。fileMu 内永不取 mu —— Init 改 file/size 时短暂持 fileMu,
+	// 不存在 ABBA。
+	fileMu.Lock()
+	defer fileMu.Unlock()
+	// 本地时间戳按秒缓存:同秒复用 Format(800 行/探测轮是浪费)。
+	sec := now.Unix()
+	var stamp string
+	if sec == lastStampSec {
+		stamp = lastStampStr
+	} else {
+		stamp = now.Format("2006-01-02 15:04:05")
+		lastStampSec, lastStampStr = sec, stamp
+	}
+	f, err := os.OpenFile(fpath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return // fail-soft: the next line retries
 	}
@@ -117,18 +147,26 @@ func write(level string, parts ...any) {
 		return
 	}
 	size += int64(n)
-
-	if size >= maxFileBytes {
-		// 与 JS 同款单文件轮转：rename 到 <base>.old.log（Windows 的
-		// MoveFileEx REPLACE_EXISTING 语义与 libuv 一致，可直接覆盖）。
-		//
-		// R10:只有 rename **成功**才把计数归零。JS 版无论成败都归零,于是
-		// 目标 .old.log 被占用(MoveFileEx 失败)时计数被清零、继续往没轮转
-		// 的同一个文件追加 ⇒ gateway.log 无界增长。失败时保留 size,下一行
-		// 会再试一次 rename;只有真轮转过去,size 才重新从零开始计。
-		if err := os.Rename(file, strings.TrimSuffix(file, ".log")+".old.log"); err == nil {
-			size = 0
-		}
+	if size < maxFileBytes {
+		return
+	}
+	// 与 JS 同款单文件轮转：rename 到 <base>.old.log（Windows 的
+	// MoveFileEx REPLACE_EXISTING 语义与 libuv 一致，可直接覆盖）。
+	//
+	// R10:只有 rename **成功**才把计数归零。JS 版无论成败都归零,于是
+	// 目标 .old.log 被占用(MoveFileEx 失败)时计数被清零、继续往没轮转
+	// 的同一个文件追加 ⇒ gateway.log 无界增长。失败时保留 size,下一行
+	// 会再试一次 rename;只有真轮转过去,size 才重新从零开始计。
+	//
+	// 失败退避:AV 常驻锁定时每行重试一次 rename 是每行一次失败 syscall,
+	// 1s 内不再试。
+	if time.Now().UnixMilli()-lastRenameFailMS < 1000 {
+		return
+	}
+	if err := os.Rename(fpath, strings.TrimSuffix(fpath, ".log")+".old.log"); err == nil {
+		size = 0
+	} else {
+		lastRenameFailMS = time.Now().UnixMilli()
 	}
 }
 

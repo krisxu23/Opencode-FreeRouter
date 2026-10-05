@@ -489,8 +489,9 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 		}{OK: true, Rows: view.Rows, Stale: view.Stale})
 
 	default:
+		// 固定文案:method+path 原样反射只是信息回显,固定更干净。
 		writeJSON(w, http.StatusNotFound, map[string]any{
-			"error": fmt.Sprintf("no route for %s %s", method, path),
+			"error": "not found",
 		})
 	}
 }
@@ -511,6 +512,7 @@ func (s *Server) serveShell(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.Itoa(len(page)))
+	securityHeaders(w.Header())
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, page)
 }
@@ -529,6 +531,7 @@ func (s *Server) serveClientJS(w http.ResponseWriter) {
 	// 与全站 no-store 策略一致(shell 与所有 API 都设,唯独这里漏了):exe 更新
 	// 后浏览器可能沿用会话内缓存的旧 app.js 搭配新 __BOOT__ 快照,形状错配。
 	w.Header().Set("Cache-Control", "no-store")
+	securityHeaders(w.Header())
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(raw)
 }
@@ -675,6 +678,15 @@ func readBodyJSON(w http.ResponseWriter, r *http.Request) (map[string]any, error
 	return out, nil
 }
 
+// securityHeaders 是面板全站的安全头:防 MIME 嗅探、防本机他端口页面的
+// iframe 点击劫持。CSP 不设 script-src(内联脚本是面板自身的,不值得为它
+// 建 nonce 管线),只钉 frame-ancestors。
+func securityHeaders(h http.Header) {
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "SAMEORIGIN")
+	h.Set("Content-Security-Policy", "frame-ancestors 'self'")
+}
+
 // writeJSON mirrors src/panel.js's json(): the charset is spelled out (unlike
 // forward's writeJSON, which sends a bare application/json), the length is
 // pinned, and the response is never cached.
@@ -687,6 +699,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.Header().Set("Cache-Control", "no-store")
+	securityHeaders(w.Header())
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
 }
@@ -694,6 +707,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 func writeText(w http.ResponseWriter, status int, text string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(text)))
+	securityHeaders(w.Header())
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, text)
 }

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -30,8 +31,15 @@ import (
 const (
 	historyDays     = 30
 	maxBytesPerDay  = 32 << 20
+	// maxTotalBytes 是 route 目录的总量上限:32MB/天 × 30 天 ≈ 960MB 无人管。
+	// prune 按总量从老删,总量超 200MB 时删到 150MB 水位线。
+	maxTotalBytes   = 200 << 20
+	maxTotalLowMark = 150 << 20
 	ringMax         = 500
 	orderRowsInFile = 8
+	// maxConsecFails 是连续失败阈值:过去 OpenFile/Write 任一失败即整日停写,
+	// 一次瞬时抖动(AV 锁、磁盘抖)丢一整天路由证据。连续 N 次才停写。
+	maxConsecFails = 5
 )
 
 // OrderRow is one candidate in the pick, with the reason it ranked where it
@@ -77,6 +85,7 @@ var (
 	dir          string
 	ring         []Route
 	writeOff     bool
+	consecFails  int
 	lastPruneDay string
 	dayBytes     int64
 	// writeMu 把磁盘 I/O 挪出 mu:Record 曾全程持 mu 做 open/write/close,
@@ -185,25 +194,35 @@ func Record(r Route) {
 		mu.Unlock()
 		return
 	}
-	// 扣账放在开文件**之后**:OpenFile 失败时下面会把 writeOff 置真(整日停写),
-	// 扣没扣都一样;而真开成的这一行才计入当天额度,账目与盘上内容一一对应,
-	// 不会出现「配额被没落地的行吃掉」。OpenFile 在锁内(本地文件的一次
-	// open,毫秒级),换来的是「写出去的行」与「记在账上的行」严格一致。
+	// 扣账放在开文件**之后**:OpenFile 失败时下面记一次失败(连续 5 次才整日
+	// 停写,见 maxConsecFails),扣没扣都一样;而真开成的这一行才计入当天额度,
+	// 账目与盘上内容一一对应,不会出现「配额被没落地的行吃掉」。OpenFile 仍
+	// 在 mu 内(本地文件一次 open 毫秒级,换来账实一致;Recent 是 RLock,短挡可接受)。
 	f, err := os.OpenFile(filepath.Join(d, day+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		writeOff = true
+		noteFailLocked()
 		mu.Unlock()
 		return
 	}
 	dayBytes += int64(len(b))
+	consecFails = 0
 	mu.Unlock()
 
 	if _, err := f.Write(b); err != nil {
 		mu.Lock()
-		writeOff = true
+		noteFailLocked()
 		mu.Unlock()
 	}
 	_ = f.Close()
+}
+
+// noteFailLocked 记一次写失败:连续 maxConsecFails 次才整日停写。瞬时抖动
+// (AV 锁、磁盘抖)只丢几行,不丢一整天。调用方已持 mu 写锁。
+func noteFailLocked() {
+	consecFails++
+	if consecFails >= maxConsecFails {
+		writeOff = true
+	}
 }
 
 // pruneLocked deletes jsonl files older than the retention window. Only
@@ -229,6 +248,47 @@ func pruneLocked(today string) {
 		}
 		if d.Before(cutoff) {
 			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
+	// 总量上限:32MB/天 × 30 天 ≈ 960MB 无人管。超 200MB 时按 mtime 从老删
+	// 到 150MB 水位线 —— 天数保留策略管「老」,总量管「大」。
+	pruneTotalLocked()
+}
+
+// pruneTotalLocked 按总量删老文件。调用方已持 mu 写锁(pruneLocked 内)。
+func pruneTotalLocked() {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type finfo struct {
+		name  string
+		mtime int64
+		size  int64
+	}
+	var total int64
+	var files []finfo
+	for _, e := range ents {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		total += fi.Size()
+		files = append(files, finfo{name: e.Name(), mtime: fi.ModTime().Unix(), size: fi.Size()})
+	}
+	if total <= maxTotalBytes {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mtime < files[j].mtime })
+	for _, f := range files {
+		if total <= maxTotalLowMark {
+			break
+		}
+		if err := os.Remove(filepath.Join(dir, f.name)); err == nil {
+			total -= f.size
 		}
 	}
 }

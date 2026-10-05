@@ -10,7 +10,12 @@ package effort
 // dependency on catalog (L1) — same layer, and the layer check forbids the
 // sibling import.
 
-import "math"
+import (
+	"math"
+	"sync"
+
+	"freerouter/internal/logger"
+)
 
 type Entry struct {
 	ID            string
@@ -21,6 +26,10 @@ type Entry struct {
 	// SupportsReasoning is false for models that reject a reasoning effort
 	// field outright; sending one turns a 200 into a 400.
 	SupportsReasoning bool
+	// AlwaysThinking 置 true 表示关不掉思考(mimo 家族):推理先从同一块输出
+	// 上限里扣,档位上限不翻倍的话 balanced 只给答案留约 1500 token。
+	// ceilingOf 内翻倍,见下。
+	AlwaysThinking bool
 }
 
 // Level is a reasoning effort level as spelled on the wire.
@@ -62,6 +71,7 @@ const (
 // canonicalLevel 把一个档位词归一成四档之一。"balanced"、空串与未知词都是
 // 虚拟默认档:模型有推理菜单时落到中档(high,与 JS balanced 同一预算),
 // 否则 none。light/deep 是 JS 词汇的别名(settings 文件里存的就是那套词)。
+// 未知词降级时打一次 Warn(每词一次):静默落默认让错误配置零反馈。
 func canonicalLevel(l Level, e Entry) Level {
 	switch string(l) {
 	case string(LevelNone):
@@ -73,11 +83,38 @@ func canonicalLevel(l Level, e Entry) Level {
 	case string(LevelExtra), "deep":
 		return LevelExtra
 	default: // ""、"balanced"、未知词 —— 全部降级为默认,不报错
+		if s := string(l); s != "" && s != DefaultLevel {
+			warnUnknownLevelOnce(s)
+		}
 		if e.SupportsReasoning {
 			return LevelHigh
 		}
 		return LevelNone
 	}
+}
+
+var (
+	unknownLevelWarnedMu sync.Mutex
+	unknownLevelWarned   = map[string]bool{}
+)
+
+// unknownLevelWarnCap 是未知档词去重表的上限:档词来自客户端请求体,是
+// 客户端可控键 —— 无上限等于任由调用方把内存撑大。超限后不再记(最坏多打
+// 几行 warn,日志级别的影响可忽略)。
+const unknownLevelWarnCap = 1024
+
+func warnUnknownLevelOnce(word string) {
+	unknownLevelWarnedMu.Lock()
+	defer unknownLevelWarnedMu.Unlock()
+	if unknownLevelWarned[word] {
+		return
+	}
+	if len(unknownLevelWarned) >= unknownLevelWarnCap {
+		logger.Warn("effort: 未知档位词 " + word + ",已回落默认档")
+		return
+	}
+	unknownLevelWarned[word] = true
+	logger.Warn("effort: 未知档位词 " + word + ",已回落默认档")
 }
 
 // ceilingOf 返回一个档位在某个模型上的预算上限;ok=false 表示该档没有自己的
@@ -91,8 +128,14 @@ func ceilingOf(l Level, e Entry) (int64, bool) {
 	}
 	switch canonicalLevel(l, e) {
 	case LevelLow:
+		if e.AlwaysThinking {
+			return 2 * levelLowCeiling, true
+		}
 		return levelLowCeiling, true
 	case LevelHigh:
+		if e.AlwaysThinking {
+			return 2 * levelHighCeiling, true
+		}
 		return levelHighCeiling, true
 	default: // none / extra:档位继承模型容量
 		return 0, false
@@ -136,8 +179,14 @@ func BudgetFor(l Level, e Entry, requested int, settingsDefault *int) int {
 	if ceiling, ok := ceilingOf(l, e); ok && ceiling < capacity {
 		capacity = ceiling
 	}
-	if capacity < minBudget {
-		capacity = minBudget
+	// 下限不超模型上限:小模型(MaxOutput<512)被抬到 512 会超上游上限 → 400。
+	// 大模型仍是 512 兜底。
+	floor := int64(minBudget)
+	if e.MaxOutput > 0 && e.MaxOutput < floor {
+		floor = e.MaxOutput
+	}
+	if capacity < floor {
+		capacity = floor
 	}
 	// int 是平台相关的:32 位构建上 MaxInt 是 2^31-1,而 capacity 来自
 	// int64(e.MaxOutput)。一个上限 8 万 token 的模型（远未到 2^31）在 32 位

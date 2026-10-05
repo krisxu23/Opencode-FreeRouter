@@ -9,6 +9,7 @@ package sub
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -338,6 +339,14 @@ func parseSubscriptionBodyWithReason(text string) ([]parse.Outbound, string) {
 	if links := parse.ParseLinks(body); len(links) > 0 {
 		return links, ""
 	}
+	// 整段 base64 的 Clash YAML:ParseLinks 只在解出含 :// 时采用解码结果,
+	// base64 后的 Clash 文本(无 ://)会被当坏行全灭。这里对解码成功且变长/
+	// 含 proxies: 的结果补一次 Clash 解析 —— 解码失败/无 proxies 则原样认输。
+	if decoded := tryB64Decode(body); decoded != "" && decoded != body && strings.Contains(decoded, "proxies:") {
+		if obs, err := parse.ParseClashYAML(decoded); err == nil && len(obs) > 0 {
+			return obs, ""
+		}
+	}
 	return nil, strings.Join(reasons, "; ")
 }
 
@@ -348,6 +357,39 @@ func parseSubscriptionBodyWithReason(text string) ([]parse.Outbound, string) {
 // 函数，而不是在测试架里重拼 ParseClashYAML + dropUnroutable。
 func ParseSubscriptionBody(text string) []parse.Outbound {
 	return parseSubscriptionBody(text)
+}
+
+// tryB64Decode 尝试把整段文本按 base64 解码(兼容 urlsafe 与缺 padding):
+// 成功返回解码串,失败返回 ""。parse 侧的 b64decode 未导出,这里自实现一份
+// (只用于「解码后是否含 proxies:」的形态判断,不做节点解析)。
+func tryB64Decode(s string) string {
+	cleaned := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r == '-':
+			cleaned = append(cleaned, '+')
+		case r == '_':
+			cleaned = append(cleaned, '/')
+		case r == ' ' || r == '\n' || r == '\r' || r == '\t':
+		case r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' ||
+			r == '+' || r == '/' || r == '=':
+			cleaned = append(cleaned, r)
+		default:
+			return ""
+		}
+	}
+	str := string(cleaned)
+	if str == "" {
+		return ""
+	}
+	if pad := len(str) % 4; pad != 0 {
+		str += strings.Repeat("=", 4-pad)
+	}
+	dec, err := base64.StdEncoding.DecodeString(str)
+	if err != nil {
+		return ""
+	}
+	return string(dec)
 }
 
 // proxiesLineRe 对应 JS /^\s*proxies:\s*$/m：某一行只有 proxies: 键。

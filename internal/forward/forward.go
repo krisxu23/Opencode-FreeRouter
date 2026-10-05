@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -387,12 +388,30 @@ func KeyMatches(presented, expected string) bool {
 	if n == 0 {
 		return false
 	}
-	x := make([]byte, n)
-	y := make([]byte, n)
+	// 填充比较(防时序侧信道,见上);缓冲走池,不在热路径上每次 make。
+	x := getKeyBuf(n)
+	y := getKeyBuf(n)
+	defer keyBufPool.Put(x[:0])
+	defer keyBufPool.Put(y[:0])
 	copy(x, a)
 	copy(y, b)
 	equal := subtle.ConstantTimeCompare(x, y) == 1
 	return len(a) == len(b) && equal
+}
+
+// keyBufPool 复用 KeyMatches 的填充缓冲:密钥短(几十字节),池里常驻两份。
+var keyBufPool = sync.Pool{New: func() any { return make([]byte, 0, 128) }}
+
+// getKeyBuf 取 n 字节的清零缓冲(池不够大时现造,不污染池)。
+func getKeyBuf(n int) []byte {
+	if b, ok := keyBufPool.Get().([]byte); ok && cap(b) >= n {
+		b = b[:n]
+		for i := range b {
+			b[i] = 0
+		}
+		return b
+	}
+	return make([]byte, n)
 }
 
 // readBody 读并解析请求体(js :66-76)。超限返回 413 —— JS 那边这条抛出的
@@ -403,28 +422,30 @@ func KeyMatches(presented, expected string) bool {
 // 底层错误原文(io 错误、语法偏移)属于内部细节,不回给调用方。
 func (s *Server) readBody(w *writer, r *http.Request) (map[string]any, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
+	// 流式解码:8MB 全量驻留 + Unmarshal 两遍(一次 []byte、一次 map)是
+	// 每请求的固定税;Decoder 只走一遍,且超限在 MaxBytesReader 处即停。
+	var parsed any
+	if err := json.NewDecoder(r.Body).Decode(&parsed); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			openAIError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large")
 			return nil, false
 		}
-		openAIError(w, http.StatusBadRequest, "invalid_request_error", "could not read request body")
+		// 空体是合法的(旧语义 len(raw)==0 → 空 map):EOF 单独回空 map,
+		// 其余读错/语法错按 4xx 固定短语回。
+		if errors.Is(err, io.EOF) {
+			return map[string]any{}, true
+		}
+		openAIError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
 		return nil, false
 	}
 	// 读体阶段到此结束:解除 ReadTimeout 设下的读死线,再进入可能长时间
-	// 写 SSE 的处理阶段(见 New 的两段式注释)。
-	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
-	if len(raw) == 0 {
-		return map[string]any{}, true
-	}
-	var parsed any
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		// JS 的 JSON.parse 抛错同样走顶层 catch → 500;客户端错误按 4xx 回,
-		// 调用方才不会把语法错误当成服务端故障去重试。
-		openAIError(w, http.StatusBadRequest, "invalid_request_error", "request body is not valid JSON")
-		return nil, false
+	// 写 SSE 的处理阶段(见 New 的两段式注释)。解除失败记日志不中断 ——
+	// 死线残留只影响极端长尾,不值得为一次 Hijacker 断言失败拒掉请求。
+	if rc := http.NewResponseController(w); rc != nil {
+		if err := rc.SetReadDeadline(time.Time{}); err != nil {
+			logger.Warn("forward: 解除读死线失败: " + err.Error())
+		}
 	}
 	body, _ := parsed.(map[string]any)
 	if body == nil {
@@ -512,15 +533,25 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 // JS 不转。模型输出里出现 </script> 或 &amp; 是常事,两个版本的响应字节必须
 // 一致,否则差分验收会在这些字符上误报。
 func marshalNoEscape(v any) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
+	buf := marshalBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer marshalBufPool.Put(buf)
+	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(v); err != nil {
 		return nil, err
 	}
 	// Encoder 会补一个换行,JSON.stringify 不会。Content-Length 得对得上。
-	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+	// 返回拷贝:buf 归池后内容会被下次复用覆盖。
+	out := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+	cp := make([]byte, len(out))
+	copy(cp, out)
+	return cp, nil
 }
+
+// marshalBufPool 复用非流式响应的编码缓冲:流式路径已复用 buf/enc,
+// 非流式每响应 new Buffer+Encoder 是同型浪费。
+var marshalBufPool = sync.Pool{New: func() any { return &bytes.Buffer{} }}
 
 // stringField 是 JS 的 `String(body.model ?? ”)`:非字符串值也要能变成字符串。
 func stringField(body map[string]any, key string) string {

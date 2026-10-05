@@ -545,7 +545,17 @@ func RepairToolPairing(messages []Message) []Message {
 	flushPending := func(ids []ToolCall) {
 		for _, c := range ids {
 			if waiting, ok := pending[c.ID]; ok {
-				out = append(out, waiting...)
+				// 深拷贝 Blocks:pending 持有原 Message(含 Blocks 底层数组),
+				// 调用方并发改历史会产生别名。flush 时拷贝,pending 侧只读。
+				for _, w := range waiting {
+					if w.Blocks != nil {
+						cp := w
+						cp.Blocks = append([]Block(nil), w.Blocks...)
+						out = append(out, cp)
+					} else {
+						out = append(out, w)
+					}
+				}
 				delete(pending, c.ID)
 			}
 		}
@@ -688,14 +698,22 @@ func (d ToolDef) Renamed(name string) any {
 	return d
 }
 
-// truncateName 按 rune 截到上游上限(JS 的 slice(0, MAX_TOOL_NAME_LEN) 是
-// UTF-16 单位,rune 对 BMP 等价,且避免把多字节字符切成非法 UTF-8)。
+// truncateName 按 UTF-16 码元截到上游上限:JS 的 slice(0, MAX_TOOL_NAME_LEN)
+// 是 UTF-16 单位,rune 对 BMP 等价,但增补平面字符(emoji)在 rune 下少算
+// 一位 —— 截断后长度与上游预期差 1~2。按 UTF-16 码元逐字对齐。
 func truncateName(name string) string {
-	runes := []rune(name)
-	if len(runes) <= upstream.MaxToolNameLen {
-		return name
+	var n16 int
+	for i, r := range name {
+		if r > 0xFFFF {
+			n16 += 2
+		} else {
+			n16++
+		}
+		if n16 > upstream.MaxToolNameLen {
+			return name[:i]
+		}
 	}
-	return string(runes[:upstream.MaxToolNameLen])
+	return name
 }
 
 // ToolDefs 对应 JS toToolDefs(tools, style)。计划骨架的 ToolDefs(tools) 没有

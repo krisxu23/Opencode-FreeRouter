@@ -20,6 +20,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // UpstreamBase is the provider root. src/upstream.js:24 reads
@@ -37,14 +38,34 @@ const UpstreamBase = "https://opencode.ai"
 // 开关恰好在它声称要解决的问题上失效。修复不是再加一处读取,而是让**所有**
 // 读取共用这一个函数(adapter 装配、Parts.base)。
 //
-// 环境变量按进程生命周期看待(Load 读一次即可):runtime 改 os.Setenv 不是
-// 本产品支持的操作面,而数据面每请求重读一个 getenv 是白付的开销。
+// 环境变量按进程生命周期看待:以原始串为键缓存(与 UserAgent 同一条纪律),
+// 数据面以后若有人在热路径上调它,也不付重复 getenv;键取原始串则
+// t.Setenv 改完下一次调用立即生效,测试可行性不丢。
 func BaseFromEnv() string {
-	if v := os.Getenv("OUR_FREE_MODEL_BASE"); v != "" {
+	raw := os.Getenv("OUR_FREE_MODEL_BASE")
+	baseMu.RLock()
+	if baseHas && baseRaw == raw {
+		v := baseCached
+		baseMu.RUnlock()
 		return v
 	}
-	return UpstreamBase
+	baseMu.RUnlock()
+	v := raw
+	if v == "" {
+		v = UpstreamBase
+	}
+	baseMu.Lock()
+	baseRaw, baseCached, baseHas = raw, v, true
+	baseMu.Unlock()
+	return v
 }
+
+var (
+	baseMu     sync.RWMutex
+	baseRaw    string
+	baseCached string
+	baseHas    bool
+)
 
 // ClientVersion / ClientKind 是 1.x 时代的桌面端指纹。src/upstream.js:26-52
 // 记录了五个在现场被试过又被回滚的"更好"候选:平台三元组 UA(opencode2api
@@ -76,12 +97,34 @@ const (
 // 闸门找的是 user-agent 里任意位置的、空白分隔的
 // `opencode/<2-3 段点分数字>` token(大小写不敏感);裸 opencode/1.18.31
 // 是能通过的最小形式,也是本网关发送的值。
+//
+// 以原始 env 串为键缓存:env 在进程生命周期内不变,数据面每请求一次 getenv
+// 是白付开销;键取原始串则 t.Setenv 改完下一次调用立即生效,测试可行性不丢。
 func UserAgent() string {
-	if v := os.Getenv("OUR_FREE_MODEL_UA"); v != "" {
+	raw := os.Getenv("OUR_FREE_MODEL_UA")
+	uaMu.RLock()
+	if uaHas && uaRaw == raw {
+		v := uaCached
+		uaMu.RUnlock()
 		return v
 	}
-	return "opencode/" + ClientVersion
+	uaMu.RUnlock()
+	v := raw
+	if v == "" {
+		v = "opencode/" + ClientVersion
+	}
+	uaMu.Lock()
+	uaRaw, uaCached, uaHas = raw, v, true
+	uaMu.Unlock()
+	return v
 }
+
+var (
+	uaMu     sync.RWMutex
+	uaRaw    string
+	uaCached string
+	uaHas    bool
+)
 
 // Wire 是一条上游线路的请求/响应形状;驱动请求编码与响应解析两条路径。
 type Wire string

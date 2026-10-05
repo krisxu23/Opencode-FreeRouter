@@ -1098,6 +1098,7 @@ func TestToolDeltasFoldByIndex(t *testing.T) {
 	foldChunks(ToolCallDeltaChunk(0, "", "", `q":1`), &out)
 	foldChunks(ToolCallDeltaChunk(0, "", "", `}`), &out)
 	foldChunks(ToolCallDeltaChunk(1, "c2", "echo", `{}`), &out)
+	materializeToolCalls(&out) // 增量期 Arguments 滞后于 argsSB,读前物化
 	if len(out.ToolCalls) != 2 {
 		t.Fatalf("同一 Index 的增量应归并: %+v", out.ToolCalls)
 	}

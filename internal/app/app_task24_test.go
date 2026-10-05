@@ -430,23 +430,20 @@ func TestColdDeletionFreezesWhenHotUnhealthy(t *testing.T) {
 	// 了实现与注释的矛盾:旧实现冻结期照样 ++streak,解锁那一刻积满的连败会
 	// 立刻放行删除 —— 冻结只剩延迟,没挡住任何判决)。
 	if snap := p.Health.NodeSnapshot(); snap["n0"].Streak != 0 {
-		t.Fatalf("冻结期积了 streak=%d, want 0(解锁后必须重新数满 3)", snap["n0"].Streak)
+		t.Fatalf("冻结期积了 streak=%d, want 0(解锁后必须重新数满 2,n0 从未活过)", snap["n0"].Streak)
 	}
-	// 打开闸门:跑一轮健康的热区 pass 解锁,再 sweep **三轮**才删 ——
+	// 打开闸门:跑一轮健康的热区 pass 解锁,再 sweep **两轮**才删 ——
 	// n0 不在热区(它是 dead),n1 全绿 → lastHotOK=true;failedTags 保留
-	// n0,冷区每轮都真实失败。
+	// n0,冷区每轮都真实失败。n0 是首探死建的行(NeverAlive),门槛 2 轮。
 	p.hotPass(context.Background()) // n1 全绿 → lastHotOK=true
 	if !p.lastHotOK.Load() {
 		t.Fatal("健康热区 pass 必须打开删除闸")
 	}
-	for round := 1; round <= 2; round++ {
-		sum := p.coldPass(context.Background())
-		if sum.Deleted != 0 {
-			t.Fatalf("解锁后第 %d 轮就删了, want 等 streak 数满 3", round)
-		}
+	if sum := p.coldPass(context.Background()); sum.Deleted != 0 {
+		t.Fatalf("解锁后第 1 轮就删了, want 等 streak 数满 2, deleted=%d", sum.Deleted)
 	}
 	if sum := p.coldPass(context.Background()); sum.Deleted != 1 || p.Registry.Has("n0") {
-		t.Fatalf("解锁后第 3 轮应删除 n0: deleted=%d has=%v", sum.Deleted, p.Registry.Has("n0"))
+		t.Fatalf("解锁后第 2 轮应删除 n0: deleted=%d has=%v", sum.Deleted, p.Registry.Has("n0"))
 	}
 }
 
@@ -661,8 +658,11 @@ func TestRebuildReplacesOutboundsInPlace(t *testing.T) {
 	if err := p.Rebuild(context.Background()); err != nil {
 		t.Fatalf("rebuild: %v", err)
 	}
-	if !p.Registry.Has("fresh-node") || p.Registry.Len() != 2 {
-		t.Fatalf("registry len %d has fresh %v, want 2/true(池=历史并集,热插不重启)", p.Registry.Len(), p.Registry.Has("fresh-node"))
+	// 成员资格跟随订阅:订阅只剩 fresh-node,旧 n0 不在任何源里即下架。
+	// 旧语义「池=历史并集」已废(订阅下架的节点靠 coldPass 三振,关探测则
+	// 永久残留)。
+	if !p.Registry.Has("fresh-node") || p.Registry.Len() != 1 {
+		t.Fatalf("registry len %d has fresh %v, want 1/true(订阅下架即删除)", p.Registry.Len(), p.Registry.Has("fresh-node"))
 	}
 	if !p.Host.Has("fresh-node") {
 		t.Fatal("新节点没有热插进 sing-box")
@@ -729,8 +729,8 @@ func TestRebuildRetriesTwiceThenGivesUp(t *testing.T) {
 		}
 	case <-time.After(300 * time.Millisecond):
 	}
-	if p.subFetchRetries != subRetryLimit {
-		t.Fatalf("subFetchRetries = %d, want %d", p.subFetchRetries, subRetryLimit)
+	if p.subFetchRetries.Load() != int64(subRetryLimit) {
+		t.Fatalf("subFetchRetries = %d, want %d", p.subFetchRetries.Load(), subRetryLimit)
 	}
 }
 

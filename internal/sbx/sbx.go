@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
@@ -366,7 +367,26 @@ func (h *Host) SyncOutbounds(outs []parse.Outbound) (added, removed int, err err
 		return added, removed, fmt.Errorf("sbx: 尚未启动")
 	}
 	b := h.box
-	for _, tag := range toRemove {
+	// 分批落锁:大 churn(1700+ tag)时持写锁逐个 Remove/Create 会让全部
+	// Dialer 的 RLock 排队,在途拨号+探测集体 stall。每批后解一小会儿锁让
+	// 读侧插空,复核 box 代数(Close 并发时 box 置 nil,剩下的不做了)。
+	const syncBatch = 200
+	flushBatch := func() bool {
+		if h.box == nil || h.box != b {
+			return false
+		}
+		h.mu.Unlock()
+		runtime.Gosched()
+		h.mu.Lock()
+		if h.box == nil || h.box != b {
+			return false
+		}
+		return true
+	}
+	for i, tag := range toRemove {
+		if i > 0 && i%syncBatch == 0 && !flushBatch() {
+			return added, removed, fmt.Errorf("sbx: 热插中被关闭")
+		}
 		if _, still := h.tags[tag]; !still {
 			continue // 快照之后已被并发路径摘掉:不重复记账
 		}
@@ -376,7 +396,10 @@ func (h *Host) SyncOutbounds(outs []parse.Outbound) (added, removed int, err err
 		delete(h.tags, tag)
 		removed++
 	}
-	for _, it := range toAdd {
+	for i, it := range toAdd {
+		if i > 0 && i%syncBatch == 0 && !flushBatch() {
+			return added, removed, fmt.Errorf("sbx: 热插中被关闭")
+		}
 		if _, exists := h.tags[it.tag]; exists {
 			continue // 快照之后已被并发路径装上:不重复 Create
 		}

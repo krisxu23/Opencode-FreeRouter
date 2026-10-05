@@ -90,37 +90,59 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	if p.Host == nil || p.Registry == nil {
 		return nil
 	}
+	// 入口互斥:并发的两轮重建会让出站集合在 SyncOutbounds 里互相覆盖。
+	// 第二个进来的只记 queued,等本轮结束补一轮,不并发跑。
 	p.rebuildMu.Lock()
 	if p.rebuilding {
-		// 已经在重建:记下这次意图,等本轮结束后立刻补一次,而不是并发跑
-		// 两轮 —— 两轮并发会让出站集合在 SyncOutbounds 里互相覆盖。
 		p.rebuildQueued = true
 		p.rebuildMu.Unlock()
 		return nil
 	}
 	p.rebuilding = true
 	p.rebuildMu.Unlock()
-	defer func() {
+	// 补重建用循环不用递归:持续被 queue 时 defer 内递归栈深度无界。
+	var lastErr error
+	for {
+		if err := p.rebuildOnce(ctx); err != nil {
+			lastErr = err
+		} else {
+			lastErr = nil
+		}
 		p.rebuildMu.Lock()
 		again := p.rebuildQueued
 		p.rebuildQueued = false
-		p.rebuilding = false
-		p.rebuildMu.Unlock()
-		if again && ctx.Err() == nil {
-			if err := p.Rebuild(ctx); err != nil {
-				logger.Warn(fmt.Sprintf("[app] 补重建失败: %v", err))
-			}
+		if !again || ctx.Err() != nil {
+			p.rebuilding = false
+			p.rebuildMu.Unlock()
+			break
 		}
-	}()
+		// rebuilding 保持 true,下一轮继续。
+		p.rebuildMu.Unlock()
+	}
+	return lastErr
+}
+
+// rebuildOnce 是一轮重建本体(旧 Rebuild 去掉递归外壳)。
+//
+// R2:不拿 rebuildMu 做「已在重建」短路。上一轮把递归改循环时在这里加了一道
+// 「p.rebuilding → 记 queued → return nil」,但 Rebuild 循环本身已持有
+// rebuilding(第 109 行置 true)、本轮 rebuildOnce 是自己人 —— 于是第二轮及
+// 之后的每一轮都走这条短路直接返回,循环永远只跑第一轮:补重建悄悄不补,
+// 面板/托盘的「刷新」在并发触发时静默丢轮。互斥语义全部收进 Rebuild,本函数
+// 只管跑一轮,不做任何状态判断。
+func (p *Parts) rebuildOnce(ctx context.Context) error {
+	if p.Host == nil || p.Registry == nil {
+		return nil
+	}
 
 	settings := p.settingsSnapshot()
 	before := p.Registry.Len()
 
-	picked, fetchErr, dropped := p.fetchSubscriptions(ctx, settings)
+	picked, present, fetchErr, dropped := p.fetchSubscriptions(ctx, settings)
 	if fetchErr != nil {
 		p.noteSubFailure(ctx)
 	} else {
-		p.subFetchRetries = 0
+		p.subFetchRetries.Store(0)
 	}
 	// 关停窗口短路:面板动作跑在 lifeCtx 上,让它们止步的是 p.cancel() ——
 	// Shutdown 注释里「Panel.Close 取消在途动作」对它们不成立(Close 只取消
@@ -138,13 +160,32 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 		}
 	} else {
 		added := p.Registry.Merge(picked)
-		for _, tag := range p.Registry.EnforceCap(registry.PoolCap) {
+		// 成员资格跟随订阅(与 boot 路径同语义):拉取成功后,不在任何源里
+		// 的节点删干净。订阅下架的节点平时只靠 coldPass 三振,关探测则永久
+		// 残留占池位和探测预算。先落盘再 Sync(崩溃语义:盘上先一致)。
+		pruned := 0
+		if present != nil {
+			for _, o := range p.Registry.All() {
+				if !present[o.Tag] {
+					if p.Registry.Remove(o.Tag) {
+						p.Health.Forget(o.Tag)
+						pruned++
+					}
+				}
+			}
+		}
+		// 健康感知淘汰:从没活过的死节点先出,活着/B 档后出。rank 快照在
+		// 锁外一次算好(EnforceCapRanked 只读传入的 map)。
+		ranks := p.Health.EvictRank()
+		for _, tag := range p.Registry.EnforceCapRanked(registry.PoolCap, func(tag string) int {
+			return ranks[tag]
+		}) {
 			p.Health.Forget(tag) // D-C1:池外节点不留健康行
 		}
 		if err := p.Registry.Flush(); err != nil {
 			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
 		}
-		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d），池内现有 %d 个", len(picked), added, p.Registry.Len()))
+		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，下架 %d），池内现有 %d 个", len(picked), added, pruned, p.Registry.Len()))
 	}
 	if dropped > 0 {
 		logger.Warn(fmt.Sprintf("[app] 订阅里有 %d 个节点 sing-box 无法使用（非法 uuid / 不认的 cipher / 未知传输），未入池", dropped))
@@ -206,9 +247,9 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 // B11:从前这里回的是 bool,而 Rebuild 无论订阅成不成、出站热插有没有报错都
 // `return nil`。于是面板「刷新」永远 toast 成功、托盘 Reload 永远静默 ——
 // 哪怕订阅全军覆没。现在把失败原样交出去,由 Rebuild 聚合后上报。
-func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]parse.Outbound, error, int) {
+func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]parse.Outbound, map[string]bool, error, int) {
 	if len(settings.SubURLs) == 0 {
-		return nil, nil, 0
+		return nil, nil, nil, 0
 	}
 	exits := p.subExits()
 	budget, cancel := context.WithTimeout(ctx, subFetchBudget)
@@ -216,7 +257,13 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 	res, err := sub.Fetch(budget, settings.SubURLs, exits)
 	if err != nil {
 		logger.Warn(fmt.Sprintf("[app] 订阅失败，沿用 %d 个已知出口: %v", p.Registry.Len(), err))
-		return nil, err, 0
+		return nil, nil, err, 0
+	}
+	// present 是订阅原始全量的 tag 集(过滤前):差集删除的判据。被用户地区
+	// 选择过滤掉的节点仍在订阅里,不删 —— 与 boot 路径同口径。
+	present := make(map[string]bool, len(res.Outbounds))
+	for _, o := range res.Outbounds {
+		present[o.Tag] = true
 	}
 	picked := parse.FilterByGroups(res.Outbounds, settings.Countries)
 	clean := make([]parse.Outbound, 0, len(picked))
@@ -229,7 +276,7 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 		}
 		clean = append(clean, sanitized)
 	}
-	return clean, nil, dropped
+	return clean, present, nil, dropped
 }
 
 // subExits 是拉订阅时可以借用的出口。只取健康表判活的节点,且最多
@@ -275,11 +322,10 @@ func (p *Parts) subExits() []sub.Exit {
 // 首次启动时订阅常常比出口池先就绪,等本实例就绪后经健康出口复拉往往就通了
 // (src/index.js:458-469)。
 func (p *Parts) noteSubFailure(ctx context.Context) {
-	if p.subFetchRetries >= subRetryLimit {
+	if p.subFetchRetries.Load() >= int64(subRetryLimit) {
 		return
 	}
-	p.subFetchRetries++
-	attempt := p.subFetchRetries
+	attempt := p.subFetchRetries.Add(1)
 	logger.Warn(fmt.Sprintf("[app] 订阅拉取失败 — %s 后自动重试（第 %d/%d 次，等本实例就绪后经健康出口复拉）",
 		subRetryDelay, attempt, subRetryLimit))
 	p.afterFunc(subRetryDelay, func() {

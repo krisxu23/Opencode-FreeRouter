@@ -478,14 +478,29 @@ func TestFullProbeDoesUseEcho(t *testing.T) {
 // Close / SetDeadline 都是空操作。它钉的是 easy-proxies 记录过的协议形状 ——
 // 拨号能回来，但请求体永远不落地，客户端的 cancel 与 client.Timeout 都无法让
 // 这一发收口（只有传输层的 close 能，而这一层不理会）。
+//
+// R3:Read 必须是一次性把假头交出去(t0 行)、之后**永久阻塞**(select{})。
+// 过去这里是 `copy(p, …)` 而不看 p 有多长(64) —— Go Transport 的 readLoop 在
+// 连接空闲时会先 Peek(1) 探活:64 字节的 buf 只读走 1 字节,剩下 63 字节留
+// 在桩里;下一个请求复用同一连接时读到的就是残缺头,readResponse 报
+// unexpected EOF,readLoop 进 peekFailLocked 关连接,那一发以
+// readLoopPeekFailLocked 收场(echo 合法失败 → alive)。约 10% 概率撞上。
+// 修法:头一次性交清(调用方 buf 恒 ≥4KB,64 字节必一次装下)。
 type stubbornConn struct {
 	sentHead bool
 }
 
+var stubbornHead = []byte("HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")
+
 func (c *stubbornConn) Read(p []byte) (int, error) {
 	if !c.sentHead {
 		c.sentHead = true
-		return copy(p, []byte("HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n")), nil
+		if len(p) < len(stubbornHead) {
+			// 防御:调用方 buf 比头还小(现实中不会发生,Transport 读头用 4KB)。
+			// 截断交出去等于复刻旧 bug,直接报错让测试响亮失败而不是随机 flake。
+			return 0, fmt.Errorf("stubbornConn: buf %d < head %d", len(p), len(stubbornHead))
+		}
+		return copy(p, stubbornHead), nil
 	}
 	select {} // 永久阻塞：头发完了就永远不返回，也不理会 Close
 }
@@ -582,10 +597,15 @@ func TestIncompleteIsNotDead(t *testing.T) {
 	// 余量必须给「响应头」留够时间：echo 这一发能撞到兜底，靠的是**头已经
 	// 到了、判决层卡在读 body 上**（stubbornConn 的 Close 与各 deadline 都是
 	// 空操作）。若 echo 的单发预算先到期，transport 会放弃这一发、ProbeNode
-	// 立刻以 alive 收场 —— 用例就退化成「客户端自己能取消」的形状。100ms 的
-	// 预算在满载 CI 上真会先到期（实测拿到 alive），1000ms 才有可用的裕量。
-	p.echoBudgetMS = 1000   // echo 单发预算：只要头在这之内到达即可
-	p.backstopSlackMS = 100 // 兜底 ≈ 100 + 1000 + 100
+	// 立刻以 alive 收场 —— 用例就退化成「客户端自己能取消」的形状。
+	//
+	// R3:预算提到 5000ms（兜底≈5600ms，外层 15s 不动）。直接诱因是桩的
+	// Read 不看 buf 长度：Go Transport 的 readLoop 空闲探活用 Peek(1) 只读走
+	// 1 字节，残缺头让下一发以 readLoopPeekFailLocked 收场、echo 合法失败回
+	// alive（约 10% 概率，见 stubbornConn 注释）。桩已修（头原子交付），
+	// 5000ms 纯作调度抖动保险 —— race 并行满载下 1s 级停顿并非不可能。
+	p.echoBudgetMS = 5000   // echo 单发预算：只要头在这之内到达即可
+	p.backstopSlackMS = 500 // 兜底 ≈ 100 + 5000 + 500
 	items := []Item{{Tag: "slow", Dial: dial, Options: ProbeOptions{TimeoutMS: 100, Attempts: 1}}}
 	res := p.ProbeAll(context.Background(), items, 1)
 	if len(res) != 1 {
@@ -669,9 +689,10 @@ func TestAbortStopsTheZombie(t *testing.T) {
 	p.gate = ""
 	p.echo = []string{echoSrv.URL + "/echo"}
 	// 同 TestIncompleteIsNotDead：撞兜底的前提是 echo 的头先到、body 读挂死，
-	// 预算给到 1000ms 才不会被满载下的调度抖动抢先收口。
-	p.echoBudgetMS = 1000
-	p.backstopSlackMS = 100
+	// 预算给到 5000ms 才不会被满载下的调度抖动抢先收口（R3：1000ms 在 12 包
+	// 并行 race 下被吃穿，transport 先关 body、echo 合法失败回 alive）。
+	p.echoBudgetMS = 5000
+	p.backstopSlackMS = 500
 	items := []Item{{Tag: "zombie", Dial: dial, Options: ProbeOptions{TimeoutMS: 100, Attempts: 1}}}
 
 	done := make(chan []Result, 1)

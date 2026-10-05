@@ -398,11 +398,17 @@ func foldChunks(c Chunk, into *Outcome) (FinishReason, bool) {
 			into.ToolCalls = append(into.ToolCalls, ToolCall{ID: c.ToolID, Name: c.ToolName, Arguments: c.ToolArguments, slot: c.Index})
 			return FinishStop, true
 		}
-		// 增量帧:按 Index 找条目(js :527-531)。
+		// 增量帧:按 Index 找条目(js :527-531)。参数只往 argsSB 追加(O(1)摊还),
+		// Arguments 在物化点回填 —— 长参数 × 碎增量的 `+=` 是 O(n²)。
 		for i := range into.ToolCalls {
 			call := &into.ToolCalls[i]
 			if call.slot == c.Index {
-				call.Arguments += c.ToolDelta
+				if call.argsSB == nil {
+					call.argsSB = &strings.Builder{}
+					call.argsSB.WriteString(call.Arguments)
+					call.Arguments = ""
+				}
+				call.argsSB.WriteString(c.ToolDelta)
 				if c.ToolName != "" {
 					call.Name = c.ToolName
 				}
@@ -412,7 +418,9 @@ func foldChunks(c Chunk, into *Outcome) (FinishReason, bool) {
 				return FinishStop, true
 			}
 		}
-		into.ToolCalls = append(into.ToolCalls, ToolCall{ID: c.ToolID, Name: c.ToolName, Arguments: c.ToolDelta, slot: c.Index})
+		newCall := ToolCall{ID: c.ToolID, Name: c.ToolName, slot: c.Index, argsSB: &strings.Builder{}}
+		newCall.argsSB.WriteString(c.ToolDelta)
+		into.ToolCalls = append(into.ToolCalls, newCall)
 		return FinishStop, true
 	case ChunkUsage:
 		into.Usage = c.Usage // JS 是整体替换(:540),adapter 交来的是终值
@@ -427,11 +435,26 @@ func foldChunks(c Chunk, into *Outcome) (FinishReason, bool) {
 	}
 }
 
+// materializeToolCalls 把 argsSB 累积的参数回填进 Arguments。增量期
+// Arguments 滞后,任何读 Arguments 的地方(转发层投影、dropBrokenToolCalls、
+// 测试)都必须先过这一道;多次调用无害(已物化的条目 argsSB 为空则跳过)。
+func materializeToolCalls(out *Outcome) {
+	for i := range out.ToolCalls {
+		call := &out.ToolCalls[i]
+		// 只有增量路径的条目才有 argsSB;block-end 直接追加的条目
+		// Arguments 已就位、argsSB 为 nil,不碰。重复调用幂等(回填同一值)。
+		if call.argsSB != nil {
+			call.Arguments = call.argsSB.String()
+		}
+	}
+}
+
 // dropBrokenToolCalls 过滤掉 arguments 不是合法 JSON 的 tool call
 // (js :412-416)。max-tokens 收尾意味着 adapter 判定某个调用的参数被截在
 // JSON 半截上;保留它会让 OpenAI 答案与 finish_reason 不一致。空 arguments
 // 按 {} 参与判定(JS 的 call.arguments === ” ? '{}' : call.arguments)。
 func dropBrokenToolCalls(out *Outcome) {
+	materializeToolCalls(out)
 	kept := make([]ToolCall, 0, len(out.ToolCalls))
 	for _, call := range out.ToolCalls {
 		args := call.Arguments

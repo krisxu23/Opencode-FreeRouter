@@ -163,11 +163,19 @@ type ToolCall struct {
 	Name string
 	// Arguments is raw JSON text. It may be truncated mid-object, which is
 	// exactly what FinishMaxTokens means.
+	//
+	// 增量期它可能滞后于 argsSB:foldChunks 的增量分支只往 argsSB 追加(O(1)
+	// 摊还),Arguments 在物化点(materializeToolCalls)才回填 —— `+=` 在长
+	// 参数 × 碎增量下是 O(n²)。读 Arguments 前必须经过物化点;生产侧的物化点
+	// 是 attempt 的 materialize() 与 dropBrokenToolCalls 入口。
 	Arguments string
 	// slot 是 JS 折叠账目里的 candidate.slot(tool-call 增量按它归并,js :527)。
 	// 计划类型块没有这个字段,但按 Index 归并的语义需要把槽位记在条目上;
 	// 未导出字段不进任何 JSON/API 形状,对类型块的公开面零影响。
 	slot int
+	// argsSB 累积参数增量,见 Arguments 的注释。指针:strings.Builder 禁止
+	// 值拷贝,而 ToolCalls 切片的 append/扩容/range 都会拷贝元素值。
+	argsSB *strings.Builder
 }
 
 // Row is one /v1/models entry.
@@ -230,10 +238,11 @@ var attemptCapByCode = map[string]int{
 	check.CodeEmpty: 6,
 }
 
-// maxWallClockDefault = 0 即「不限」(js :225)。没有墙钟上限是明确的选择:
-// 设了上限就会在长 prompt 上放弃已经烧掉的 token,不设则靠每轮一行汇总日志
-// 兜住可观测性。
-const maxWallClockDefault = 0
+// maxWallClockDefault 是单轮请求的墙钟上限(毫秒)。过去是 0(不限),代价是
+// 连续命中慢超时节点时单请求占 goroutine+SSE+车道槽最长 ~200s(20 次 ×
+// EMPTY 中位 9.6s)。180s 覆盖正常长尾(大 prompt 多轮重试),只掐病态扫池;
+// settings 显式 0 仍表示不限(面板可设,存量配置不受影响)。
+const maxWallClockDefault = 180000
 
 // ---- 编排器 ----
 
@@ -345,6 +354,38 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 	startedSticky := snapshot.Health.ExitForSession(session)
 	pool := e.deps.Pool() // 池子随 State 同一代际快照,中途 rebuild 不换轮内候选
 	turnSeed := mintTurnSeed()
+
+	// 轮首预建:build+指纹+Marshal 只做一次(同轮重试 body 不变),attempt
+	// 只换 Client/NodeKey/Session 头。stale-reasoning 重放走 adapter 内的
+	// 二次 Marshal(就地剥字段后重序列化),不走这里。
+	clientEffort, _ := openAi["reasoning_effort"].(string)
+	var wheelEntry effort.Entry
+	wheelEntry, clientEffort = buildEffortEntry(*entry, clientEffort, settings.EffortLevel)
+	wheelReq := buildAttemptRequest(attemptInput{
+		messages:   msgs,
+		tools:      tools,
+		settings:   settings,
+		session:    session,
+		openAi:     openAi,
+		turnSeed:   turnSeed,
+	}, clientEffort)
+	var wheelPrebuilt *adapter.PrebuiltBody
+	{
+		probeDeps := e.deps.AdapterDeps
+		probeDeps.Model = entry.ID
+		probeDeps.Wire = entry.Wire
+		probeDeps.SessionID = session
+		probeDeps.Tools = tools
+		probeDeps.Effort = settings.EffortLevel
+		if settings.DefaultMaxTokens > 0 {
+			probeDeps.MaxTokens = settings.DefaultMaxTokens
+		}
+		probeDeps.Entry = wheelEntry
+		if pb, err := adapter.NewAdapter(probeDeps).BuildBody(wheelReq); err == nil {
+			wheelPrebuilt = pb
+		}
+		// 预建失败不致命:attempt 回落本地组装(与旧语义一致)。
+	}
 
 	attempt := 0
 	for {
@@ -478,6 +519,9 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 				openAi:     openAi,
 				turnSeed:   turnSeed,
 				onChunk:    onChunk,
+				prebuilt:   wheelPrebuilt,
+				clientEffort: clientEffort,
+				effortEntry:  wheelEntry,
 			})
 		}()
 
@@ -516,7 +560,9 @@ func (e *Engine) Complete(ctx context.Context, req Request, onChunk func(Chunk) 
 		tr.tries = append(tr.tries, tracelog.TryRow{
 			Tag:     picked.NodeKey,
 			Country: picked.Country,
-			IP:      snapshot.Health.ExitIPOf(picked.NodeKey, nowMS()),
+			IP:      exitIP, // 复用 attempt 初的 exitIP,不二次查询:探测轮可能
+			// 在请求跑着时改判,二次查会把同一轮记成两个 IP;trace 要的是
+			// 「这一轮走的出口」,不是记录时刻的最新量测。
 			Code:    tryCodeOf(failure),
 			MS:      attemptMS,
 			Served:  sawContent,
@@ -648,6 +694,14 @@ type attemptInput struct {
 	openAi     map[string]any
 	turnSeed   string
 	onChunk    func(Chunk) error
+	// prebuilt 是轮首预建的请求体(build+指纹+Marshal 一次,见 Complete):
+	// 同轮重试 body 不变,每 attempt 重建是最多 20 倍白算。nil 时 attempt
+	// 回落本地组装(测试直调 attempt 时)。
+	prebuilt *adapter.PrebuiltBody
+	// clientEffort 与 effortEntry 是轮首算好的 effort 推导(同轮不变),
+	// attempt 不再每轮重算 buildEffortEntry。
+	clientEffort string
+	effortEntry  effort.Entry
 }
 
 // attempt runs one attempt on one exit. Returns the folded Outcome, the
@@ -663,13 +717,46 @@ type attemptInput struct {
 // 第一个信源只能来自投影层 —— 上游把被输出上限截断的一轮照样报成
 // finish "tool_calls"(实测 2026-09-25),只看 token 会把一个不可执行的调用
 // 交给 harness。
+// buildAttemptRequest 把一次尝试的 adapter.Request 组装出来:与 attempt 内
+// 原先的内联组装逐字一致,抽出来是为了让轮首预建与 attempt 共用同一组装,
+// 不出现两处真相。
+func buildAttemptRequest(in attemptInput, clientEffort string) adapter.Request {
+	areq := adapter.Request{
+		Messages:        in.messages,
+		Stream:          true,
+		TurnSeed:        in.turnSeed,
+		ReasoningEffort: clientEffort,
+	}
+	if v, ok := in.openAi["temperature"].(float64); ok {
+		areq.Temperature = v
+	}
+	if v, ok := in.openAi["max_tokens"].(float64); ok && v > 0 {
+		areq.MaxTokens = int(v)
+	} else if v, ok := in.openAi["max_completion_tokens"].(float64); ok && v > 0 {
+		// OpenAI 的新参数名(chat completions 的 max_completion_tokens):与
+		// max_tokens 同义。过去只有老名字被读,新名字的输出上限被静默丢弃、
+		// 回落到面板默认 —— 新 SDK 是会发新名字的。
+		areq.MaxTokens = int(v)
+	}
+	// R19:客户端的停止序列要上线。adapter 写 payload["stop"] 的分支一直在,但全仓
+	// 没有生产赋值点(JS 的 engine.js 同样不生产 options.stop),于是「调用方指定
+	// stop」这件事在两条线上都是静默无效的。
+	if stops := stopSequences(in.openAi["stop"]); len(stops) > 0 {
+		areq.Stop = stops
+	}
+	if in.prebuilt != nil {
+		areq.Prebuilt = in.prebuilt
+	}
+	return areq
+}
+
 func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishReason, bool, *errors.Failure) {
 	var out Outcome
 	sawContent := false
 	// 正文增量在这里用 Builder 攒,foldChunks 不再摸 Outcome.Text(长答案上的
 	// `+=` 是 O(n²));每个返回点先 materialize 回填。
 	var textSB strings.Builder
-	materialize := func() { out.Text = textSB.String() }
+	materialize := func() { out.Text = textSB.String(); materializeToolCalls(&out) }
 	emit := func(c Chunk) error {
 		if c.Kind == ChunkText {
 			textSB.WriteString(c.Text)
@@ -707,34 +794,20 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 		deps.OnFirstToken = in.snapshot.Health.NoteTtft
 	}
 
-	clientEffort, _ := in.openAi["reasoning_effort"].(string)
+	clientEffort := in.clientEffort
+	entry := in.effortEntry
+	// 测试直调 attempt 时轮首字段为空:回落本地推导,与旧内联语义一致。
+	if in.prebuilt == nil {
+		var cw string
+		cw, _ = in.openAi["reasoning_effort"].(string)
+		entry, cw = buildEffortEntry(*in.entry, cw, in.settings.EffortLevel)
+		clientEffort = cw
+	}
 	// 默认档来自设置(上游语义:harness 缺省 balanced),调用方可用
 	// reasoning_effort 逐请求覆盖 —— 这条车道真正生效的旋钮是它导出的预算。
-	deps.Entry, clientEffort = buildEffortEntry(*in.entry, clientEffort, in.settings.EffortLevel)
+	deps.Entry = entry
 
-	areq := adapter.Request{
-		Messages:        in.messages,
-		Stream:          true,
-		TurnSeed:        in.turnSeed,
-		ReasoningEffort: clientEffort,
-	}
-	if v, ok := in.openAi["temperature"].(float64); ok {
-		areq.Temperature = v
-	}
-	if v, ok := in.openAi["max_tokens"].(float64); ok && v > 0 {
-		areq.MaxTokens = int(v)
-	} else if v, ok := in.openAi["max_completion_tokens"].(float64); ok && v > 0 {
-		// OpenAI 的新参数名(chat completions 的 max_completion_tokens):与
-		// max_tokens 同义。过去只有老名字被读,新名字的输出上限被静默丢弃、
-		// 回落到面板默认 —— 新 SDK 是会发新名字的。
-		areq.MaxTokens = int(v)
-	}
-	// R19:客户端的停止序列要上线。adapter 写 payload["stop"] 的分支一直在,但全仓
-	// 没有生产赋值点(JS 的 engine.js 同样不生产 options.stop),于是「调用方指定
-	// stop」这件事在两条线上都是静默无效的。
-	if stops := stopSequences(in.openAi["stop"]); len(stops) > 0 {
-		areq.Stop = stops
-	}
+	areq := buildAttemptRequest(in, clientEffort)
 
 	res, err := adapter.NewAdapter(deps).Complete(ctx, areq, func(d adapter.Delta) error {
 		return emit(chunkOfDelta(d))
@@ -934,10 +1007,19 @@ func (e *Engine) logRotation(trail []string, result string, startedAt int64, tr 
 	if len(shown) > 0 {
 		body = strings.Join(shown, " → ") + " "
 	}
-	msg := fmt.Sprintf("出口轮换 %d 次后%s: %s共 %dms", len(trail), result, body, nowMS()-startedAt)
+	elapsed := nowMS() - startedAt
+	msg := fmt.Sprintf("出口轮换 %d 次后%s: %s共 %dms", len(trail), result, body, elapsed)
+	// 慢轮标记:单轮超阈值(默认 15s)的请求在汇总行里显眼,排障不用离线翻
+	// tracelog 的 jsonl。阈值内的成功轮换不加噪音。
+	if elapsed > slowTurnThresholdMS {
+		msg += " [慢轮]"
+	}
 	e.logf(msg)
 	tr.record(result, body)
 }
+
+// slowTurnThresholdMS 是「慢轮」的阈值:单轮耗时超过它,轮换汇总行带标记。
+const slowTurnThresholdMS = 15000
 
 // shortTag 是日志里的出口标识(js :84-93)。JS 版是 `名称前缀@端口`,因为
 // 端口才是唯一键(实测 218 个节点端口无重复);零端口架构里没有端口,唯一键

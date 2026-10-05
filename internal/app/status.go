@@ -243,6 +243,12 @@ func (p *Parts) stopPendingTimers() {
 // wait 返回一个在 d 后闭合的通道。三档间隔每轮重读
 // (面板改 hotIntervalSec 立即生效),所以是逐轮 wait 而不是固定 Ticker。
 // waitFn 是测试接缝:注入后三个循环的节拍完全由测试驱动。
+//
+// 生产路径刻意用 time.After 而不是 NewTimer+Stop:调用方是 select 多分支
+// (ctx/nudge/wait 三选一),nudge/取消分支命中时没有 timer 句柄可 Stop ——
+// 要 Stop 就得把 timer 建在 select 之外并在每个分支里 Stop,六个循环每个
+// 都要改。After 的悬置 timer 由 runtime 到期回收,间隔 45s~24h、nudge 低频,
+// 堆积可忽略。
 func (p *Parts) wait(d time.Duration) <-chan time.Time {
 	if p.waitFn != nil {
 		return p.waitFn(d)
@@ -319,8 +325,8 @@ func (p *Parts) StartTimers(ctx context.Context) {
 		p.cancel = cancel
 	} else if p.cancel != nil {
 		// Stop 函数随 AfterFunc 一起留着 —— 丢掉它会让 ctx 一直持有这个回调,
-		// 直到 ctx 自己被回收为止。
-		_ = context.AfterFunc(ctx, p.cancel)
+		// 直到 ctx 自己被回收为止。Shutdown 时显式 Stop(见 stopCancelBridge)。
+		p.cancelStop = context.AfterFunc(ctx, p.cancel)
 	}
 	life := p.lifeCtx
 
@@ -415,6 +421,18 @@ func (p *Parts) warmUp(ctx context.Context) {
 	go func() {
 		defer p.timersWG.done()
 		p.refreshCatalog(ctx)
+	}()
+	// R1:开场刷一次限额覆盖层。limitsLoop 的节拍是 24h,重启后 fetchedAt 从
+	// 磁盘恢复旧值、stale 初始 false —— 于是重启后最长 24h 内面板显示
+	// 「已是最新」,实际数据是几天前的(2026-10-04 现场:65 小时前的快照配
+	// stale:false)。开场刷一次,失败则 stale 置真(refreshLimitsOverlay 内),
+	// 面板诚实显示。直连抓取 30s 预算,后台跑不挡监听。
+	p.timersWG.add()
+	go func() {
+		defer p.timersWG.done()
+		if err := p.refreshLimitsOverlay(ctx); err != nil {
+			logger.Warn(fmt.Sprintf("[app] 开场限额刷新失败: %v", err))
+		}
 	}()
 }
 
@@ -538,14 +556,17 @@ func (p *Parts) Status() any {
 	}
 
 	outs := p.poolNodes()
+	// 健康快照只取一次:下面的节点表与 coldCount 共用,不再二次全量拷贝
+	// (8000 节点 = 3× 全 map 拷贝 + 8000 个 map 行分配,每 5s 一轮)。
+	snapForStatus := p.Health.NodeSnapshot()
 	singbox := map[string]any{
 		"running": true, // 零端口架构:sing-box 与本进程同生死,进程在即 running
 		"pid":     os.Getpid(),
 		"lastCheck": map[string]any{
 			"ok":        okValue,
 			"dropped":   dropped,
-			"nodes":     len(outs),     // 前端 checkAlert 的「N 个节点正常启用」读它
-			"probation": p.coldCount(), // 1.3.0:观察期语义并入冷区(dead 节点数)
+			"nodes":     len(outs),               // 前端 checkAlert 的「N 个节点正常启用」读它
+			"probation": p.coldCountOn(snapForStatus), // 1.3.0:观察期语义并入冷区(dead 节点数)
 			"at":        lastRebuildAt,
 			"mode":      mode,
 			"error":     lastErr,
@@ -587,7 +608,7 @@ func (p *Parts) Status() any {
 	// JS 逐字搬运的前端按 n.state/n.latencyMs/n.country/n.tier 取数;零端口
 	// 架构没有 per-node 端口,NodeRow 不带 port(节点表的 port 列恒显示 —,
 	// 这是任务 23 登记过的已知差异)。
-	snap := p.Health.NodeSnapshot()
+	snap := snapForStatus
 	nodes := make([]any, 0, len(outs))
 	for _, o := range outs {
 		row := map[string]any{
@@ -1014,14 +1035,20 @@ func topBuckets(all map[string]stats.Bucket, n int) map[string]stats.Bucket {
 	return out
 }
 
-// coldCount 是冷区(dead)节点数:面板的「观察期」数字在 1.3.0 双档模型里
-// 的对应物。一次快照算完,不逐 tag 锁往返。
-func (p *Parts) coldCount() int {
+// coldCountOn 用已有快照数冷区(dead)节点:面板的「观察期」数字在 1.3.0
+// 双档模型里的对应物。status 主路径已有一份 NodeSnapshot,不再二次全量拷贝。
+func (p *Parts) coldCountOn(snap map[string]health.NodeView) int {
 	n := 0
-	for _, view := range p.Health.NodeSnapshot() {
+	for _, view := range snap {
 		if view.State == health.StateDead {
 			n++
 		}
 	}
 	return n
+}
+
+// coldCount 是冷区(dead)节点数:面板的「观察期」数字在 1.3.0 双档模型里
+// 的对应物。一次快照算完,不逐 tag 锁往返。
+func (p *Parts) coldCount() int {
+	return p.coldCountOn(p.Health.NodeSnapshot())
 }

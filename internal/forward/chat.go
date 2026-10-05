@@ -598,11 +598,13 @@ func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[strin
 				})
 			}
 		case engine.ChunkUsage:
-			start()
 			u, ok := openAIUsageOf(c.Usage)
 			if !ok {
 				return nil
 			}
+			// 先判 ok 再发头:空 usage 也烧头的话,后续失败只能走 in-band,
+			// 丢掉延迟发头的红利。
+			start()
 			// usage 帧按 js :274 带 choices: [],不是收尾帧。
 			stream.send(chunkFrame{
 				ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
@@ -924,9 +926,14 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 				Type: "response.reasoning_summary_text.delta", ItemID: it.itemID, OutputIndex: it.outIdx, Delta: c.Text,
 			})
 		case engine.ChunkToolCallDelta:
-			sendCreated()
+			// 先判归属再发头:孤儿 delta(it==nil、无首帧信息)本来要丢弃,
+			// 先 sendCreated 等于为一次注定丢弃的增量烧掉 response.created。
 			it := itemBySlot[c.Index]
 			first := !seenToolSlot[c.Index]
+			if it == nil && !first {
+				return nil // 没开过项也没有首帧信息:无从归属,丢弃
+			}
+			sendCreated()
 			if first {
 				seenToolSlot[c.Index] = true
 				if it == nil {
@@ -944,9 +951,6 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 						CallID: c.ToolID, Name: c.ToolName, Arguments: "",
 					}})
 				}
-			}
-			if it == nil {
-				return nil // 没开过项也没有首帧信息:无从归属,丢弃
 			}
 			if c.ToolArguments != "" {
 				// block-end:增量已经拼齐就忽略;零参调用(整段参数随

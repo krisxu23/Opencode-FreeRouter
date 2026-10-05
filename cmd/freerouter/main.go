@@ -13,9 +13,17 @@ package main
 import (
 	"context"
 	_ "embed"
+	"errors"
+	"flag"
 	"fmt"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,20 +48,78 @@ func main() {
 	// exit code, and a hard exit skips every defer below — which is why every
 	// store persists synchronously on its own writes rather than only on
 	// shutdown.
+	//
+	// 启动参数(全部可选,缺省即现行行为):
+	//   --data-dir  覆盖数据目录(等价 FREEROUTER_DATA,显式参数优先)。
+	//   --version   打印 ldflags 注入的版本号即退,不启动网关(CI 烟测/排障用)。
+	//   --pprof-port 本机回环诊断口(如 6060):只绑 127.0.0.1 的 pprof,而不是
+	//               全网段暴露 —— 内存/CPU 剖析按需开,常态零监听。
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	dataDir := fs.String("data-dir", "", "data directory (overrides FREEROUTER_DATA)")
+	showVersion := fs.Bool("version", false, "print version and exit")
+	pprofPort := fs.Int("pprof-port", 0, "loopback pprof port (0 = disabled)")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		os.Stderr.WriteString("freerouter: " + err.Error() + "\n")
+		os.Exit(2)
+	}
+	if *showVersion {
+		fmt.Println(app.Version)
+		return
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	root, err := app.RootDir()
-	if err != nil {
-		// The logger needs the data dir, and the failure may be that the data
-		// dir is unwritable: one line on stderr is the only honest channel.
-		os.Stderr.WriteString("freerouter: " + err.Error() + "\n")
-		os.Exit(1)
+	root := strings.TrimSpace(*dataDir)
+	if root == "" {
+		var err error
+		root, err = app.RootDir()
+		if err != nil {
+			// The logger needs the data dir, and the failure may be that the data
+			// dir is unwritable: one line on stderr is the only honest channel.
+			os.Stderr.WriteString("freerouter: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+	} else {
+		if abs, err := filepath.Abs(root); err != nil {
+			os.Stderr.WriteString("freerouter: --data-dir 不是可用路径: " + err.Error() + "\n")
+			os.Exit(1)
+		} else {
+			root = filepath.Clean(abs)
+		}
+		if err := os.MkdirAll(filepath.Join(root, "data"), 0o755); err != nil {
+			os.Stderr.WriteString("freerouter: --data-dir 不可写: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+	}
+	if *pprofPort > 0 {
+		startLoopbackPprof(*pprofPort)
 	}
 	if err := run(ctx, stop, root); err != nil {
 		os.Stderr.WriteString("freerouter: " + err.Error() + "\n")
 		os.Exit(1)
 	}
+}
+
+// startLoopbackPprof 按需开 pprof:只绑 127.0.0.1,端口非法(<=0/>65535)直接
+// 拒绝,不静默钳制 —— 排障开关的误配要响亮失败,而不是开在一个意外的口上。
+func startLoopbackPprof(port int) {
+	if port <= 0 || port > 65535 {
+		os.Stderr.WriteString("freerouter: --pprof-port 非法: " + strconv.Itoa(port) + "\n")
+		os.Exit(2)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+	if err != nil {
+		os.Stderr.WriteString("freerouter: pprof 监听失败: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+	go func() {
+		// DefaultServeMux 已被 net/http/pprof 注册;这里只服务回环监听。
+		_ = http.Serve(ln, nil)
+	}()
+	logger.Warn(fmt.Sprintf("[main] pprof 已在 127.0.0.1:%d 开启(仅回环)", port))
 }
 
 // run is main's body once root is known. It returns when the tray quits or

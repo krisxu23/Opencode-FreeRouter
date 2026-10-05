@@ -122,10 +122,14 @@ func Classify(status int, body []byte, retryAfterMS int64) Failure {
 
 	// 配额分支必须在凭证分支之前:文案是 "usage limit" 的 403 是配额拒绝,
 	// 换出口恰恰是正确的应对(src/errors.js:47)。
+	//
+	// 文案判据只认 4xx:5xx 是供应商自身故障,一句 "rate limit exceeded
+	// while scaling" 不能把出口判成配额耗尽(换出口+吃 RetryAfter 还掩盖
+	// 真故障)。429/402/显式 type 是结构信号,任何状态码都认。
 	case status == 429 || typ == "FreeUsageLimitError" || typ == "GoUsageLimitError" ||
-		status == 402 || quotaRe.MatchString(flat) ||
-		strings.Contains(flat, "insufficient funds") || strings.Contains(flat, "insufficient quota") ||
-		strings.Contains(flat, "insufficient credits"):
+		status == 402 || (status < 500 && quotaRe.MatchString(flat)) ||
+		(status < 500 && (strings.Contains(flat, "insufficient funds") || strings.Contains(flat, "insufficient quota") ||
+			strings.Contains(flat, "insufficient credits"))):
 		// GoUsageLimitError 是配额分支的第二个类型名(dsh harness 仓库 2026-10
 		// 实测:它以 403 且文案不含 "usage limit" 的形状出现,漏认会掉进下面的
 		// 凭证分支变成不可重试的慢失败;自带 retry-after ≈600s)。402 与
@@ -145,7 +149,11 @@ func Classify(status int, body []byte, retryAfterMS int64) Failure {
 	case status == 401 || status == 403:
 		return Failure{Code: check.CodeCredential, Status: status, Type: typ, Message: msg}
 
-	case typ == "ModelError" || modelRe.MatchString(flat):
+	// 模型下线只认 4xx 路由层拒绝:一句 5xx 里的 "model is unavailable" 是
+	// 网关侧瞬态(过载/滚动发布),打 Unavailable 位会让 engine 直接整轮报死、
+	// 不再扫池。5xx 落到 default 的 SERVER(可重试、不打 Unavailable)。
+	case (status >= 400 && status < 500 && typ == "ModelError") ||
+		(status >= 400 && status < 500 && modelRe.MatchString(flat)):
 		return Failure{Code: check.CodeServer, Status: status, Type: typ, Message: msg, Unavailable: true}
 
 	// R8: Retry-After 提示必须在这一支也带上。从前只有配额两支设 RetryAfterMS,

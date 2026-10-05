@@ -60,7 +60,7 @@
      2. 工具
      ═══════════════════════════════════════════════════════════════════ */
   function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]))
+    return String(s == null ? '' : s).replace(/[&<>"'`]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;' }[c]))
   }
   function bucketOf(cc) {
     const c = String(cc || '').toUpperCase()

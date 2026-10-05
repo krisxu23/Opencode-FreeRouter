@@ -38,7 +38,9 @@ func transport(d Dialer) *http.Transport {
 		MaxIdleConns:          32,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       60 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		// 握手 5s:免费池的慢出口多,10s 串行 Dial+TLS 最坏 20s 才判死一个
+		// 出口;5s 足够覆盖正常握手(P95 远小于此),烂握手早死早换出口。
+		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: time.Second,
 		// node's pipeline: pipelining 0 in the JS build became this flag. Keeping
 		// it explicit matters because the default is 1 and a pipelined request

@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	stderrors "errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -95,6 +96,33 @@ type Request struct {
 	// ReasoningEffort 是客户端 reasoning_effort 的原词("" 视同未指定),与
 	// Deps.Effort(设置档)一起在 build 时经 effort.ResolveLevel 折叠。
 	ReasoningEffort string
+	// Prebuilt 是 engine 在轮首预建的请求体(build+指纹+Marshal 一次):
+	// 同轮重试 body 不变(同 turnSeed、同指纹),每 attempt 重建是最多 20 倍
+	// 的白算。Complete 优先用它,字段为 nil 时回落本地 build(测试直调与
+	// stale-reasoning 重放走回落路径)。body map 仍保留(重放要就地剥字段)。
+	Prebuilt *PrebuiltBody
+}
+
+// PrebuiltBody 是一次 build 的成品:指纹已应用、已序列化。
+type PrebuiltBody struct {
+	Body    map[string]any
+	Payload []byte
+	Renames map[string]string
+}
+
+// BuildBody 对外暴露 build+指纹+Marshal,供 engine 在轮首预建一次。
+// 与 Complete 首段同一组装,语义一致。
+func (a *Adapter) BuildBody(req Request) (*PrebuiltBody, error) {
+	body, err := a.build(req)
+	if err != nil {
+		return nil, err
+	}
+	renames := upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return &PrebuiltBody{Body: body, Payload: payload, Renames: renames}, nil
 }
 
 // Adapter holds no mutable state; Complete is safe for concurrent use.
@@ -122,14 +150,23 @@ type turn struct {
 func (a *Adapter) Complete(ctx context.Context, req Request, onChunk func(Delta) error) (Result, error) {
 	t0 := time.Now()
 
-	body, err := a.build(req)
-	if err != nil {
-		return Result{}, err
-	}
-	renames := upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return Result{}, err
+	var body map[string]any
+	var payload []byte
+	var renames map[string]string
+	if req.Prebuilt != nil {
+		// engine 轮首已预建:同轮重试只换头,不重建 body。
+		body, payload, renames = req.Prebuilt.Body, req.Prebuilt.Payload, req.Prebuilt.Renames
+	} else {
+		var err error
+		body, err = a.build(req)
+		if err != nil {
+			return Result{}, err
+		}
+		renames = upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
+		payload, err = json.Marshal(body)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 
 	t := &turn{req: req, body: body, payload: payload, renames: renames, t0: t0}
@@ -174,6 +211,10 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, s *sink) (Result, error
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, rerr := readAllPrefix(resp.Body, maxBodyBytes)
+		// 排空残余再关:读完(或截断判定后)的 body 不消费完就 Close,Go 的
+		// Transport 只能弃连,下次同出口重建 TCP+TLS。64KB 有界排空,超限的
+		// 大 body 本来也复用不了,多付一次 Discard 上限即止。
+		_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
 		// A 400 naming a reasoning item the server no longer knows is not a
 		// client error: drop the server-issued references and replay once.
 		// Replaying unconditionally would double every genuine 400, and a
@@ -876,21 +917,34 @@ func numOf(v any) (int64, bool) {
 }
 
 // snippet 把非 JSON 响应体的开头截进错误消息(js http.js:166 的 slice(0,200);
-// 字节截断即可 —— 它只进错误消息,不再被解析)。
+// 按 rune 截:字节截会把 CJK/emoji 撕成半个 UTF-8,日志里吐 �)。
 func snippet(raw []byte) string {
-	if len(raw) > 200 {
-		return string(raw[:200])
+	const maxSnippetRunes = 200
+	rs := []rune(string(raw))
+	if len(rs) > maxSnippetRunes {
+		return string(rs[:maxSnippetRunes])
 	}
-	return string(raw)
+	return string(rs)
 }
 
-// readAllPrefix 读**前缀**:至多 limit 字节,超出的部分静默丢弃、不报错
-// (非 2xx 响应体封顶 1MB —— 失败路径要的是错误信封,不是整个响应体)。
-// 与 httpclient.ReadCapped(严格模式:超限一个字节就报错)语义不同、名字相近
-// 曾是误用陷阱,改名以示区分:前缀用于「只需要开头就能分类」的场合,严格版
-// 用于「多读一个字节都算违约」的场合。
+// readAllPrefix 读**前缀**:至多 limit 字节,多一个字节就报错(非 2xx 响应体
+// 封顶 1MB —— 失败路径要的是错误信封,不是整个响应体)。
+//
+// 过去这里用 LimitReader 静默截断:1MB 后的 FreeTierError 关键词被截掉时,
+// 403 照样掉进不可重试的凭证判决(换出口变立即失败),而 classifyErrorBody 的
+// readErr→TRANSPORT 兜底是永远走不到的死分支。截断必须是大声的 ——
+// classifyErrorBody 会把它翻成可重试的 TRANSPORT(换出口+冷却)。
+// 与 httpclient.ReadCapped 同一读法(名字相近曾是误用陷阱,改名以示区分:
+// 前缀用于「只需要开头就能分类」的场合,严格版用于「多读一个字节都算违约」)。
 func readAllPrefix(r io.Reader, limit int64) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(r, limit))
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return body, err
+	}
+	if int64(len(body)) > limit {
+		return body[:limit], fmt.Errorf("adapter: error body exceeds %d bytes (truncated)", limit)
+	}
+	return body, nil
 }
 
 // finishOfFullBody 从非流式整包里读终止原因(feed 只处理 delta 形状,这是它的

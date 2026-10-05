@@ -82,6 +82,14 @@ func IdentityOf(o Outbound) string {
 	if o.Path != "" {
 		parts = append(parts, "path="+o.Path)
 	}
+	// socks 等协议的用户名只进 Extra(见 clash.go/parse.go 的 username),
+	// 不拼则同 server:port+同 password 但不同用户名的两条线路塌缩成同一身份,
+	// 轮内去重/Merge 丢掉一条。只在非空时拼:没有用户名的既有身份串一字不变。
+	if u, ok := o.Extra["username"]; ok {
+		if s, ok := u.(string); ok && s != "" {
+			parts = append(parts, "user="+s)
+		}
+	}
 	return strings.Join(parts, "|")
 }
 

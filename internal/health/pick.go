@@ -12,6 +12,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"freerouter/internal/parse"
@@ -82,6 +83,11 @@ type ranked struct {
 	geo       bool
 }
 
+// rankedPool 复用 Pick 整池 rank 的行对象:8000 节点 × 每 attempt 一次 Pick,
+// 每次 `&ranked{...}` 堆分配是 GC 压力大头。值切片 + 索引传递,排序只排索引,
+// 行对象不出借(调用方拿到的是 Picked 拷贝,无别名风险)。
+var rankedPool = sync.Pool{New: func() any { return make([]ranked, 0, 256) }}
+
 // Pick returns nil when nothing is usable. Callers must not fall back to
 // direct egress: a wrong-country answer still proves the exit works, a direct
 // one proves nothing.
@@ -102,52 +108,34 @@ func pickRanked(hit *ranked, sorted []*ranked, stickyNode string) *Picked {
 	return p
 }
 
-// top8 决策快照只留前 8:整池几千个候选全写下来,一条记录就能顶掉一天的量,
-// 而这个顺序的前 8 名已经能解释「为什么选了它」(src/health.js:1037-1040)。
-func top8(list []*ranked) []*ranked {
-	if len(list) > 8 {
-		return list[:8]
-	}
-	return list
-}
-
 func (h *Health) Pick(req PickRequest) *Picked {
 	now := time.Now().UnixMilli()
 
-	// 锁内阶段(占用账 + sticky + 全池 rank)。整个临界区包在闭包里用 defer
-	// 解锁:O2 把排序挪到了锁外之后,这里的显式 Unlock 失去了 panic 兜底 ——
-	// rank/分组途中任何一次 panic 都会让 h.mu 永久锁死,之后所有 Pick、
-	// NoteTtft、MarkProbe 全部挂死。defer 是唯一能同时保住「锁外排序」与
-	// 「异常安全」的形状。
-	stickyHit, want, byGroup, rankedAll := func() (*ranked, []string, map[string][]*ranked, []*ranked) {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		// 长期占用:每个出口 IP 被多少个活会话钉着(不含调用方自己那个)
-		busy := h.busyExitIpsLocked(req.StickyNode)
-		// 配额扩散:还在记号有效期内的出口 IP 集合
-		quotaIps := h.quotaMarkedExitIpsLocked(now)
+	// 快照阶段(RLock):只拷贝 rank 需要的输入,不做任何删除。写操作(过期
+	// cool/busy/sticky/quota 的懒删)全部延后到选中后的短写锁里提交 ——
+	// 过去整池 rank 握着写锁做 CPU 活,8000 节点 × 每 attempt 一次 Pick,
+	// 并发 Pick 全串行。快照里的行是值拷贝(ttft/busy/sticky 的指针只读),
+	// NoteTtft/NoteExitBusy 整行替换旧指针,锁外读到的旧值仍自洽。
+	snap := h.pickSnapshot(now, req.StickyNode, req.Pool)
 
-		// sticky 优先(src/health.js:1007-1019):命中时 Order 只有它一行 —— 粘性
-		// 压过排序是这个模块最容易被误判的行为(「为什么还在用那个慢出口」只能从
-		// 这行回答)。rank 为 nil(节点不可用/受限模型遇到非 B)则照常落回池内选路;
-		// StickyNode 不在池里同样跳过。
-		if req.StickyNode != "" {
-			for _, node := range req.Pool {
-				if node.Tag != req.StickyNode {
-					continue
-				}
-				if r := h.rankLocked(node, req, busy, quotaIps, now); r != nil {
-					return r, nil, nil, nil
-				}
-				break
+	// 锁外 rank:纯计算,零共享写。ranked 行从池里复用,排序只排索引。
+	buf := rankedPool.Get().([]ranked)
+	rankedAll := buf[:0]
+	// sticky 先按 tag 索引 O(1) 命中,不再线性扫池。
+	stickyHit := (*ranked)(nil)
+	if req.StickyNode != "" && snap.poolIdx != nil {
+		if idx, ok := snap.poolIdx[req.StickyNode]; ok {
+			if r, ok2 := rankNode(snap.nodes[idx], req, snap, now); ok2 {
+				rankedAll = append(rankedAll, r)
+				stickyHit = &rankedAll[len(rankedAll)-1]
 			}
 		}
-
-		// countries 是固定分组(US/JP/HK/TW/KR/SG/EU/OTHER),节点的 tag 推断国与
-		// 出口 IP 实测国都归到分组后再匹配;byGroup 必须按分组 key,不能按原始国家码
-		// (否则 EU/OTHER 分组永远查不到,如 NL→EU、CA→OTHER,src/health.js:1026-1029)。
-		// want 保序去重:Set 的插入序就是回退序,不能排字典序。
-		want := make([]string, 0, len(req.Countries))
+	}
+	var want []string
+	var byGroup map[string][]int
+	var allIdx []int
+	if stickyHit == nil {
+		want = make([]string, 0, len(req.Countries))
 		seen := map[string]bool{}
 		for _, g := range req.Countries {
 			group := strings.ToUpper(g)
@@ -157,172 +145,316 @@ func (h *Health) Pick(req PickRequest) *Picked {
 			seen[group] = true
 			want = append(want, group)
 		}
-		byGroup := map[string][]*ranked{}
-		// rankedAll 是为了不再排第二遍(O11):过去这里把整池 rank 一遍、按分组丢弃,
-		// 选定分组全落空时又把整池**重新 rank 一遍** —— 每次 Pick 白付约 2×池子次数的
-		// rank,而 rank 里还要查出口 IP 信任窗口、配额记号与 TTFT 中位数。第一趟的
-		// 结果就是第二趟要的结果:同一个纯函数、同一批 now/busy/quotaIps。
-		rankedAll := make([]*ranked, 0, len(req.Pool))
-		for _, node := range req.Pool {
-			r := h.rankLocked(node, req, busy, quotaIps, now)
-			if r == nil {
+		byGroup = map[string][]int{}
+		allIdx = make([]int, 0, len(snap.nodes))
+		for i := range snap.nodes {
+			// sticky 已命中则不会走到这里;未命中时 sticky 节点仍参与池排。
+			r, ok := rankNode(snap.nodes[i], req, snap, now)
+			if !ok {
 				continue
 			}
 			rankedAll = append(rankedAll, r)
-			group := parse.BucketOf(r.country)
+			idx := len(rankedAll) - 1
+			allIdx = append(allIdx, idx)
+			group := parse.BucketOf(rankedAll[idx].country)
 			if !seen[group] {
 				continue
 			}
-			byGroup[group] = append(byGroup[group], r)
+			byGroup[group] = append(byGroup[group], idx)
 		}
-		return nil, want, byGroup, rankedAll
-	}()
-
-	// sticky 命中:锁已由闭包释放,Order 只有它一行。
-	if stickyHit != nil {
-		return pickRanked(stickyHit, []*ranked{stickyHit}, req.StickyNode)
 	}
 
-	// (bucket, cost, tag) 三元组。第三项是 Go 版新增:JS 的 Array.prototype.sort
-	// 稳定性由引擎保证,sort.SliceStable 之下两个同 bucket 同 cost 的候选还得有
-	// 一个确定次序,否则「为什么选了它」在重放时无法复现。
-	sortRanked := func(list []*ranked) {
-		sort.SliceStable(list, func(i, j int) bool {
-			if list[i].bucket != list[j].bucket {
-				return list[i].bucket < list[j].bucket
+	// 锁外排序:三元组(bucket, cost, tag),与旧 sortRanked 同序。
+	sortIdx := func(list []int) {
+		sort.SliceStable(list, func(a, b int) bool {
+			ra, rb := &rankedAll[list[a]], &rankedAll[list[b]]
+			if ra.bucket != rb.bucket {
+				return ra.bucket < rb.bucket
 			}
-			if list[i].cost != list[j].cost {
-				return list[i].cost < list[j].cost
+			if ra.cost != rb.cost {
+				return ra.cost < rb.cost
 			}
-			return list[i].node.Tag < list[j].node.Tag
+			return ra.node.Tag < rb.node.Tag
 		})
 	}
-	// O2:rank 之后的账目只读,排序在锁外做 —— 排序(整池几千候选)是纯计算,
-	// 留在 h.mu 里会把所有并发 Pick 串成一条队(engine 每个 attempt 都要 Pick
-	// 一次)。快照与选中瞬间之间状态再变的窗口本来就是 Pick 返回后同样存在的
-	// (engine 的 NoteExitBusy 在 Pick 返回后才落账),这里不引入新的竞争类。
-	for _, group := range want {
-		list := byGroup[group]
-		if len(list) == 0 {
-			continue
+
+	var hitIdx int = -1
+	var orderIdx []int
+	switch {
+	case stickyHit != nil:
+		// sticky 命中:Order 只有它一行(粘性压过排序,见旧注释)。
+		hitIdx = 0
+		orderIdx = []int{0}
+	default:
+		for _, group := range want {
+			list := byGroup[group]
+			if len(list) == 0 {
+				continue
+			}
+			sortIdx(list)
+			hitIdx = list[0]
+			if len(list) > 8 {
+				list = list[:8]
+			}
+			orderIdx = list
+			break
 		}
-		sortRanked(list)
-		return pickRanked(list[0], top8(list), req.StickyNode)
+		if hitIdx < 0 && len(allIdx) > 0 {
+			// 选定分组全部落空:给一个可用池内节点而不是直接失败。
+			sortIdx(allIdx)
+			hitIdx = allIdx[0]
+			if len(allIdx) > 8 {
+				allIdx = allIdx[:8]
+			}
+			orderIdx = allIdx
+		}
 	}
-	// 选定分组全部落空:仍然优先给一个可用池内节点而不是直接失败 —— 错国家的
-	// 好答案胜过没有答案。直连在这里永远不是候选;受限模型已在 rank 里滤掉非 B。
-	// (src/health.js:1044-1048)
-	if len(rankedAll) > 0 {
-		sortRanked(rankedAll)
-		return pickRanked(rankedAll[0], top8(rankedAll), req.StickyNode)
+
+	// 选中后短写锁提交:把快照期发现的过期键一次删掉(懒删的合法性:这些键
+	// 在快照时刻已过期,删除只影响内存回收,不改变 rank 结论)。
+	if hitIdx < 0 {
+		rankedPool.Put(buf[:0])
+		h.commitPickSweep(snap)
+		return nil
 	}
-	return nil
+	out := pickRanked(&rankedAll[hitIdx], rankedSlice(rankedAll, orderIdx), req.StickyNode)
+	rankedPool.Put(buf[:0])
+	h.commitPickSweep(snap)
+	return out
 }
 
-// rankLocked 是 pick 的核心公式(src/health.js:965-999)。返回 nil 的两种情形:
-// 节点不可用(dead/冷却中)、受限模型遇到非 B 出口。其余任何节点都参与排序,
-// 只重排、不排除。
-func (h *Health) rankLocked(node PoolNode, req PickRequest, busy map[string]int, quotaIps map[string]bool, now int64) *ranked {
-	r, hasRow := h.nodes[node.Tag]
-	if !h.nodeUsableLocked(node.Tag, now) {
-		return nil
+// rankedSlice 把索引切片翻译成 pickRanked 要的行指针切片(行仍活在调用方的
+// rankedAll 里, pickRanked 只读不存,无别名外泄)。
+func rankedSlice(all []ranked, idx []int) []*ranked {
+	out := make([]*ranked, 0, len(idx))
+	for _, i := range idx {
+		out = append(out, &all[i])
 	}
-	gated := hasRow && r.Tier == TierB
-	// 受限模型只认 B 类(唯一真实对话验证过的出口);普通模型 A/B 并用,
-	// B 类更快优先(bucket -1)。(src/health.js:969-971)
+	return out
+}
+
+// pickSnap 是 Pick 一次选路所需的全部只读输入,RLock 下一次拷完。
+// 行是值拷贝;ttft/busy/sticky 的指针只读(写侧整行替换,旧值自洽)。
+// sweep* 是快照期发现的已过期键,提交阶段短写锁删掉。
+type pickSnap struct {
+	nodes    []snapNode
+	poolIdx  map[string]int
+	busy     map[string]int
+	quotaIps map[string]bool
+	busyTbl  map[string]int
+	sweepCool  []string
+	sweepBusy  []string
+	sweepSticky []string
+	sweepQuota  []string
+}
+
+type snapNode struct {
+	tag     string
+	country string
+	row     row
+	hasRow  bool
+	coolOk  bool // true = 可用(cool 缺席或已过期);false = 冷却中
+	expiredCool bool // cool 已过期,待删
+	ttft    int64
+	hasTtft bool
+	exitIP  string
+	quotaSelf bool // 自身配额记号新鲜
+}
+
+// pickSnapshot 在 RLock 下拷贝 rank 的全部输入,不做任何删除。
+// pool 来自调用方(req.Pool):只为池内 tag 拷贝行 + 建 tag 索引。
+func (h *Health) pickSnapshot(now int64, ownSticky string, pool []PoolNode) *pickSnap {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	snap := &pickSnap{
+		nodes:   make([]snapNode, 0, len(pool)),
+		busy:    map[string]int{},
+		quotaIps: map[string]bool{},
+		busyTbl:  map[string]int{},
+	}
+	// busy 表快照:只拷窗内计数,过窗只记不删(提交阶段删)。
+	for ip, b := range h.busy {
+		if b == nil {
+			continue
+		}
+		if now-b.At > exitBusyStale {
+			snap.sweepBusy = append(snap.sweepBusy, ip)
+			continue
+		}
+		snap.busyTbl[ip] = b.Count
+	}
+	for _, node := range pool {
+		r, hasRow := h.nodes[node.Tag]
+		sn := snapNode{tag: node.Tag, country: node.Country, row: r, hasRow: hasRow}
+		// cool:冷却中不可用;过期只记不删。
+		if c, ok := h.cool[node.Tag]; ok {
+			if c.Until > now {
+				sn.coolOk = false
+			} else {
+				sn.coolOk = true
+				sn.expiredCool = true
+				snap.sweepCool = append(snap.sweepCool, node.Tag)
+			}
+		} else {
+			sn.coolOk = true
+		}
+		// ttft:只读中位数(写侧已算好,见 ttftRow 注释)。
+		if t, ok := h.ttft[node.Tag]; ok && t.hasMedian && now-t.At <= ttftFresh {
+			sn.ttft, sn.hasTtft = t.median, true
+		}
+		// exitIP:信任窗口内才有效(与 exitIpOfLocked 同口径,只读不续命)。
+		if hasRow && r.ExitIP != "" {
+			at := r.ExitIPAt
+			if at == 0 {
+				at = r.LastProbeAt
+			}
+			if now-at <= exitIPTTL {
+				sn.exitIP = r.ExitIP
+			}
+		}
+		// 自身配额记号。
+		sn.quotaSelf = hasRow && r.LastQuotaAt > 0 && now-r.LastQuotaAt < quotaMark
+		snap.nodes = append(snap.nodes, sn)
+	}
+	// poolIdx 只在 sticky 命中路径需要:无 sticky 会话的请求(大多数)不付
+	// 建表成本。建表只在需要时做,见 Pick 的 sticky 分支。
+	if ownSticky != "" {
+		snap.poolIdx = make(map[string]int, len(snap.nodes))
+		for i := range snap.nodes {
+			snap.poolIdx[snap.nodes[i].tag] = i
+		}
+	}
+	// busy:sticky 全扫在快照里做(读侧),过期只记不删。
+	for session, hit := range h.sticky {
+		if hit == nil || now-hit.At > ttlOf(hit) {
+			snap.sweepSticky = append(snap.sweepSticky, session)
+			continue
+		}
+		if ownSticky != "" && hit.NodeKey == ownSticky {
+			continue
+		}
+		// 可用性用快照内的行判定(不调带删的 nodeUsableLocked)。
+		usable := true
+		if r, ok := h.nodes[hit.NodeKey]; ok && r.State == StateDead {
+			usable = false
+		} else if c, ok := h.cool[hit.NodeKey]; ok && c.Until > now {
+			usable = false
+		}
+		if !usable {
+			continue
+		}
+		ip := hit.ExitIP
+		if ip == "" {
+			if r, ok := h.nodes[hit.NodeKey]; ok && r.ExitIP != "" {
+				at := r.ExitIPAt
+				if at == 0 {
+					at = r.LastProbeAt
+				}
+				if now-at <= exitIPTTL {
+					ip = r.ExitIP
+				}
+			}
+		}
+		if ip != "" {
+			snap.busy[ip]++
+		}
+	}
+	// quota:只走索引,过期只记不删。
+	for key := range h.quotaTags {
+		r, ok := h.nodes[key]
+		if !ok || !(r.LastQuotaAt > 0 && now-r.LastQuotaAt < quotaMark) {
+			snap.sweepQuota = append(snap.sweepQuota, key)
+			continue
+		}
+		if r.ExitIP != "" {
+			at := r.ExitIPAt
+			if at == 0 {
+				at = r.LastProbeAt
+			}
+			if now-at <= exitIPTTL {
+				snap.quotaIps[r.ExitIP] = true
+			}
+		}
+	}
+	return snap
+}
+
+// rankNode 是 rankLocked 的无锁版:同一公式,只读快照。ok=false 的两种情形
+// 与旧函数一致:节点不可用(dead/冷却中)、受限模型遇到非 B。
+func rankNode(sn snapNode, req PickRequest, snap *pickSnap, now int64) (ranked, bool) {
+	var zero ranked
+	_ = now
+	if sn.hasRow && sn.row.State == StateDead {
+		return zero, false
+	}
+	if !sn.coolOk {
+		return zero, false
+	}
+	gated := sn.hasRow && sn.row.Tier == TierB
 	if req.Restricted && !gated {
-		return nil
+		return zero, false
 	}
-	// 出口 IP 走信任窗口(exitIpOf):没有可用量测时按「独立 IP」处理,既不
-	// 参与归组也不参与配额扩散 —— 未知不是「和谁共享」。(src/health.js:972-974)
-	ip := h.exitIpOfLocked(node.Tag, now)
-	// 这个 IP 的负载 = 钉在它上面的会话数 + 正在它上面跑的请求数。两者都算:
-	// 前者是长期占用,后者是瞬时压力,配额和上游并发上限按 IP 计。
-	// (src/health.js:976-977)
+	ip := sn.exitIP
 	load := 0
 	if ip != "" {
-		load += busy[ip]
+		load += snap.busy[ip]
 	}
-	load += h.exitBusyCountLocked(ip, now)
-	// 被别的会话占着 → 降一级(不是禁用,只是排在空闲 IP 后面)。
+	load += snap.busyTbl[ip]
 	shared := 0
 	if load > 0 {
 		shared = 1
 	}
-	// 超过软上限 → 再降一级,整批排到最后。满载是「健康但排队」—— 不排除、
-	// 不记失败。(src/health.js:980-982)
 	saturated := 0
 	if load > exitSoftCap {
 		saturated = 1
 	}
-	// 刚撞过配额墙的降一级,同样只是排后面。按节点和按出口 IP 两种读法都算
-	// (理由见 quotaMarkedExitIps)。(src/health.js:983-985)
 	throttled := 0
-	if h.quotaMarkedLocked(node.Tag, now) || (ip != "" && quotaIps[ip]) {
+	if sn.quotaSelf || (ip != "" && snap.quotaIps[ip]) {
 		throttled = 1
 	}
-	// 订阅标签标的国家和实测出口国家对不上 → 降一级。同样是「排在对得上的
-	// 后面」,不是排除:标签本身就可能错,一个比特的怀疑换不掉一个出口。
-	// (src/health.js:986-988)
 	geo := 0
-	if hasRow && r.GeoMismatch {
+	if sn.hasRow && sn.row.GeoMismatch {
 		geo = 1
 	}
 	bucket := shared + saturated + throttled + geo
-	if hasRow && r.State == StateAlive {
-		// alive 从 0 起步;dead 已被 nodeUsable 过滤,这里只剩 unknown +1
+	if sn.hasRow && sn.row.State == StateAlive {
 	} else {
 		bucket += 1
 	}
 	if gated {
 		bucket -= 1
 	}
-	// 排序延迟:真实 TTFT 优先(≥3 个新鲜样本),否则退回探测延迟。两者都只做
-	// 同 bucket 内的相对比较,绝对值不进任何门槛。无任何数据时是哨兵值 ——
-	// 排最后,落盘时写 0。(src/health.js:990-994)
 	latency := int64(math.MaxInt64)
-	if tt, ok := h.ttftLatencyLocked(node.Tag, now); ok {
-		latency = tt
-	} else if hasRow {
-		// JS 的 `??` 只在缺失时回退,-1(dead 的 latencyMin)原样参战;Go 侧
-		// 0 是「没填」(markProbe/noteQuota 不会产出 0),按缺失回退。
-		if r.LatencyMin != 0 {
-			latency = r.LatencyMin
-		} else if r.LatencyMS != 0 {
-			latency = r.LatencyMS
+	if sn.hasTtft {
+		latency = sn.ttft
+	} else if sn.hasRow {
+		if sn.row.LatencyMin != 0 {
+			latency = sn.row.LatencyMin
+		} else if sn.row.LatencyMS != 0 {
+			latency = sn.row.LatencyMS
 		}
-		// **这是对 JS 的一处有意修正**:-1 在本项目里是「没有任何延迟数据」的
-		// 内部哨兵(noteQuota 给新行的 LatencyMS=-1、dead 行的 LatencyMin=-1),
-		// 而 JS 把它当一个可以参战的数字 —— cost = (load+1)×(-1) 是**负数**,
-		// 于是「一个测量都没做过的节点」在同 bucket 里稳赢所有有真实延迟的
-		// 节点,成为每个回合的首选。这里把 ≤0 归回哨兵语义:没有数据 = 排最后。
 		if latency <= 0 {
 			latency = orderSentinelCut + 1
 		}
 	}
-	// 同 bucket 内再按 (load+1)×latency 排:负载每多一条就把等效延迟放大一档,
-	// 于是「快而挤」会输给「略慢而空」。用乘法而不是先比负载,是为了不让一个
-	// 30ms 的热节点输给一个 900ms 的冷节点。(src/health.js:995-998)
 	var cost int64
 	if latency > orderSentinelCut {
-		cost = math.MaxInt64 // 哨兵:排序压底;先判后乘,避免溢出
+		cost = math.MaxInt64
 	} else {
 		cost = latency * int64(load+1)
 	}
-	// effectiveCountry(src/health.js:961-964):实测出口国(恰好 2 位)优先,
-	// 否则退回引擎给的池内国家上截 2 位。
 	country := ""
-	if hasRow && len(r.ExitCountry) == 2 {
-		country = r.ExitCountry
+	if sn.hasRow && len(sn.row.ExitCountry) == 2 {
+		country = sn.row.ExitCountry
 	}
 	if country == "" {
-		country = strings.ToUpper(node.Country)
+		country = strings.ToUpper(sn.country)
 		if len(country) > 2 {
 			country = country[:2]
 		}
 	}
-	return &ranked{
-		node:      node,
+	return ranked{
+		node:      PoolNode{Tag: sn.tag, Country: sn.country},
 		bucket:    bucket,
 		cost:      cost,
 		country:   country,
@@ -331,9 +463,39 @@ func (h *Health) rankLocked(node PoolNode, req PickRequest, busy map[string]int,
 		latency:   latency,
 		throttled: throttled == 1,
 		geo:       geo == 1,
-	}
+	}, true
 }
 
+// commitPickSweep 短写锁提交快照期的懒删。
+func (h *Health) commitPickSweep(snap *pickSnap) {
+	if len(snap.sweepCool)+len(snap.sweepBusy)+len(snap.sweepSticky)+len(snap.sweepQuota) == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := time.Now().UnixMilli()
+	for _, k := range snap.sweepSticky {
+		if hit, ok := h.sticky[k]; ok && now-hit.At > ttlOf(hit) {
+			delete(h.sticky, k)
+			delete(h.stickyFail, k)
+		}
+	}
+	for _, k := range snap.sweepQuota {
+		if r, ok := h.nodes[k]; !ok || !(r.LastQuotaAt > 0 && now-r.LastQuotaAt < quotaMark) {
+			delete(h.quotaTags, k)
+		}
+	}
+	for _, k := range snap.sweepCool {
+		if c, ok := h.cool[k]; ok && c.Until <= now {
+			delete(h.cool, k)
+		}
+	}
+	for _, ip := range snap.sweepBusy {
+		if r, ok := h.busy[ip]; ok && now-r.At > exitBusyStale {
+			delete(h.busy, ip)
+		}
+	}
+}
 // orderRowOf 把 ranked 压成落盘的 OrderRow:哨兵值在这里变 0 —— JS 写 null,
 // Go 的 int 写不了 null,0 读起来就是「没量到」,9223372036854775807 在面板上
 // 是个看不出含义的魔数(计划修正:不得写 MaxInt64)。
@@ -354,43 +516,6 @@ func orderRowOf(r *ranked, stickyNode string) tracelog.OrderRow {
 	} else {
 		out.Latency = r.latency
 		out.Cost = int(r.cost)
-	}
-	return out
-}
-
-// busyExitIpsLocked 当前被活会话钉住的出口 IP,以及各被钉了几个会话。
-// (src/health.js:873-903)
-// 为什么按 IP 计数:实测 191 个存活节点报出的 exitIp 塌缩成 96 个不同 IP,其中
-// 19 个被 2-7 个节点共用;纯按 bucket+latency 排会把每个新会话都灌进同几个快
-// IP —— 共享配额正是最先在那里跑光。计数而不是布尔:2 个会话钉着比 1 个更该
-// 让路。与 exitBusy 分开记,因为「这个会话钉在这里」是长期事实,「现在正压着
-// 一条请求」是瞬时事实,两者都算进负载但不能互相覆盖。
-func (h *Health) busyExitIpsLocked(ownSticky string) map[string]int {
-	out := map[string]int{}
-	now := time.Now().UnixMilli()
-	for session, hit := range h.sticky {
-		if now-hit.At > ttlOf(hit) {
-			// R20:过期行就地删掉。这张表按客户端可控的会话标识建键,而行过去只在
-			// 「同一个会话又被读到」时才作废 —— 于是每次 Pick 都要在独占锁下扫一遍
-			// 历史会话数,而表长只增不消。这次遍历本来就已经付了,顺手回收是免费的。
-			delete(h.sticky, session)
-			delete(h.stickyFail, session) // 同一把键的另一张表,一起放手
-			continue
-		}
-		// 调用方自己钉着的那个 tag 永不给自己降级(src/health.js:896)
-		if ownSticky != "" && hit.NodeKey == ownSticky {
-			continue
-		}
-		if !h.nodeUsableLocked(hit.NodeKey, now) {
-			continue
-		}
-		ip := hit.ExitIP
-		if ip == "" {
-			ip = h.exitIpOfLocked(hit.NodeKey, now)
-		}
-		if ip != "" {
-			out[ip]++
-		}
 	}
 	return out
 }

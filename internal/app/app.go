@@ -123,6 +123,9 @@ type Parts struct {
 	panelLn       net.Listener
 	forwardLn     net.Listener
 	cancel        context.CancelFunc
+	// cancelStop 是 lifeCtx 与调用方 ctx 之间桥接的 Stop 句柄:StartTimers 在
+	// lifeCtx 已存在时登记,Shutdown 时显式 Stop,不让调用方 ctx 一直持有回调。
+	cancelStop    func() bool
 	shutdownOnce  sync.Once
 	shutdownErr   error
 
@@ -158,6 +161,10 @@ type Parts struct {
 	hotNudge     chan struct{}
 	coldNudge    chan struct{}
 	firstNudge   chan struct{}
+	// coldCursor 是冷区轮换抽样的游标:每轮只扫 1/3 死节点,三轮一循环。
+	// 烂水池里 900 死节点每 10 分钟全扫一次是浪费,轮换后每节点仍每 30 分钟
+	// 被扫到一次(3 轮 × 10 分钟),复活延迟可接受。
+	coldCursor   atomic.Uint64
 	tierGate     *gate.Gate
 	tierBuckets  tierChains
 
@@ -165,7 +172,9 @@ type Parts struct {
 	rebuildMu       sync.Mutex
 	rebuilding      bool
 	rebuildQueued   bool
-	subFetchRetries int
+	// subFetchRetries 是订阅补偿重试计数:Rebuild 串行化保证同一时刻只有一轮
+	// 在跑,当前靠串行偶然安全;改 atomic 后任何未来并发 Rebuild 也不竞态。
+	subFetchRetries atomic.Int64
 
 	// applyMu 串行化 ApplySettings(候选-落盘-回滚必须原子,见 status.go)。
 	applyMu sync.Mutex
@@ -241,13 +250,13 @@ func defaultSettings() Settings {
 		ProbeEnabled:       true,
 		ProbeWorkers:       48,
 		ProbeIntervalMin:   30, // 1.2.x 遗留:运行时不再读取,见字段注释
-		RefreshIntervalMin: 30,
-		HotIntervalSec:     60,
-		ColdIntervalSec:    300,
+		RefreshIntervalMin: 15, // 烂水池:失效率快,补货频率跟上死亡频率
+		HotIntervalSec:     45, // 烂水池:活节点死得快,复检便宜(百节点秒级),高频保新鲜
+		ColdIntervalSec:    600, // 死节点 5 分钟内复活≈彩票,10 分钟扫一次省一半开销
 		EffortLevel:        effort.DefaultLevel,
 		DefaultMaxTokens:   nil,
 		MaxAttempts:        20,
-		MaxWallClockMS:     0,
+		MaxWallClockMS:     180000, // 单轮墙钟上限;0 = 不限(面板可改,存量显式 0 不受影响)
 		ForwardKey:         "",
 		ExitConcurrency:    0, // 不限;面板显式开启后才生效
 	}
@@ -638,7 +647,11 @@ func Load(root string) (*Parts, error) {
 			return
 		}
 		merged := reg.Merge(clean)
-		evicted := reg.EnforceCap(registry.PoolCap)
+		// 健康感知淘汰(与周期 Rebuild 同口径):开场时健康表刚 Load,rank 快照有效。
+		ranks := h.EvictRank()
+		evicted := reg.EnforceCapRanked(registry.PoolCap, func(tag string) int {
+			return ranks[tag]
+		})
 		for _, tag := range evicted {
 			// 池子外的节点不该留健康行:D-C1 —— Forget 掉,否则被淘汰者的行
 			// 永远留在 node-health.json(PruneStale 只在探测轮里跑,这里不补
@@ -800,6 +813,10 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	p.shutdownOnce.Do(func() {
+		if p.cancelStop != nil {
+			// 先断桥:调用方 ctx 不再持有 cancel 回调。
+			p.cancelStop()
+		}
 		if p.cancel != nil {
 			p.cancel()
 		}
@@ -827,21 +844,24 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 		}
 		// Flush before closing the host: an exit that is still in the registry
 		// must survive the restart even though its socket just went away.
+		// 顺序:registry 先、health 后 —— health 的行引用注册表的 tag,中间崩溃
+		// 时「health 有行、registry 没条目」比反过来更容易自愈(PruneStale 会清
+		// 掉无主行)。每项 10s 超时:磁盘 hanging 时退出也不 hanging。
 		flushes := []struct {
 			name string
 			fn   func() error
 		}{
-			{"health", func() error {
-				if p.Health == nil {
-					return nil
-				}
-				return p.Health.Persist()
-			}},
 			{"registry", func() error {
 				if p.Registry == nil {
 					return nil
 				}
 				return p.Registry.Flush()
+			}},
+			{"health", func() error {
+				if p.Health == nil {
+					return nil
+				}
+				return p.Health.Persist()
 			}},
 			{"settings", func() error {
 				if p.settingsStore == nil {
@@ -857,13 +877,34 @@ func (p *Parts) Shutdown(ctx context.Context) error {
 			}},
 		}
 		for _, f := range flushes {
-			if err := f.fn(); err != nil && p.shutdownErr == nil {
+			done := make(chan error, 1)
+			go func(fn func() error) { done <- fn() }(f.fn)
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(10 * time.Second):
+				err = fmt.Errorf("app: 关停时落盘 %s 超时(10s)", f.name)
+			}
+			if err != nil && p.shutdownErr == nil {
 				p.shutdownErr = fmt.Errorf("app: 关停时落盘 %s: %w", f.name, err)
 			}
 		}
 		if p.Host != nil {
-			if err := p.Host.Close(); err != nil && p.shutdownErr == nil {
-				p.shutdownErr = fmt.Errorf("app: 关停 sing-box: %w", err)
+			// R4:关 sing-box 同样给超时(30s)。box.Close 等在途连接收尾,
+			// 挂死的长连接会把它拖住 —— 落盘每项都有 10s 超时,唯独这里没有,
+			// 退出会被拖成僵尸。超时后进程照常退出(Shutdown 已做完落盘,无
+			// 数据可丢),超时的 Close 让它在后台收尾。
+			done := make(chan error, 1)
+			go func() { done <- p.Host.Close() }()
+			select {
+			case err := <-done:
+				if err != nil && p.shutdownErr == nil {
+					p.shutdownErr = fmt.Errorf("app: 关停 sing-box: %w", err)
+				}
+			case <-time.After(30 * time.Second):
+				if p.shutdownErr == nil {
+					p.shutdownErr = fmt.Errorf("app: 关停 sing-box 超时(30s),已放行退出")
+				}
 			}
 		}
 	})

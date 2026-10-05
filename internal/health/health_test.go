@@ -211,11 +211,23 @@ func TestPassStateMachineTwoTierThresholds(t *testing.T) {
 		t.Fatalf("复活后行 = %+v, want alive + streak 0", snap["n1"])
 	}
 	// 冷区满 3(delete 后行被删,节点回到「无行」)。
+	// n2 是首探判死建的行(NeverAlive):2 轮即删,第 3 次调时行已没了。
 	h.MarkProbe("n2", nodeprobe.ProbeResult{State: nodeprobe.StateDead, LatencyMS: 1})
-	h.MarkPassFail("n2", true)
-	h.MarkPassFail("n2", true)
+	if got := h.MarkPassFail("n2", true); got != "" {
+		t.Fatalf("从未活过第 1 败 = %q, want \"\"", got)
+	}
 	if got := h.MarkPassFail("n2", true); got != "delete" {
-		t.Fatalf("冷区 3 败 = %q, want delete", got)
+		t.Fatalf("从未活过第 2 败 = %q, want delete", got)
+	}
+	// 曾经活过的行仍是 3 轮:n3 先活一次再死,2 败不应删。
+	h.MarkProbe("n3", aliveRes(10, "9.9.9.9", "US"))
+	h.MarkProbe("n3", nodeprobe.ProbeResult{State: nodeprobe.StateDead, LatencyMS: 1})
+	h.MarkPassFail("n3", true)
+	if got := h.MarkPassFail("n3", true); got != "" {
+		t.Fatalf("活过第 2 败 = %q, want \"\"", got)
+	}
+	if got := h.MarkPassFail("n3", true); got != "delete" {
+		t.Fatalf("活过第 3 败 = %q, want delete", got)
 	}
 	if _, ok := h.NodeSnapshot()["n2"]; ok {
 		t.Fatal("delete 之后必须不留健康行(零记录,墓碑已退役)")

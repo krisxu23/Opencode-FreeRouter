@@ -213,8 +213,11 @@ func (r *Registry) Merge(outs []parse.Outbound) int {
 		// 过去这个分支不涨代数,而 Generation() 的注释宣称它是派生视图的
 		// 失效信号 —— 接线缓存的瞬间这就是一个错账。
 		existing.LastSeenAt = now
-		if parse.IdentityOf(existing.Outbound) != key {
+		if oldKey := parse.IdentityOf(existing.Outbound); oldKey != key {
 			r.generation++
+			// 旧身份让位:seen 建后永不删旧键的话,同批后出现的 tagB(旧身份
+			// 已空闲、本应入池)会被当别名误杀。更新前取值、更新后删旧。
+			delete(seen, oldKey)
 		}
 		existing.Outbound = o
 		existing.flat = nil
@@ -233,7 +236,17 @@ func (r *Registry) Merge(outs []parse.Outbound) int {
 // node-health.json 里(生命周期审计 D-C1/D-A2)。PruneStale 只在**探测轮**
 // 里跑,池子静默(订阅刷新淘汰而探测没跑)时没有任何回收点。
 // 容量不是节点的罪,驱逐**不立墓碑** —— 这些只是挤不下的,不是被判死的。
+//
+// rank 为 nil 时按加入时间(旧行为);非 nil 时按 rank 分(小先出,同分按
+// 加入时间,再同按 tag):调用方(app)传入健康状态映射,让「从没活过的死
+// 节点」先出、「活着/B 档」后出。registry 不 import health(分层),rank 由
+// 调用方在锁外算好传进来。
 func (r *Registry) EnforceCap(cap int) []string {
+	return r.EnforceCapRanked(cap, nil)
+}
+
+// EnforceCapRanked 是 EnforceCap 的健康感知版,见上。
+func (r *Registry) EnforceCapRanked(cap int, rank func(tag string) int) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.entries) <= cap {
@@ -247,7 +260,15 @@ func (r *Registry) EnforceCap(cap int) []string {
 	for tag, e := range r.entries {
 		all = append(all, kv{tag, e})
 	}
+	rankOf := func(tag string) int { return 0 }
+	if rank != nil {
+		rankOf = rank
+	}
 	sort.Slice(all, func(i, j int) bool {
+		ri, rj := rankOf(all[i].tag), rankOf(all[j].tag)
+		if ri != rj {
+			return ri < rj
+		}
 		if !all[i].e.AddedAt.Equal(all[j].e.AddedAt) {
 			return all[i].e.AddedAt.Before(all[j].e.AddedAt)
 		}

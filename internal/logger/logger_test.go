@@ -117,11 +117,16 @@ func TestRotationKeepsTheSizeWhenRenameFails(t *testing.T) {
 	}
 	Init(file)
 	// 白盒:直接推到轮转阈值,省掉 5MB 的落盘。
+	fileMu.Lock()
 	size = maxFileBytes
+	fileMu.Unlock()
 	Info("after a failed rotation")
 
-	if size <= maxFileBytes {
-		t.Fatalf("size = %d after a failed rotation, want > %d:轮转失败不能把记账归零,否则文件无界增长", size, maxFileBytes)
+	fileMu.Lock()
+	sz := size
+	fileMu.Unlock()
+	if sz <= maxFileBytes {
+		t.Fatalf("size = %d after a failed rotation, want > %d:轮转失败不能把记账归零,否则文件无界增长", sz, maxFileBytes)
 	}
 	b, err := os.ReadFile(file)
 	if err != nil {
@@ -138,11 +143,16 @@ func TestRotationResetsTheSizeOnSuccess(t *testing.T) {
 	file := filepath.Join(dir, "freerouter.log")
 	Init(file)
 	Info("first generation")
+	fileMu.Lock()
 	size = maxFileBytes
+	fileMu.Unlock()
 	Info("second generation")
 
-	if size > maxFileBytes {
-		t.Fatalf("size = %d, want <= %d(成功轮转后重新记账)", size, maxFileBytes)
+	fileMu.Lock()
+	sz := size
+	fileMu.Unlock()
+	if sz > maxFileBytes {
+		t.Fatalf("size = %d, want <= %d(成功轮转后重新记账)", sz, maxFileBytes)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "freerouter.old.log"))
 	if err != nil {
