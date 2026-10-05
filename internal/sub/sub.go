@@ -54,6 +54,13 @@ type Result struct {
 	FetchedAt int64            `json:"fetchedAt"`
 	Sources   []string         `json:"sources"`
 	Details   []Detail         `json:"details"`
+	// SourcesOK / SourcesTotal 是本次拉取成功/配置的**源**数（不是节点数）。
+	// 九审：调用方靠它区分「全员到齐」与「部分源失败」——差集删（成员资格
+	// 跟随订阅）只允许在前者执行；部分源失败时 present 只是残缺名单，拿它
+	// 判「不在任何源里」会把好节点整批下架（2026-10-05 实测一轮只拉到 1 个
+	// 源，present 仅 10 个 tag，4328 个节点含全部活节点被清场）。
+	SourcesOK    int `json:"sourcesOk"`
+	SourcesTotal int `json:"sourcesTotal"`
 }
 
 // Detail is the per-source fetch record the panel renders as the last line of
@@ -193,10 +200,12 @@ func Fetch(ctx context.Context, sources []string, exits []Exit) (Result, error) 
 	// 物理节点的判断是同一个，不会互相漂移。
 	merged := []parse.Outbound{}
 	seen := map[string]bool{}
+	sourcesOK := 0
 	for i := range list {
 		if raw[i] == nil {
 			continue
 		}
+		sourcesOK++
 		nodes := 0
 		for _, o := range raw[i] {
 			key := parse.IdentityOf(o)
@@ -221,6 +230,9 @@ func Fetch(ctx context.Context, sources []string, exits []Exit) (Result, error) 
 		FetchedAt: time.Now().UnixMilli(),
 		Sources:   list,
 		Details:   details,
+
+		SourcesOK:    sourcesOK,
+		SourcesTotal: len(list),
 	}, nil
 }
 

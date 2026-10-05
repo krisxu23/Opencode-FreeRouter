@@ -171,7 +171,7 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 	settings := p.settingsSnapshot()
 	before := p.Registry.Len()
 
-	picked, present, fetchErr, dropped := p.fetchSubscriptions(ctx, settings)
+	picked, present, fetchErr, dropped, sourcesOK, sourcesTotal := p.fetchSubscriptions(ctx, settings)
 	if fetchErr != nil {
 		p.noteSubFailure(ctx)
 	} else {
@@ -192,8 +192,15 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 			logger.Info("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（0 个）；注册表为空则以纯直连兜底模式启动")
 		}
 	} else {
-		// 成员资格跟随订阅:拉取成功后,不在任何源里的节点删干净。订阅下架
-		// 的节点平时只靠 coldPass 三振,关探测则永久残留占池位和探测预算。
+		// 成员资格跟随订阅:**全员到齐才允许差集删**。九审(2026-10-05):
+		// 部分源失败时 present 只是残缺名单,拿它判「不在任何源里=已下架」,
+		// 一轮「30 源只成 1 个」的拉取就把 4328 个节点(含全部活节点)清了
+		// 场——健康行一起 Forget,热区归零后 subExits 借不到出口复拉,下一
+		// 轮源更拉不到,恶性循环直到「几千节点零活」。下架判定必须建立在
+		// 「名单完整」之上;缺源这轮只合并,下架留给名单完整的一轮。
+		//
+		// 订阅下架的节点平时只靠 coldPass 三振,关探测则永久残留占池位和
+		// 探测预算 —— 所以不是干脆不删,而是**只在可信名单下删**。
 		//
 		// **先删、后 Merge** —— 与 boot 路径(app.go 的 629→649)逐字同序,
 		// 这个次序是承重的:Merge 按**身份**去重而差集删按 **tag** 判,订阅商
@@ -205,7 +212,7 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 		// 判据仍是对**过滤前**的原始源算 present:被用户地区选择滤掉的节点
 		// 仍在订阅里,不删 —— 与 boot 同口径。
 		pruned := 0
-		if present != nil {
+		if present != nil && sourcesOK == sourcesTotal {
 			for _, o := range p.Registry.All() {
 				if !present[o.Tag] {
 					if p.Registry.Remove(o.Tag) {
@@ -236,6 +243,11 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 		}
 		if err := p.Registry.Flush(); err != nil {
 			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
+		}
+		// 九审:部分源失败的合并轮要留下可诊断的痕迹,不然「池子没缩水但
+		// 名单残缺」这件事在日志里无影无踪。
+		if present != nil && sourcesOK != sourcesTotal {
+			logger.Warn(fmt.Sprintf("[app] 订阅部分源失败（%d/%d 个源成功）— 本轮只合并不下架,池内现有 %d 个", sourcesOK, sourcesTotal, p.Registry.Len()))
 		}
 		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，下架 %d），池内现有 %d 个", len(picked), added, pruned, p.Registry.Len()))
 	}
@@ -294,14 +306,16 @@ func (p *Parts) rebuildOnce(ctx context.Context) error {
 
 // fetchSubscriptions 拉取并筛选订阅。返回值:picked 是整形后的出站、fetchErr
 // 表示「一个源都没拉到」(要用缓存/历史节点;非 nil 才算失败)、dropped 是被
-// sing-box 拒收的节点数。
+// sing-box 拒收的节点数;sourcesOK/sourcesTotal 是成功/配置的**源**数 ——
+// 九审:差集删只在 sourcesOK == sourcesTotal(全员到齐)时执行,部分源失败
+// 时 present 残缺,只能合并不能下架。
 //
 // B11:从前这里回的是 bool,而 Rebuild 无论订阅成不成、出站热插有没有报错都
 // `return nil`。于是面板「刷新」永远 toast 成功、托盘 Reload 永远静默 ——
 // 哪怕订阅全军覆没。现在把失败原样交出去,由 Rebuild 聚合后上报。
-func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]parse.Outbound, map[string]bool, error, int) {
+func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]parse.Outbound, map[string]bool, error, int, int, int) {
 	if len(settings.SubURLs) == 0 {
-		return nil, nil, nil, 0
+		return nil, nil, nil, 0, 0, 0
 	}
 	exits := p.subExits()
 	budget, cancel := context.WithTimeout(ctx, subFetchBudget)
@@ -309,7 +323,7 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 	res, err := sub.Fetch(budget, settings.SubURLs, exits)
 	if err != nil {
 		logger.Warn(fmt.Sprintf("[app] 订阅失败，沿用 %d 个已知出口: %v", p.Registry.Len(), err))
-		return nil, nil, err, 0
+		return nil, nil, err, 0, 0, len(settings.SubURLs)
 	}
 	// present 是订阅原始全量的 tag 集(过滤前):差集删除的判据。被用户地区
 	// 选择过滤掉的节点仍在订阅里,不删 —— 与 boot 路径同口径。
@@ -317,6 +331,10 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 	for _, o := range res.Outbounds {
 		present[o.Tag] = true
 	}
+	// 九审:present 的可信度取决于源覆盖面。部分源失败时它只是残缺名单 ——
+	// 拿残缺名单判「不在任何源里=已下架」,一次网络抖动就会把整个池子清场
+	// (2026-10-05 实测:30 源只成 1 个,4328 节点含全部活节点被删,热区
+	// 归零后借不到出口复拉,恶性循环)。所以源成功数必须透传给调用方裁决。
 	picked := parse.FilterByGroups(res.Outbounds, settings.Countries)
 	clean := make([]parse.Outbound, 0, len(picked))
 	dropped := 0
@@ -328,7 +346,7 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 		}
 		clean = append(clean, sanitized)
 	}
-	return clean, present, nil, dropped
+	return clean, present, nil, dropped, res.SourcesOK, res.SourcesTotal
 }
 
 // openingSubscription 是 Load 第 6.5 步的 goroutine 体:开机后台拉一轮订阅,
@@ -351,7 +369,7 @@ func (p *Parts) openingSubscription(ctx context.Context, cur Settings) {
 		p.setRebuildResult(0, 0, 0, nil)
 		return
 	}
-	clean, present, ferr, dropped := p.fetchSubscriptions(ctx, cur)
+	clean, present, ferr, dropped, sourcesOK, sourcesTotal := p.fetchSubscriptions(ctx, cur)
 	if ferr != nil {
 		p.setRebuildResult(0, 0, 0, ferr)
 		return
@@ -359,11 +377,19 @@ func (p *Parts) openingSubscription(ctx context.Context, cur Settings) {
 	// 成员资格跟随订阅(1.3.0):拉取成功后,不在**任何源**里的节点
 	// 删干净(注册表 + 健康行,零记录)。删除判定对原始源算 —— 被
 	// 用户地区选择过滤掉的节点仍在订阅里,不删。
-	for _, o := range p.Registry.All() {
-		if !present[o.Tag] {
-			_ = p.Registry.Remove(o.Tag)
-			p.Health.Forget(o.Tag)
+	// 九审:与 rebuildOnce 同一条闸门 —— **全员到齐才允许差集删**。
+	// 部分源失败时 present 残缺,拿它判下架会一次清空整个池子
+	// (boot 轮清场比周期轮更狠:它没有任何「沿用历史」护栏以外的
+	// 恢复点,健康行一起没)。缺源这轮只合并。
+	if present != nil && sourcesOK == sourcesTotal {
+		for _, o := range p.Registry.All() {
+			if !present[o.Tag] {
+				_ = p.Registry.Remove(o.Tag)
+				p.Health.Forget(o.Tag)
+			}
 		}
+	} else if present != nil {
+		logger.Warn(fmt.Sprintf("[app] 开机订阅部分源失败（%d/%d 个源成功）— 本轮只合并不下架", sourcesOK, sourcesTotal))
 	}
 	// 落盘前复核 ctx(生命周期审计 #3):sub.Fetch 是网络等待,这期间 Load
 	// 可能已因端口占用而失败,fail() 会 cancel() 让 ctx 进入取消态。Fetch

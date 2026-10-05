@@ -86,6 +86,29 @@ func TestPartialFailureIsNotAnError(t *testing.T) {
 	if failed != 1 {
 		t.Fatalf("failed count = %d, want 1", failed)
 	}
+	// 九审(2026-10-05 清场事故):「整体成功」与「全员到齐」是两件事。上层的
+	// 差集删只敢在 SourcesOK == SourcesTotal 时执行 —— 这里钉住字段本身。
+	if res.SourcesOK != 1 || res.SourcesTotal != 2 {
+		t.Fatalf("sources = %d/%d, want 1/2(部分失败时上层必须能看到名单残缺)", res.SourcesOK, res.SourcesTotal)
+	}
+}
+
+func TestSourcesCountFullSuccess(t *testing.T) {
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(link(0)))
+	}))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(link(1)))
+	}))
+	defer b.Close()
+	res, err := Fetch(context.Background(), []string{a.URL, b.URL}, nil)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if res.SourcesOK != 2 || res.SourcesTotal != 2 {
+		t.Fatalf("sources = %d/%d, want 2/2(全成功才允许差集删)", res.SourcesOK, res.SourcesTotal)
+	}
 }
 
 func TestAllSourcesFailingIsAnError(t *testing.T) {

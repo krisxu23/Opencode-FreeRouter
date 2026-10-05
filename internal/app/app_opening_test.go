@@ -149,6 +149,51 @@ func TestOpeningSubscriptionMergesAndPrunes(t *testing.T) {
 	}
 }
 
+// TestOpeningSubscriptionPartialSourcesDoNotPrune 钉九审(2026-10-05 清场事故):
+// 30 个源只拉到 1 个时,present 只有 10 个 tag —— 旧代码照样差集删,4328 个
+// 节点含全部活节点被清场,热区归零后 subExits 借不到出口复拉,恶性循环到
+// 「几千节点零活」。开场轮是清场的重灾区(它没有任何「沿用历史」护栏以外的
+// 恢复点):部分源失败必须只合并不下架,且留 Warn 痕迹。
+func TestOpeningSubscriptionPartialSourcesDoNotPrune(t *testing.T) {
+	goodURL := subAndCatalogServer(t, vlink("nn1"), "{}", http.StatusOK)
+	closed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	closedURL := closed.URL
+	closed.Close() // 拒连源:直连与出口复拉都必败
+	p := newOpeningParts(t)
+	s := *p.Settings
+	s.SubURLs = []string{closedURL, goodURL}
+
+	p.openingSubscription(context.Background(), s)
+
+	if got := p.Registry.Len(); got != 3 {
+		t.Fatalf("registry = %d, want 3(部分源失败只合并:池内 n0/n1 保留 + nn1 新增,绝不清场)", got)
+	}
+	if !p.Registry.Has("n0") || !p.Registry.Has("n1") {
+		t.Fatal("残缺名单不得当差集判据:n0/n1 该原样保留")
+	}
+	if !p.Registry.Has("nn1") {
+		t.Fatal("成功源里的 nn1 该正常合并入池")
+	}
+}
+
+// TestOpeningSubscriptionFullSourcesPrune 补对照面:全员到齐时差集删照常执行
+// (成员资格跟随订阅的语义本身没错,错的是拿残缺名单执行它)。
+func TestOpeningSubscriptionFullSourcesPrune(t *testing.T) {
+	source := subAndCatalogServer(t, vlink("nn1"), "{}", http.StatusOK)
+	p := newOpeningParts(t)
+	s := *p.Settings
+	s.SubURLs = []string{source}
+
+	p.openingSubscription(context.Background(), s)
+
+	if got := p.Registry.Len(); got != 1 {
+		t.Fatalf("registry = %d, want 1(全源成功仍按下架语义整理)", got)
+	}
+	if !p.Registry.Has("nn1") || p.Registry.Has("n0") {
+		t.Fatal("全源成功时 n0/n1 该删净、nn1 该入池")
+	}
+}
+
 // TestRebuildQueuedEntryHonestUnderShutdown 钉八审 L11:关停窗口里撞上「已有
 // 一轮在跑」的调用方拿到的必须是普通错误 —— 面板/托盘把 errRebuildQueued 哨兵
 // 按「已受理,等补跑」处理,而 ctx 已取消意味着排队的一手注定被循环里的关停

@@ -766,6 +766,50 @@ func TestRebuildKeepsOldOutboundsWhenAllSubsFail(t *testing.T) {
 	}
 }
 
+// TestRebuildPartialSourcesDoNotPrune 钉九审(2026-10-05 清场事故)的周期轮面:
+// 部分源失败(这里 1 拒连 1 成功)时 present 只是残缺名单 —— 差集删必须跳过,
+// 池内节点原样保留、成功源的节点照常合并,并留 Warn 痕迹。旧代码一轮就把
+// 4328 个节点(含全部活节点)清场,热区归零后借不到出口复拉,恶性循环。
+func TestRebuildPartialSourcesDoNotPrune(t *testing.T) {
+	goodURL := subAndCatalogServer(t, vlink("nn1"), `{"data":[]}`, http.StatusOK)
+	closed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	closedURL := closed.URL
+	closed.Close()
+	p := newProbeParts(t, 3)
+	swallowTimers(p)
+	p.Settings.SubURLs = []string{closedURL, goodURL}
+	if err := p.Rebuild(context.Background()); err != nil {
+		t.Fatalf("部分源失败不算整体失败: %v", err)
+	}
+	if got := p.Registry.Len(); got != 4 {
+		t.Fatalf("registry len = %d, want 4(池内 3 保留 + nn1 新增;旧代码 3——残缺名单清场)", got)
+	}
+	for _, tag := range []string{"n0", "n1", "n2", "nn1"} {
+		if !p.Registry.Has(tag) {
+			t.Fatalf("%s 不在池里:残缺名单不得当差集判据", tag)
+		}
+	}
+}
+
+// TestRebuildFullSourcesPrune 补对照面:全员到齐时差集删照常执行 —— 部分
+// 源失败的宽限不改变「成员资格跟随订阅」的既有语义(单源全成功仍在
+// TestRebuildReplacesOutboundsInPlace 覆盖)。
+func TestRebuildFullSourcesPrune(t *testing.T) {
+	url := subAndCatalogServer(t, vlink("fresh-node"), `{"data":[]}`, http.StatusOK)
+	p := newProbeParts(t, 3)
+	swallowTimers(p)
+	p.Settings.SubURLs = []string{url}
+	if err := p.Rebuild(context.Background()); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := p.Registry.Len(); got != 1 {
+		t.Fatalf("registry len = %d, want 1(全源成功仍按下架语义整理)", got)
+	}
+	if !p.Registry.Has("fresh-node") || p.Registry.Has("n0") {
+		t.Fatal("全源成功时 n0 该删净、fresh-node 该入池")
+	}
+}
+
 func TestRebuildRetriesTwiceThenGivesUp(t *testing.T) {
 	p := newProbeParts(t, 1)
 	url := subAndCatalogServer(t, "boom", "boom", http.StatusInternalServerError)

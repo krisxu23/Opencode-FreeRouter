@@ -2,6 +2,36 @@
 
 本文记录审计过程中的事实更正与验证结果，纯文档、不随产品发版。
 
+## 2026-10-05：九审——v1.5.3「几千节点零活」根因与修复
+
+- **事故**：用户报告 v1.5.3 「几千个节点，一个有效节点都测不出来」。桌面实例证据：
+  node-health.json 全空、gateway.log 显示 23:20:22 一轮重建「合并 10 个出口
+  （新增 0，**下架 4328**）」，首探 3944 节点跑了一半被这轮清场，此后每轮
+  `probe round: 0/0 alive (热区为空)`，catalog 连续失败。
+- **根因链**：sub.Fetch 的契约是「至少一个源成功就算整体成功」（部分失败明细进
+  Details，不置错误）。rebuildOnce/openingSubscription 拿到 fetchErr=nil 后执行
+  差集删——`!present[o.Tag]` 判「不在任何源里=已下架」。当 30 个源只拉到 1 个
+  （池子刚被清空→subExits 借不到活出口+首探占带宽，恶性循环的起点），present
+  只有 10 个 tag，4328 个节点被 Registry.Remove + Health.Forget 连池带健康行清光
+  ——包括首探正在跑的 3944 个与刚通关的 53 个。热区归零→下轮 subExits 仍借不到
+  出口→更多源失败→**残缺名单→更大规模清场**的恶性循环。
+- **修复**：sub.Result 新增 SourcesOK/SourcesTotal（json sourcesOk/sourcesTotal，
+  缓存形状兼容——旧字段全保留）；fetchSubscriptions 签名扩为 6 返回值透传；
+  rebuildOnce 与 openingSubscription 的差集删都加同一道闸门
+  `sourcesOK == sourcesTotal`（**全员到齐才允许差集删**；缺源这轮只合并，
+  部分失败 Warn 留痕）。裁决要点：不是回到「池=历史并集」（订阅下架的节点靠
+  coldPass 三振，关探测则永久残留）——是**只在可信名单下删**。
+- **测试**：sub 层 TestPartialFailureIsNotAnNotAnError 补 SourcesOK/SourcesTotal
+  断言 + TestSourcesCountFullSuccess；app 层两路径各两测——
+  TestRebuildPartialSourcesDoNotPrune / TestRebuildFullSourcesPrune、
+  TestOpeningSubscriptionPartialSourcesDoNotPrune /
+  TestOpeningSubscriptionFullSourcesPrune（拒连源+好源双源夹具）。变异验证：
+  闸门旁路（`&& true`）→ 两个 Partial 测各红（rebuild 面 registry=1≠4、
+  opening 面 1≠3），还原绿。全量 27 包 go test ./... 绿。
+- **顺带核实无恙**：health.go MarkProbe 写行/EvictRank 分档/PruneStale、
+  probe.go firstProbePass 的 applyFirstProbeGuard、sub.go fetchOne 语义、
+  status.go 三循环节拍——清场不是探测层的锅，是成员资格管理的锅。
+
 ## 2026-10-05：v1.5.3 CI Go tests 红灯定位与加固
 
 - **事故形状**：f5e4d5a（1.5.3 主体）的 run 37325124629，gates 的 "Go tests" 步骤
