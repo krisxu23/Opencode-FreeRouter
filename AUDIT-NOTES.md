@@ -2,6 +2,28 @@
 
 本文记录审计过程中的事实更正与验证结果，纯文档、不随产品发版。
 
+## 2026-10-05：v1.5.3 CI Go tests 红灯定位与加固
+
+- **事故形状**：f5e4d5a（1.5.3 主体）的 run 37325124629，gates 的 "Go tests" 步骤
+  23 秒即红（exit 1），logs API 无 auth 拿不到正文。本地复现（go-test.mjs）只红
+  internal/app 的两个**固定默认端口**测试（TestLoadCreatesEveryStoreUnderRoot 直接
+  `Load(root)` 绑 3457/3458；TestLoadOnAnEmptyRootWritesSettingsDefaults 的
+  waitBindable 10s 后 Fatal）——当时网关实例在跑，属环境占用；CI 上没有实例，
+  但 run 37286524156（同代码前 6 小时）绿，说明是 runner 开机环境的随机性
+  （Hyper-V/winnat 动态排除段——该现象在 app_test.go 的 load() 注释里早有记录，
+  run 37094536832 是前科）。23s = app 测试二进制重链接 + 两个默认端口测试
+  当场红，与本地失败形状一致。
+- **加固**（只动 _test.go 与 CI，不进产品路径、不 bump 版本）：
+  waitBindable 超时从 t.Fatalf 改 **t.Skipf**（与 TestLoadFailureLeavesThePortFree
+  的 Skipf 同一先例——环境绑不上默认端口就如实跳过，不再挡发版）；
+  TestLoadCreatesEveryStoreUnderRoot 在「监听」类错误时退到 loadWithPorts
+  （一次性端口）继续验布局。模拟验证：占住 3457/3458 → 布局测 PASS、
+  默认值测/冲突测 SKIP、包 PASS；释放端口 → 全绿。
+- **CI 可观测性**：Go tests 步骤输出 Tee 到 go-tests-output.txt，失败时
+  upload-artifact 传出——公开仓库的 artifact 匿名可从 run 页面下载，
+  下次红灯不再瞎猜（本次 logs API 403 卡了一整天）。Tee-Object 传播
+  native 退出码已本地验证（exit 3 → 步骤红）。
+
 ## 2026-10-05：第八轮审查（针对 v1.5.2 的五路对抗审计）与 19 条修复
 
 五路只读审查（health/pick、app/rebuild、logger/tracelog/httpclient、

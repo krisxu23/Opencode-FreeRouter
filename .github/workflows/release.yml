@@ -153,8 +153,25 @@ jobs:
       - name: Layer + SPDX + vet
         run: node scripts/check-go.mjs
 
+      # 输出同时落盘：step 日志匿名拿不到（API 403），失败时下一步把它
+      # 传成 artifact——公开仓库的 artifact 匿名可从 run 页面下载，红灯
+      # 就不再靠猜（v1.5.3 的 run 37325124629 就是这样瞎了 24 小时）。
+      # pwsh 步骤 ErrorActionPreference=Stop 会把 native stderr 变终止性
+      # 错误，先放宽；退出码只认 $LASTEXITCODE（Tee-Object 恒成功）。
       - name: Go tests
-        run: node scripts/go-test.mjs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          node scripts/go-test.mjs 2>&1 | Tee-Object -FilePath go-tests-output.txt
+          exit $LASTEXITCODE
+
+      - name: Upload Go test output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-tests-output
+          path: go-tests-output.txt
+          if-no-files-found: warn
 
       - name: Build (console dev binary)
         run: node scripts/go-build.mjs
