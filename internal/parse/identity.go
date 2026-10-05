@@ -3,6 +3,7 @@
 package parse
 
 import (
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -184,6 +185,22 @@ func IsUnroutableServer(server string) bool {
 	}
 	if reLoopback127.MatchString(h) {
 		return true
+	}
+	// 兜底：字面量判据交给 net 标准库统一分类（第八轮 R5 中-1）。正则只认
+	// 点分十进制和「像 IPv6 的开头」，但 Go 拨号栈对**同一地址**还有一整族
+	// 合法写法：::ffff:7f00:1（=127.0.0.1）、::ffff:a9fe:0100
+	// （=169.254.169.254）、0:0:0:0:0:ffff:10.0.0.5 这类十六进制组 /
+	// 全展开前缀都能穿透上面的逐条判据 —— 一条恶意订阅就能拿网关当内网
+	// 触探器（消费方：订阅入池闸、sbx 最后一道闸、sub 重定向守卫）。
+	// ParseIP 只做字面量解析、不发 DNS（与「不做解析」的注释约定一致）。
+	// 位置刻意在 ::ffff: 递归**之前**：递归会把前缀剥成 "7f00:1" 这类
+	// 非法片段，兜底就再也看不到完整字面量了。公网字面量在这里已知不命中
+	// 却不能提前 return false —— 后面的 ::ffff:0.1.2.3 递归还背着 0.x/8 的
+	// 宽语义（reThisNet），这里只做并集、不收敛。
+	if ip := net.ParseIP(h); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			return true
+		}
 	}
 	// ::ffff: 前缀的 IPv4-mapped IPv6 写法是同一批地址的另一种拼法:剥掉前缀
 	// 后按 IPv4 的同一组判据重跑。过去只堵了 ::ffff:127.,::ffff:192.168.1.10

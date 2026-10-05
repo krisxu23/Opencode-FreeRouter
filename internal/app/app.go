@@ -40,7 +40,6 @@ import (
 	"freerouter/internal/sbx"
 	"freerouter/internal/stats"
 	"freerouter/internal/stream"
-	"freerouter/internal/sub"
 	"freerouter/internal/tracelog"
 	"freerouter/internal/upstream"
 )
@@ -591,99 +590,9 @@ func Load(root string) (*Parts, error) {
 		// 订阅地址与放行国家取**活值**:面板上保存的设置要能影响这一轮,而不是
 		// 开机那一瞬间的副本(B7)。监听端口不在此列 —— 端口已经绑定,改端口
 		// 必须重启,那是设计而不是遗漏。
-		cur := parts.settingsSnapshot()
-		subURLs := cur.SubURLs
-		if len(subURLs) == 0 {
-			logger.Info(fmt.Sprintf("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（%d 个）；注册表为空则以纯直连兜底模式启动", reg.Len()))
-			parts.setRebuildResult(0, 0, 0, nil)
-			return
-		}
-		exits := make([]sub.Exit, 0, reg.Len())
-		for _, o := range reg.All() {
-			d, derr := host.Dialer(o.Tag)
-			if derr != nil {
-				continue
-			}
-			exits = append(exits, sub.Exit{Name: o.Tag, Dial: d})
-		}
-		res, ferr := sub.Fetch(ctx, subURLs, exits)
-		if ferr != nil {
-			logger.Warn(fmt.Sprintf("[app] 订阅失败，沿用 %d 个已知出口: %v", reg.Len(), ferr))
-			parts.setRebuildResult(0, 0, 0, ferr)
-			return
-		}
-		picked := parse.FilterByGroups(res.Outbounds, cur.Countries)
-		clean := make([]parse.Outbound, 0, len(picked))
-		for _, o := range picked {
-			if ok, keep := parse.SanitizeOutbound(o); keep {
-				clean = append(clean, ok)
-			}
-		}
-		// 成员资格跟随订阅(1.3.0):拉取成功后,不在**任何源**里的节点
-		// 删干净(注册表 + 健康行,零记录)。删除判定对原始源算 —— 被
-		// 用户地区选择过滤掉的节点仍在订阅里,不删。
-		present := make(map[string]bool, len(res.Outbounds))
-		for _, o := range res.Outbounds {
-			present[o.Tag] = true
-		}
-		for _, o := range reg.All() {
-			if !present[o.Tag] {
-				_ = reg.Remove(o.Tag)
-				h.Forget(o.Tag)
-			}
-		}
-		// 订阅里被 sing-box 拒收的节点数(非法 uuid / 不认的 cipher / 未知传输)。
-		// 前端拿它显示「剔除 N 个坏节点」,不传过去那条告警就永远不出现。
-		dropped := len(picked) - len(clean)
-		// 落盘前复核 ctx(生命周期审计 #3):sub.Fetch 是网络等待,这期间 Load
-		// 可能已因端口占用而失败,fail() 会 cancel() 让 ctx 进入取消态。Fetch
-		// 在取消前恰好成功返回时,旧的写法照样往下走 —— reg.Flush 会把这一轮
-		// 订阅结果写进注册表文件,而进程随即退出:一次**从未成功启动**的运行
-		// 在磁盘上留下了注册表,下次开机继承它。joinBoot 只保证「返回之后不再
-		// 写」,管不了「失败之后仍在写」。取消的一轮什么都不写:池子原样留给
-		// 下一次真正的开机。
-		if ctx.Err() != nil {
-			logger.Info("[app] 开机订阅已完成拉取但启动已中止 — 本轮不写注册表,池子保持磁盘现状")
-			return
-		}
-		merged := reg.Merge(clean)
-		// 健康感知淘汰(与周期 Rebuild 同口径):开场时健康表刚 Load,rank 快照有效。
-		// 查不到行的新 tag 显式给中间档 3(与 rebuild.go 同一裁决,理由见彼处注释)。
-		ranks := h.EvictRank()
-		evicted := reg.EnforceCapRanked(registry.PoolCap, func(tag string) int {
-			if v, ok := ranks[tag]; ok {
-				return v
-			}
-			return 3
-		})
-		for _, tag := range evicted {
-			// 池子外的节点不该留健康行:D-C1 —— Forget 掉,否则被淘汰者的行
-			// 永远留在 node-health.json(PruneStale 只在探测轮里跑,这里不补
-			// 就没有回收点)。
-			parts.Health.Forget(tag)
-		}
-		if err := reg.Flush(); err != nil {
-			logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
-		}
-		syncAdded, syncRemoved, serr := host.SyncOutbounds(reg.All())
-		if serr == nil && (syncAdded != 0 || syncRemoved != 0) {
-			// 出站换了代:旧代 client 里绑的是上一代的拨号闭包(O3)。零增删
-			// 的 sync 是纯 no-op(SyncOutbounds 对已存在的 tag 不 Remove 不
-			// 重建,旧 client 的拨号闭包依然有效),换代只会白扔全部出口的
-			// 温热连接池 —— 与 noteEgressChanged 注释声明的语义一致。
-			parts.noteEgressChanged()
-		}
-		if dropped > 0 {
-			logger.Warn(fmt.Sprintf("[app] 订阅里有 %d 个节点 sing-box 无法使用（非法 uuid / 不认的 cipher / 未知传输），未入池", dropped))
-		}
-		if serr != nil {
-			logger.Warn(fmt.Sprintf("[app] 热插出站失败: %v", serr))
-			parts.setRebuildResult(syncAdded, syncRemoved, dropped, serr)
-			return
-		}
-		parts.setRebuildResult(syncAdded, syncRemoved, dropped, nil)
-		logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，淘汰 %d），池内现有 %d 个（热插 %d，撤下 %d）",
-			len(clean), merged, len(evicted), reg.Len(), syncAdded, syncRemoved))
+		// 八审 M8:goroutine 体抽成 openingSubscription,拉取段与周期轮同走
+		// fetchSubscriptions(180s 预算 + 只借活出口 + 过滤逻辑单份)。
+		parts.openingSubscription(ctx, parts.settingsSnapshot())
 	}()
 
 	// 7. the forward listener, last: the port may only open once it can serve.

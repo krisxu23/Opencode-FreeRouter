@@ -39,7 +39,7 @@ type WireTool interface {
 // 两种形状都要认:[]any 是 JSON 解码出来的形状,也是本包测试用的形状;而
 // adapter.build 直接往 map[string]any 的请求体里放的是 []messages.ToolDef
 // —— 一个具体切片类型,对 []any 的类型断言永远不成立。旧代码就卡在这一步:
-// hadClientTools 恒为 false,于是 chat/messages 线把 tool_choice 强写成
+// hadClientTools 恒为 false,于是 chat 线把 tool_choice 强写成
 // "none",并把调用方的工具整份换成两个诱饵 —— function calling 从请求侧就
 // 死掉了。upstream 不能 import messages,所以摊平用反射完成。
 func toolListOf(raw any) []any {
@@ -151,13 +151,16 @@ func falsy(v any) bool {
 //
 // body 就地修改。请求体一律 map[string]any + encoding/json 而不是 Go 结构体:
 // 三条上游线路字段面完全不同且随上游演进,透传未知字段必须保持自动,否则
-// 每加一个上游字段就要改一次 Go 类型。flat=true 是 Responses 形状({name}),
-// false 是 chat 形状({function:{name}})。
+// 每加一个上游字段就要改一次 Go 类型。诱饵形状按 wire 分派:WireResponses
+// 是 Responses 形状({name}),WireChat 是 chat 形状({function:{name}}),
+// WireMessages 是 Anthropic 形状({name, input_schema} —— 第八轮 R4 中-2:
+// 旧实现只有 flat 二态,messages 线拿到的是 chat 形状诱饵 + 字符串
+// tool_choice,全靠上游宽容才没炸)。
 //
 // body["tools"] 的条目可能是 map 形状(解码出来的、测试用的),也可能是
 // messages.ToolDef 这类结构体(adapter 的真实投影):两者都由 toolListOf 认,
 // 名字都由 toolNameOf 读 —— 只认其中一种形状会让闸门静默失效。
-func ApplyFingerprint(body map[string]any, flat bool) map[string]string {
+func ApplyFingerprint(body map[string]any, wire Wire) map[string]string {
 	renames := map[string]string{}
 	if body == nil {
 		return renames
@@ -187,21 +190,30 @@ func ApplyFingerprint(body map[string]any, flat bool) map[string]string {
 		}
 	}
 
-	// 缺名补诱饵:形状与 description 逐字照抄 src/upstream.js:350-352。
+	// 缺名补诱饵:形状与 description 逐字照抄 src/upstream.js:350-352,再按
+	// wire 分派字段面(messages 线的 {name, input_schema} 与
+	// messages.ToolStyleClaude 投影的调用方工具同形)。
 	for _, name := range RequiredTools {
 		if seen[name] {
 			continue
 		}
 		description := "This tool is currently unavailable and must not be used."
 		parameters := map[string]any{"type": "object", "properties": map[string]any{}}
-		if flat {
+		switch wire {
+		case WireResponses:
 			out = append(out, map[string]any{
 				"type":        "function",
 				"name":        name,
 				"description": description,
 				"parameters":  parameters,
 			})
-		} else {
+		case WireMessages:
+			out = append(out, map[string]any{
+				"name":         name,
+				"description":  description,
+				"input_schema": parameters,
+			})
+		default: // WireChat
 			out = append(out, map[string]any{
 				"type": "function",
 				"function": map[string]any{
@@ -215,10 +227,18 @@ func ApplyFingerprint(body map[string]any, flat bool) map[string]string {
 
 	body["tools"] = out
 	if falsy(body["tool_choice"]) {
-		if flat {
+		switch wire {
+		case WireResponses:
 			body["tool_choice"] = "auto"
-		} else if !hadClientTools {
-			body["tool_choice"] = "none"
+		case WireMessages:
+			// Anthropic 形状的 tool_choice 是 {"type":…} 对象,没有字符串
+			// 形状;"none" 类型在 Anthropic 规范里也不存在,写什么都是赌。
+			// 这里选择不设 —— 与 responses 线的 "auto" 同为放行语义,不调
+			// 诱饵靠 description("must not be used")把关。
+		default: // WireChat
+			if !hadClientTools {
+				body["tool_choice"] = "none"
+			}
 		}
 	}
 	return renames

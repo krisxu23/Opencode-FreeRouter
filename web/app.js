@@ -917,7 +917,9 @@
         + '<div>回退链里有 <b>' + dead.length + '</b> 个地区当前没有可用节点（'
         + dead.map(function (id) {
           const b = BUCKETS.filter(function (x) { return x.id === id })[0]
-          return b ? b.name : id
+          /* esc(id)：与上面回退链同一防御纵深 —— id 能从手改的 settings.json
+             回流,BUCKETS 命中时取静态名,兜底展示的原始 id 必须过 esc */
+          return b ? b.name : esc(id)
         }).join('、')
         + '）——命中它们会直接跳到下一个地区。可以保留，节点是动态的，下一轮探测可能就有。</div></div>'
       : '')
@@ -967,8 +969,8 @@
     + '  <div class="card sec"><div class="card-head"><h2>危险操作</h2></div>'
     + '    <div class="card-body inline">'
     + '      <button class="btn btn-danger" id="btnProbeForce">立即探测一轮</button>'
-    + '      <span class="dim" style="font-size:12px">跳过结果缓存，立刻重新扫一遍全部节点。'
-    + '      只认节点当前的存活与层级记录，不清空它们——没有「重置」语义。</span>'
+    + '      <span class="dim" style="font-size:12px">与概览/节点页的「立即探测」是同一个动作（触发一轮热区复检 + 冷区扫描）。'
+    + '      探测没有结果缓存，每一轮都是现场重扫；只认节点当前的存活与层级记录，不清空它们——没有「重置」语义。</span>'
     + '    </div></div>'
     + '</div>'
   }

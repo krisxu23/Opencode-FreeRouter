@@ -26,6 +26,11 @@ type Dialer = func(ctx context.Context, network, addr string) (net.Conn, error)
 // SERVER 兜底 —— 那样一个卡死的上游会被当成供应商故障而不是出口故障。
 var ErrIdleTimeout = stderrors.New("httpclient: stream idle past its deadline")
 
+// defaultStreamIdle 是 NewStreamClient 对 idle<=0 的钳制值,与 app 侧的
+// streamIdleTimeout(300s)同值 —— 语义就是「流式默认空闲窗」,不要在此
+// 引出第二个事实源:改 app 的常量时必须一起动这里。
+const defaultStreamIdle = 5 * time.Minute
+
 // transport 建出两个客户端共用的手工 Transport。手工而不是克隆
 // http.DefaultTransport 的理由见 NewClient 的注释。
 func transport(d Dialer) *http.Transport {
@@ -90,6 +95,12 @@ func NewOneShotClient(d Dialer, timeout time.Duration) *http.Client {
 // （原实现 app.go 传 20s）。所以这里把 Timeout 留 0，改由响应体包装器在每次
 // Read 返回后重置一枚 time.Timer 来实现空闲截止。
 func NewStreamClient(d Dialer, idle time.Duration) *http.Client {
+	// idle<=0 的旧形状是「头阶段截止与 body 空闲截止双双静默关闭」——
+	// 一个只收不发头的上游重新挂到天荒(第八轮 R3 低-1)。生产唯一调用方
+	// 传的是 app 的 streamIdleTimeout(300s),这里钳到同值,拒绝退化为无界。
+	if idle <= 0 {
+		idle = defaultStreamIdle
+	}
 	c := &http.Client{Transport: transport(d)}
 	c.Transport = &idleTransport{base: c.Transport, idle: idle}
 	return c
@@ -113,23 +124,14 @@ func (t *idleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// 一返回就 defer cancel 会把刚拿到的 body 立刻取消掉（实测症状是
 	// "context canceled"）。所以正常路径把它交给 idleReader，由 Close 释放。
 	ctx, cancel := context.WithCancel(req.Context())
-	var headerExpired atomic.Bool
-	var headerTimer *time.Timer
-	if t.idle > 0 {
-		headerTimer = time.AfterFunc(t.idle, func() {
-			headerExpired.Store(true)
-			cancel()
-		})
-	}
+	guard := newHeaderGuard(t.idle, cancel)
 	resp, err := t.base.RoundTrip(req.WithContext(ctx))
-	if headerTimer != nil {
-		headerTimer.Stop()
-	}
-	if err == nil && headerExpired.Load() {
-		// 头在 idle 截止的同一 tick 到达:Stop 返回 false,回调已把 ctx
-		// cancel —— 不在这里拦,body 的每次 Read 都会死在 "context canceled",
-		// 被 adapter 归成 EMPTY/SERVER 而不是 TIMEOUT(不进 cooldownOn,
-		// 坏出口不冷却)。与 exchange 侧「空闲截止先于 ctx 检查」同一裁决。
+	guard.settle()
+	if err == nil && guard.triggered() {
+		// 头在 idle 截止的同一 tick 到达:回调已把 ctx cancel —— 不在这里
+		// 拦,body 的每次 Read 都会死在 "context canceled",被 adapter 归成
+		// EMPTY/SERVER 而不是 TIMEOUT(不进 cooldownOn,坏出口不冷却)。与
+		// exchange 侧「空闲截止先于 ctx 检查」同一裁决。
 		cancel()
 		return nil, ErrIdleTimeout
 	}
@@ -138,7 +140,7 @@ func (t *idleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// 头阶段的超时在底层看起来是 context canceled（我们自己取消的），
 		// 对调用方要的是同一个空闲超时语义 —— 否则它会被归成「客户端中止」
 		// 而不是可重试的 TIMEOUT。
-		if headerExpired.Load() {
+		if guard.triggered() {
 			return nil, ErrIdleTimeout
 		}
 		return resp, err
@@ -149,6 +151,47 @@ func (t *idleTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		cancel()
 	}
 	return resp, nil
+}
+
+// headerGuard 把「头阶段截止」封装成可等价:计时器触发时回调先 cancel 请求
+// context、再落 expired 标志、最后关 done(顺序刻意:回归测试用一枚阻塞的
+// cancel 就能把回调钉在「已触发、未落定」的位置上)。**settle 是关键** —— 计时器的
+// Stop() 返回 false 只保证回调已被触发(runtime 已把它排进 goroutine 队列),
+// 不保证它已执行到 expired.Store(true):旧形状在这里直接读标志,晚到的回调
+// 随后才 cancel() ⇒ 流在 body 阶段死于裸 "context canceled",被归成
+// EMPTY/SERVER 而非 ErrIdleTimeout(不冷却)。settle 在 Stop=false 时等回调
+// 收尾再返回,expired 的读数因此是最终值(第八轮 R3 中-2;窗口极窄,短 idle
+// 的测试与高负载下概率放大)。
+type headerGuard struct {
+	expired atomic.Bool
+	done    chan struct{}
+	timer   *time.Timer
+}
+
+func newHeaderGuard(idle time.Duration, cancel context.CancelFunc) *headerGuard {
+	g := &headerGuard{done: make(chan struct{})}
+	if idle > 0 {
+		g.timer = time.AfterFunc(idle, func() {
+			cancel()
+			g.expired.Store(true)
+			close(g.done)
+		})
+	}
+	return g
+}
+
+// settle 停掉头阶段计时器;若它已触发,等回调执行完再返回。
+func (g *headerGuard) settle() {
+	if g == nil || g.timer == nil {
+		return
+	}
+	if !g.timer.Stop() {
+		<-g.done
+	}
+}
+
+func (g *headerGuard) triggered() bool {
+	return g != nil && g.expired.Load()
 }
 
 // idleReader 是「每读到数据就续期」的响应体。计时器在两次 Read 之间跑，超时

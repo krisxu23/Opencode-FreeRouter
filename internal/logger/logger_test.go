@@ -327,3 +327,65 @@ func countFileLines(t *testing.T, file string) int {
 	}
 	return strings.Count(string(b), "\n")
 }
+
+// TestWriteFailureWarnsInsteadOfGoingSilent 钉第八轮 R3 中-3:open 成功而写
+// 失败(盘满对既有文件/坏盘)时 n=0、size 停滞 —— 轮转与封顶机制都推不到,
+// 若无告警,文件日志的死是无声的(第七轮补的 lastOpenWarn 只覆盖 open 那半)。
+// 契约:写失败必须打一行 Warn 进 ring(一小时节流),size 不得虚涨。
+func TestWriteFailureWarnsInsteadOfGoingSilent(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "freerouter.log")
+	Init(file)
+	Info("baseline line lands on disk")
+
+	errDiskFull := os.ErrInvalid // 任意非 nil 错误即可,文案自证来源
+	orig := writeLine
+	writeLine = func(*os.File, string) (int, error) { return 0, errDiskFull }
+	defer func() { writeLine = orig }()
+
+	mu.RLock()
+	warnsBefore := 0
+	for _, l := range ring {
+		if strings.Contains(l.Msg, "写日志文件失败") {
+			warnsBefore++
+		}
+	}
+	mu.RUnlock()
+
+	Info("first doomed write")
+	Info("second doomed write") // 节流:一小时内只告警一次
+
+	mu.RLock()
+	warns := 0
+	var firstWarn string
+	for _, l := range ring {
+		if strings.Contains(l.Msg, "写日志文件失败") {
+			warns++
+			if firstWarn == "" {
+				firstWarn = l.Msg
+			}
+		}
+	}
+	sz := size
+	mu.RUnlock()
+
+	if warns != warnsBefore+1 {
+		t.Fatalf("写失败告警条数 = %d(warnsBefore=%d), want 恰好 +1(一小时节流)", warns, warnsBefore)
+	}
+	if !strings.Contains(firstWarn, "size=55") {
+		t.Fatalf("告警应报告 size 停滞(0), got: %s", firstWarn)
+	}
+	if sz != 55 {
+		t.Fatalf("size = %d, want 55:写失败的行不得入账(否则封顶口径虚高)", sz)
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(b), "doomed") {
+		t.Fatalf("失败的写不得半落盘:\n%s", b)
+	}
+	if !strings.Contains(string(b), "baseline line") {
+		t.Fatalf("写失败路径不得扰动既有文件:\n%s", b)
+	}
+}

@@ -406,7 +406,7 @@ func TestStaleReasoningIsStrippedAndReplayed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	renames := upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
+	renames := upstream.ApplyFingerprint(body, a.deps.Wire)
 	body["previous_response_id"] = "resp_stale"
 	input, _ := body["input"].([]any)
 	body["input"] = append(input, map[string]any{"type": "reasoning", "summary": []any{}})
@@ -1147,7 +1147,7 @@ func TestReplayIdleTimeoutIsATimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	renames := upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
+	renames := upstream.ApplyFingerprint(body, a.deps.Wire)
 	body["previous_response_id"] = "resp_stale"
 	input, _ := body["input"].([]any)
 	body["input"] = append(input, map[string]any{"type": "reasoning", "summary": []any{}})
@@ -1485,5 +1485,83 @@ func TestNonStreamingJSONCarriesFinishReason(t *testing.T) {
 	}
 	if res.Finish != "length" {
 		t.Fatalf("finish = %q, want length(整包的 finish_reason 必须折进 Result)", res.Finish)
+	}
+}
+
+// TestMidStreamSSEReadFailureIsTransport 钉第八轮 R4 中-1:2xx SSE 流在**中段**
+// 断掉(Content-Length 声明了更多字节),旧形状把 stream.ReadSSE 的裸读错误
+// 原样上交,掉进引擎的 SERVER 兜底 —— 可重试但永不冷却,裸错串直进流内
+// error 帧;同一事实在响应头阶段(bodyReadFailure)= TRANSPORT(换出口+冷却)。
+// 修复后流中段读故障经 stream.ReadError 包装进 bodyReadFailure,两条路径对齐。
+func TestMidStreamSSEReadFailureIsTransport(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", "4000") // 声明比实际多:客户端读 body 以 unexpected EOF 收场
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newAdapter(srv.URL, srv.Client(), "big-pickle")
+	_, err := a.Complete(context.Background(), Request{
+		Messages: []messages.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}, collect(&strings.Builder{}))
+	if code := errors.CodeOf(err); code != check.CodeTransport {
+		t.Fatalf("code = %q, want %q(流中段断连不是「供应商故障」,该冷却该换出口)", code, check.CodeTransport)
+	}
+	if failure, ok := err.(errors.Failure); !ok || !failure.Retryable {
+		t.Fatalf("err = %#v, want Retryable", err)
+	}
+}
+
+// TestReplayKeepsOriginalReadError 钉第八轮 R4 低-2:原始 400 的**读错误**必须
+// 进重放的回落分类 —— 旧形状在 replay 里走裸 errors.Classify 把 readErr 丢了,
+// 「截断的 400 + 重放又连不上」被判成不可重试、不冷却的类别;而同一事实在
+// 非重放路径(exchange 直 receive classifyErrorBody)是 TRANSPORT。
+func TestReplayKeepsOriginalReadError(t *testing.T) {
+	var mu sync.Mutex
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n++
+		first := n == 1
+		mu.Unlock()
+		if first {
+			// 截断的 400:声明比实际长的 Content-Length,读 body 报 unexpected EOF。
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", "200")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"Reasoning item rs_9 not found"}}`)
+			return
+		}
+		// 重放那一发:连头都不发就断连 —— Client.Do 的传输失败分支。
+		if conn, _, herr := http.NewResponseController(w).Hijack(); herr == nil {
+			conn.Close()
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	a := newAdapter(srv.URL, srv.Client(), "muse-spark-1.3-contributor-free")
+	req := Request{Messages: []messages.Message{{Role: "user", Content: "hi"}}, Stream: true}
+	body, err := a.build(req)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	renames := upstream.ApplyFingerprint(body, a.deps.Wire)
+	body["previous_response_id"] = "resp_stale"
+	input, _ := body["input"].([]any)
+	body["input"] = append(input, map[string]any{"type": "reasoning", "summary": []any{}})
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	tu := &turn{req: req, body: body, payload: payload, renames: renames, t0: time.Now()}
+	_, err = a.exchange(context.Background(), tu, newSink(collect(&strings.Builder{}), renames))
+	if code := errors.CodeOf(err); code != check.CodeTransport {
+		t.Fatalf("code = %q, want %q(截断 400 + 重放传输失败:原始读错误参与分类)", code, check.CodeTransport)
+	}
+	if failure, ok := err.(errors.Failure); !ok || !failure.Retryable {
+		t.Fatalf("err = %#v, want Retryable", err)
 	}
 }

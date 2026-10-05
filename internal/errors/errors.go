@@ -180,7 +180,11 @@ const (
 
 func RetryAfter(h string) int64 {
 	secs, err := strconv.ParseFloat(h, 64)
-	if err != nil || secs <= 0 {
+	// NaN 判据(secs != secs):ParseFloat("NaN") 不报错,NaN 过掉 <=0 和
+	// >=max 两个比较(NaN 对一切比较都是 false),int64(NaN*1000) 在 amd64
+	// 上是最小负数 —— 一个 "Retry-After: NaN" 会把出口冷却成负值,比 1e18
+	// 那个「实质永久」更离谱(八审 L1)。
+	if err != nil || secs != secs || secs <= 0 {
 		return 0
 	}
 	if secs >= retryAfterMaxSecs {

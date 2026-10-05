@@ -1468,3 +1468,69 @@ func TestRawJSONOfRejectsInvalidJSONText(t *testing.T) {
 		t.Fatalf("nil 应退 {}: %q", got)
 	}
 }
+
+// TestClientGoneIsAbortedNotServer 钉第八轮 R5 低-2:正文 emit 失败(onChunk
+// 回调错误 = 客户端断开的替身)必须与 usage/finish 帧的显式分支同判 Aborted。
+// 旧形状把裸回调错误兜底成 SERVER:Try 记成供应商故障、进 retryOn,首字节前
+// 断开会让分支 A 白烧一整轮换出口重试。
+func TestClientGoneIsAbortedNotServer(t *testing.T) {
+	f := newFixture(t, func(n int) (int, string, string) {
+		return 200, "text/event-stream", sseChat("ok")
+	})
+	seedAliveIPs(f.h)
+	_, err := f.eng.Complete(context.Background(), simpleReq("big-pickle", "u1"), failAtText())
+	// 首个 text 增量先 fold(sawContent=true)再回调:断流走 Outcome.Error 通道。
+	if err != nil {
+		t.Fatalf("断流应进 Outcome.Error: %v", err)
+	}
+	tries := f.routesN()[0].Tries
+	if len(tries) != 1 {
+		t.Fatalf("emit 失败不得轮换:Tries = %d 条", len(tries))
+	}
+	if tries[0].Code != check.CodeAborted {
+		t.Fatalf("Try.Code = %q, want %q(客户端断开不是供应商故障)", tries[0].Code, check.CodeAborted)
+	}
+	assertAllBusyZero(t, f)
+}
+
+// TestClassifyAttemptErrorEmitGone 钉分类函数本身:emitError → Aborted 且文案
+// 与 usage/finish 显式分支同形;其余裸错误保持 SERVER 兜底(js 对齐)不变。
+func TestClassifyAttemptErrorEmitGone(t *testing.T) {
+	f := classifyAttemptError(&emitError{err: fmt.Errorf("write: broken pipe")})
+	if f.Code != check.CodeAborted {
+		t.Fatalf("code = %q, want %q", f.Code, check.CodeAborted)
+	}
+	if f.Message != "client gone: write: broken pipe" {
+		t.Fatalf("message = %q, want %q", f.Message, "client gone: write: broken pipe")
+	}
+	other := classifyAttemptError(fmt.Errorf("mystery"))
+	if other.Code != check.CodeServer {
+		t.Fatalf("非 emit 裸错误应保持 SERVER 兜底,得到 %q", other.Code)
+	}
+}
+
+// TestFoldChunksBlockEndFillsLateName 钉第八轮 R4 低-2(非流式半边):先参后名
+// 的反常帧序下,block-end 是名字的唯一携带帧 —— 按 ID 命中已有条目后必须补上
+// 空位,不能整帧吞(条目 Name 恒空,客户端拿到无法执行的调用)。
+func TestFoldChunksBlockEndFillsLateName(t *testing.T) {
+	var out Outcome
+	foldChunks(ToolCallDeltaChunk(0, "c1", "", `{"q"`), &out)
+	foldChunks(ToolCallDeltaChunk(0, "c1", "", `:"x"}`), &out)
+	foldChunks(ToolCallBlockEndChunk(0, "c1", "search", `{"q":"x"}`), &out)
+	materializeToolCalls(&out) // 增量期 Arguments 滞后于 argsSB,读前物化
+	if len(out.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls = %d 条, want 1", len(out.ToolCalls))
+	}
+	if out.ToolCalls[0].Name != "search" {
+		t.Fatalf("Name = %q, want search(晚到名字被吞)", out.ToolCalls[0].Name)
+	}
+	if out.ToolCalls[0].Arguments != `{"q":"x"}` {
+		t.Fatalf("Arguments = %q, want {\"q\":\"x\"}", out.ToolCalls[0].Arguments)
+	}
+	// 已有名字不受收尾帧改写:命中即保持原条目的另一半语义。
+	foldChunks(ToolCallBlockEndChunk(0, "c1", "other", `{"q":"x"}`), &out)
+	materializeToolCalls(&out)
+	if out.ToolCalls[0].Name != "search" {
+		t.Fatalf("已有名字被收尾帧改写: %q", out.ToolCalls[0].Name)
+	}
+}

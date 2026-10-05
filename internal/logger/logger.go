@@ -57,6 +57,12 @@ const (
 	renameProbeInterval = time.Minute
 )
 
+// writeLine 是「往已打开的文件写一行」的测试接缝:生产恒为真写。真盘上
+// 「open 成功而写失败」只有盘满对既有文件/坏盘能造出来,测试无法进这个象限;
+// 与 nodeprobe 的 echoBudgetMS/backstopSlackMS 同款做法(第八轮 R3 中-3 的
+// 回归钉子)。
+var writeLine = func(f *os.File, s string) (int, error) { return fmt.Fprintf(f, "%s", s) }
+
 // Line is one log record. T is milliseconds since the epoch, matching the
 // tracelog field of the same name so the panel renders both with one formatter.
 type Line struct {
@@ -101,6 +107,11 @@ var (
 	// (目录只读、盘满、AV 隔离新名字),capped 已清、size 停在 0 —— 封顶
 	// 机制的告警再也不介入,故障由响亮立刻变永久静默(第七轮复审 A)。
 	lastOpenWarn time.Time
+	// lastWriteWarn 节流「写入日志文件失败」的告警(一小时一行)。open 成功
+	// 而写失败(盘满对既有文件、坏盘 IO error)时 n=0、size 不涨,轮转与封顶
+	// 机制都推不到 —— open 侧的 lastOpenWarn 管不到这一半(第八轮 R3 中-3):
+	// 没有这条告警,文件日志的死是无声的。
+	lastWriteWarn time.Time
 )
 
 // failFile 把日志文件降级为「只写 ring」。独立函数、只取 mu:Init 的建目录
@@ -140,6 +151,7 @@ func Init(f string) {
 	nextProbe = time.Time{}
 	lastCapWarn = time.Time{}
 	lastOpenWarn = time.Time{}
+	lastWriteWarn = time.Time{}
 	if f == "" {
 		return
 	}
@@ -245,14 +257,28 @@ func write(level string, parts ...any) {
 		}
 		return
 	}
-	n, _ := fmt.Fprintf(f, "%s [%s] %s\n", stamp, level, msg)
+	n, werr := writeLine(f, fmt.Sprintf("%s [%s] %s\n", stamp, level, msg))
 	_ = f.Close()
 	size += int64(n)
+	// 写失败(n=0,盘满对既有文件/坏盘/AV 锁字节段)时 size 不涨,轮转与封顶
+	// 机制都推不到 —— 故障会从响亮变永久静默(第八轮 R3 中-3),文件日志的死
+	// 只剩内存 ring 能看见。一小时一行,放锁后再发(fileMu 内不可取 mu)。
+	var writePending string
+	if werr != nil && now.Sub(lastWriteWarn) >= time.Hour {
+		lastWriteWarn = now
+		writePending = fmt.Sprintf("[logger] 写日志文件失败(size=%d 停滞,轮转/封顶均触不到,本行只进内存 ring): %v", size, werr)
+	}
+	finish := func() {
+		fileMu.Unlock()
+		if writePending != "" {
+			Warn(writePending)
+		}
+	}
 	// 只看 size 决定要不要轮转:部分写/写失败(n>0 而 err!=nil)同样入账后
 	// 走这条 ——「每行都部分失败」的坏盘恰恰是唯一会越过阈值还不进轮转/
 	// 封顶分支的形状,短路它就等于把无界增长留给了 F4 要防的事故。
 	if size < maxFileBytes {
-		fileMu.Unlock()
+		finish()
 		return
 	}
 	// 与 JS 同款单文件轮转：rename 到 <base>.old.log（Windows 的
@@ -267,27 +293,27 @@ func write(level string, parts ...any) {
 	// 1s 内不再试。退避用单调时钟差(time.Since),墙钟回拨不会把窗口拉成
 	// 永久。越过硬封顶则转入上面的 capped 分支。
 	if !lastRenameFail.IsZero() && now.Sub(lastRenameFail) < time.Second {
-		fileMu.Unlock()
+		finish()
 		return
 	}
 	if err := os.Rename(fpath, strings.TrimSuffix(fpath, ".log")+".old.log"); err == nil {
 		size = 0
 		lastRenameFail = time.Time{}
-		fileMu.Unlock()
+		finish()
 	} else if errors.Is(err, os.ErrNotExist) {
 		// 源已被外部删除(见 capped 分支的同类注释):不当作轮转失败,归零
 		// 继续写,下一行 O_CREATE 就把文件重建出来。若不特判,它会一路走
 		// 「保留 size + 退避 + 最终 capped」,而源永远不存在 ⇒ 永久停摆。
 		size = 0
 		lastRenameFail = time.Time{}
-		fileMu.Unlock()
+		finish()
 	} else {
 		lastRenameFail = now
 		if size >= int64(hardCapFactor)*maxFileBytes {
 			capped = true
 			nextProbe = now.Add(renameProbeInterval)
 		}
-		fileMu.Unlock()
+		finish()
 	}
 }
 

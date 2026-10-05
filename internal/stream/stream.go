@@ -33,6 +33,18 @@ const maxEventBytes = 8 << 20
 // worse than failing the turn.
 var ErrEventTooLarge = errors.New("stream: SSE event data exceeds the cap")
 
+// ReadError wraps a mid-stream **read** failure (connection break, truncated
+// body) so callers can tell it apart from the two other ways ReadSSE fails:
+// a callback rejection (fn returned — that is the caller's own business, not a
+// transport fault) and ErrEventTooLarge (a protocol sentinel the engine
+// classifies itself). 第八轮 R4 中-1:裸透传的读故障掉进引擎的 SERVER 兜底
+// —— 可重试但永不冷却,而同一事实在响应头阶段 = TRANSPORT(换出口并冷却)。
+// Unwrap 保留原始错误,errors.Is 对 ErrIdleTimeout 这类哨兵照常成立。
+type ReadError struct{ Err error }
+
+func (e *ReadError) Error() string { return "stream: read interrupted: " + e.Err.Error() }
+func (e *ReadError) Unwrap() error { return e.Err }
+
 // Event is one SSE event. Data keeps the raw text, including the newlines of a
 // multi-line data block.
 type Event struct {
@@ -107,7 +119,7 @@ func ReadSSE(r io.Reader, fn func(Event) error) error {
 		if errors.Is(err, bufio.ErrTooLong) {
 			return ErrEventTooLarge
 		}
-		return err
+		return &ReadError{Err: err}
 	}
 	return flush()
 }

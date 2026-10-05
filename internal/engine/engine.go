@@ -816,7 +816,14 @@ func (e *Engine) attempt(ctx context.Context, in attemptInput) (Outcome, FinishR
 	areq := buildAttemptRequest(in, clientEffort)
 
 	res, err := adapter.NewAdapter(deps).Complete(ctx, areq, func(d adapter.Delta) error {
-		return emit(chunkOfDelta(d))
+		if err2 := emit(chunkOfDelta(d)); err2 != nil {
+			// 正文增量的 emit 失败与下面 usage/finish 两处的 emit 失败是同一
+			// 件事(客户端已断开),必须同判 Aborted:旧形状把裸回调错误兜底成
+			// SERVER(js `?? CODE.server` 的对齐),首字节前断开会让分支 A 白烧
+			// 一整轮上游重试,还把客户端自己的断开记成供应商故障。
+			return &emitError{err2}
+		}
+		return nil
 	})
 	if err != nil {
 		failure := classifyAttemptError(err)
@@ -933,13 +940,27 @@ func stopSequences(v any) []string {
 	}
 }
 
+// emitError 标记「engine 自己的 emit 失败 = 客户端断开」:onChunk 回调是
+// emit 的转发,失败语义与 usage/finish 帧的显式 Aborted 分支一致。Error()
+// 刻意透传(usage/finish 的显式分支会再拼一次 "client gone: " 前缀)。
+type emitError struct{ err error }
+
+func (e *emitError) Error() string { return e.err.Error() }
+func (e *emitError) Unwrap() error { return e.err }
+
 // classifyAttemptError 把 adapter 吐回的错误归类成 Failure:adapter 自己的
 // 失败都是 Failure;onChunk 的回调错误(客户端断开的替身)按 js :307 的
-// `error?.llmCode ?? error?.code ?? CODE.server` 兜底成 SERVER。
+// `error?.llmCode ?? error?.code ?? CODE.server` 兜底成 SERVER —— 除 emit
+// 失败外:emit 失败等于客户端已走,与 usage/finish 的显式分支同判 Aborted,
+// 不参与轮换、不冷却、不记成供应商故障。
 func classifyAttemptError(err error) *errors.Failure {
 	var f errors.Failure
 	if stderrors.As(err, &f) {
 		return &f
+	}
+	var ee *emitError
+	if stderrors.As(err, &ee) {
+		return &errors.Failure{Code: check.CodeAborted, Message: "client gone: " + ee.Error()}
 	}
 	return &errors.Failure{Code: check.CodeServer, Message: err.Error()}
 }

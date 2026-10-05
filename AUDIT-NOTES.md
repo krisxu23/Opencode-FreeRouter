@@ -2,6 +2,88 @@
 
 本文记录审计过程中的事实更正与验证结果，纯文档、不随产品发版。
 
+## 2026-10-05：第八轮审查（针对 v1.5.2 的五路对抗审计）与 19 条修复
+
+五路只读审查（health/pick、app/rebuild、logger/tracelog/httpclient、
+forward/adapter/stream/messages、engine/upstream/errors/panel/web+全仓快扫）对
+3428331 (v1.5.2) 审查。机械门禁先行全绿（gofmt/vet/build/node --check、22 纯包
+-count=1），无高危；中 8 + 低 11 经用户裁决全部修复，每条带回归测试并变异验证
+（还原后全绿）：
+
+- **tracelog 跨天清账吞掉 Init 播种（中）**：Init 按当天文件大小播种 dayBytes，
+  但 Record 的跨天块在 lastPruneDay=="" 时无条件清账 ⇒ 播种成死代码，崩溃循环下
+  每次重启可再把当天 route 文件写满 32MB。该形状是 1.5.0 修「回拨清账」时亲手引入
+  （历史行的守卫挡住了「Init 播种 vs 首条记录」的交互）。改为首条记录只落锚点，
+  清账以 seededDay 为基线（真前进且越过播种日才清）。用例：
+  TestRestartSeededDayBytesSurvivesFirstRecord 等 4 条（变异双红）。
+- **logger 写失败静默（中）**：`n, _ := fmt.Fprintf` 写失败时 size 永不涨 ⇒ 永不
+  轮转/永不封顶/零告警（lastOpenWarn 只管 open 失败，「open 成功写失败」这半边
+  无人管）。加 lastWriteWarn 小时节流告警，经 finish 闭包在 fileMu 之外发（锁序
+  规则「fileMu 内永不取 mu」不破）。用例：TestWriteFailureWarnsInsteadOfGoingSilent
+  （writeLine 接缝注入，比照 nodeprobe echoBudgetMS 的做法）。
+- **httpclient 头阶段停表 TOCTOU（中）**：AfterFunc 回调「先 Store(headerExpired)
+  再 cancel()」，Stop()==false 只保证已触发、不保证已落定 ⇒ 头贴线到达时 body 阶段
+  死于裸 context canceled，被归 EMPTY/SERVER 而非 ErrIdleTimeout（不冷却）。
+  RoundTrip 改 headerGuard 结构体：回调用 done 通道报完成（顺序刻意 cancel →
+  Store → close(done)），settle() 在 Stop 失败时等回调收尾再读。用例：
+  TestHeaderGuardSettleWaitsForTheCallback（阻塞 cancel 把回调钉在「已触发未落定」）。
+  顺带（低）：NewStreamClient 对 idle<=0 钳到 defaultStreamIdle=5m（旧形状双截止
+  静默全关），与 app 侧 streamIdleTimeout 同值联动。
+- **identity ::ffff: 十六进制写法绕过内网判据（中）**：`::ffff:7f00:1` 是合法
+  IPv6 字面量、Go 拨号栈照收，而剥前缀递归只认点分十进制 ⇒ 订阅入池闸、sbx 最后一
+  道闸、sub 重定向守卫三处消费方全被绕过。ParseIP 兜底放在递归**之前**（递归会把
+  字面量剥残成非法片段）。用例：TestUnroutableCatchesMappedHexSpellings（9 种映射
+  写法）/ TestUnroutableSparesPublicLiteralsIncludingMapped（公网字面量不误伤）。
+- **fingerprint 诱饵形状不分线（中）**：flat=false 恒发 chat 形状诱饵+字符串
+  tool_choice，WireMessages 线的无工具请求拿到 Anthropic 不认的形状（生产未爆 =
+  上游宽容）。ApplyFingerprint 改按 wire 分派三形状（responses/messages/chat）；
+  app/probe 的 tierPing 探针顺带对齐（claude 区域模型的探针诱饵也对了）。
+  用例：TestApplyFingerprintMessagesWireShape。
+- **readSSE 流中段裸透传（中）**：2xx SSE 中段读故障不过 bodyReadFailure ⇒ 归
+  SERVER：可重试但永不冷却、裸错串直进流内 error 帧；同一事实在头阶段 = TRANSPORT
+  （换出口+冷却）。stream.ReadError 包装 + adapter errors.As 分派；回调错误（客户端
+  断开）不包装、原样上交。同侧（低）：replay 回落丢原始 readErr，「截断的 400 +
+  重放又连不上」被归不可重试类别，改传 classifyErrorBody。用例：
+  TestMidStreamSSEReadFailureIsTransport / TestReplayKeepsOriginalReadError。
+- **responses 流 item 交叉（中）**：ChunkText/ChunkReasoning 复用 curMessage/
+  curReasoning 不互清 ⇒ Anthropic interleaved thinking 时双 item 线序交叉、文本不丢
+  但严格状态机客户端挂错 item。开新项前互清（不变量：两项至多一个非 nil）。注意：
+  两个清位单独保留任一即足以修复交错（互为冗余防御），变异必须双删才红。
+- **开场订阅拉取无总闸（中）**：app 开场 sub.Fetch 裸调（周期路径包了 180s
+  subFetchBudget）且 exits 用 reg.All() 全量不筛 ⇒ 直连拉不到源+死出口多时开场
+  串行烧分钟级，warmUp 与热/冷/首探/定时重建四循环全阻塞（转发面沿用已知出口，
+  不受影响）。开场同样 WithTimeout + exits 改 subExits()（筛 StateAlive+shuffle）。
+  JS 原版开场本带 AbortSignal.timeout(180_000)，属移植缺口。
+- **低危 11 条**：RetryAfter("NaN") 穿透 secs<=0 守卫（NaN 比较恒 false）→
+  int64(NaN*1000)=MinInt64（下游 >0 惰性化，但中间态污染日志与透传）；客户端断开的
+  onChunk 错误兜底 CodeServer（与 usage/finish 帧显式 CodeAborted 不对称，首字节前
+  断开多烧一个上游请求）改 emitError→CodeAborted；#btnProbeForce「跳过结果缓存」
+  文案失实（ProbeNow 忽略 force，三按钮同一动作，探测本无结果缓存）+ panel.go
+  注释同步为「force 是保留参数」；settings 死区提示 id 未 esc 直插 innerHTML
+  （手改 settings.json 的存储型 XSS，同函数其余出口已 esc）；pick fill 段丢
+  ownSticky 排除（与单趟实现口径漂移：busy 计数排序位移，非正确性破坏）；health
+  sweepQuota 用例预置行被 goroutine 刷新、删除循环零执行（白盒拨过期行）；晚到
+  tool name 被 block-end 分支吞（engine fold 补空位 / chat 流补 name-only delta /
+  responses done 帧带真名，三层各修）；tracelog Init 漏重置 consecFails；rebuild
+  入口排队短路不查 ctx（关停窗口内谎报「已排队补跑」）。
+
+**复审确认无恙**（五路交叉 + 快扫，不再重复）：engine slot/exit-busy 归还、
+foldChunks 恒有 ID、rawJSONOf 防死循环、ids CAS、panel Host+Origin 端口闸/安全头/
+injectBoot 转义、web esc 含'/反引号+j 单定义+probeFromLogs 与 check.go 逐字符一致、
+parse 小写回写、registry flushMu+seq、persistence RemoveStaleTemp/深拷贝、sub 首错
+保留/重定向≤3 跳同 scheme、stats 三桶/300ms 去抖、sbx 自愈≤5、cmd 信号桥/pprof
+回环、封顶状态机全转移无震荡环、gen 仲裁/双关幂等/EOF 停表、readBody 全象限、
+KeyMatches 常数时间、延迟发头/[DONE] 顺序/usage 帧 choices:[]、ScanUsage 四象限、
+StripStaleReasoningInputs 浅拷贝隔离、mintToolCallID 纳秒+原子 seq、
+RepairToolPairing 无丢失、tool_result 恒非空串。
+
+**race 缺口依旧**：本机无 gcc/cgo，本轮全部锁/通道改动（headerGuard、logger
+finish 闭包、health fill 口径）未过检测器；延续下节建议（CI Linux 纯包 -race）。
+
+**环境注**：internal/app 两例（TestLoadCreatesEveryStoreUnderRoot /
+TestLoadOnAnEmptyRootWritesSettingsDefaults）在本机失败 = 桌面运行实例占用
+3457/3458，非代码问题；以 CI 全绿为准。
+
 ## 2026-10-05：第七轮审查（针对 v1.4.1 的六路对抗审计）与修复
 
 六路审查（health/pick、engine/adapter、logger/tracelog/stats、rebuild/sbx/生命周期、
@@ -159,3 +241,8 @@ MaxBytesReader 的 413/400 两形状、keyBufPool 双清零无副作用、logger
   护栏、健康感知淘汰、订阅与运维补强。该提交信息声称 gofmt 干净，实际不实（见第七轮）。
 - v1.5.0：第七轮六路对抗审计 + 两路复审（共 8 名审查员）。修复清单见上两节；基准
   BenchmarkPickOverFullPool 1.62ms/892KB/20 allocs → 990µs/434KB/16 allocs。
+- v1.5.1（de18246）：v1.5.0 CI 红的测试桩热修（见上节）；v1.5.0 因该红从未发布。
+- v1.5.2（3428331）：v1.5.1 的 8 个 .tmp_*.txt 调试文件经 `git add -A` 混入提交并
+  泄漏进 GPL 源码包（342 entries）；git rm --cached + .gitignore，sourceFiles()
+  复核 181 files/bad=0。
+- v1.5.3：第八轮五路对抗审计（见 2026-10-05 第八轮节），中 8 + 低 11 全修。

@@ -231,3 +231,78 @@ func TestIdleReaderDoesNotKillAStreamThatKeepsArriving(t *testing.T) {
 		t.Fatalf("读到 %d 字节, want %d", len(raw), chunks)
 	}
 }
+
+// TestHeaderGuardSettleWaitsForTheCallback 钉第八轮 R3 中-2:计时器 Stop()
+// 返回 false 只保证回调**已触发**(被排进 goroutine 队列),不保证它已执行到
+// expired.Store(true) —— 旧形状在这里直接读标志,晚到的回调随后才 cancel(),
+// 流在 body 阶段死于裸 "context canceled"。契约:settle 必须等回调收尾,
+// 返回后 triggered() 是最终值。
+func TestHeaderGuardSettleWaitsForTheCallback(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	cancel := func() {
+		close(entered) // 回调已进门,但还没落 expired —— 把它钉在这里
+		<-release
+	}
+	g := newHeaderGuard(time.Millisecond, cancel)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("前置:回调未触发")
+	}
+	if g.triggered() {
+		t.Fatal("前置:cancel 阻塞期间 expired 不应为真")
+	}
+	settleDone := make(chan struct{})
+	go func() { g.settle(); close(settleDone) }()
+	// 旧形状(不等回调)此刻已经返回;新形状必须还卡着。
+	select {
+	case <-settleDone:
+		t.Fatal("settle 在回调收尾前就返回了:TOCTOU 窗口没有关上")
+	case <-time.After(80 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-settleDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("release 后 settle 未返回")
+	}
+	if !g.triggered() {
+		t.Fatal("settle 返回后 triggered() 必须是最终值 true")
+	}
+}
+
+// settle 对未触发的计时器照旧即时返回,不引入额外等待。
+func TestHeaderGuardSettleOnLiveTimerReturnsImmediately(t *testing.T) {
+	g := newHeaderGuard(time.Hour, func() {})
+	done := make(chan struct{})
+	go func() { g.settle(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("未触发的计时器不应等待")
+	}
+	if g.triggered() {
+		t.Fatal("前置未满足:计时器不应已触发")
+	}
+}
+
+// TestNewStreamClientClampsNonPositiveIdle 钉第八轮 R3 低-1:idle<=0 的旧
+// 形状把头阶段截止与 body 空闲截止**双双静默关闭**(「挂到天荒」复活)。
+// 构造器必须钳到默认值,不得退化。
+func TestNewStreamClientClampsNonPositiveIdle(t *testing.T) {
+	for _, idle := range []time.Duration{0, -1, -time.Hour} {
+		c := NewStreamClient(nil, idle)
+		tr, ok := c.Transport.(*idleTransport)
+		if !ok {
+			t.Fatalf("idle=%v: Transport 不是 *idleTransport", idle)
+		}
+		if tr.idle != defaultStreamIdle {
+			t.Fatalf("idle=%v 被静默接受: 构造器必须钳到 defaultStreamIdle(%v)", idle, defaultStreamIdle)
+		}
+	}
+	c := NewStreamClient(nil, 300*time.Millisecond)
+	if tr := c.Transport.(*idleTransport); tr.idle != 300*time.Millisecond {
+		t.Fatalf("正的 idle 被改写: %v", tr.idle)
+	}
+}

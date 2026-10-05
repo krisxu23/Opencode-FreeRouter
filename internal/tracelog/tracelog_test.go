@@ -2,6 +2,7 @@
 package tracelog
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -328,5 +329,98 @@ func TestBackdatedRowDoesNotResetTheDayLedger(t *testing.T) {
 	mu.RUnlock()
 	if !off {
 		t.Fatal("一条历史日期的记录把今天的 writeOff 洗掉了:每日配额账被回拨重置")
+	}
+}
+
+// TestRestartSeededDayBytesSurvivesFirstRecord 钉第八轮 R3 中-1:Init 按**当天
+// 文件的实际大小**播种 dayBytes(「重启后同一天还能再写满 32MB」的契约),
+// 而旧形状的重启后首条记录走 `lastPruneDay == ""` 分支无条件清账,把播种变成
+// 死代码 —— 同一天内崩溃循环,当日文件每次重启都重新拿满 32MB 配额,无界
+// (200MB 总量 prune 永不删最新文件)。首条记录只许落轮转锚点+触发 prune,
+// 不许动账。
+func TestRestartSeededDayBytesSurvivesFirstRecord(t *testing.T) {
+	dir := t.TempDir()
+	today := time.Now().UTC().Format("2006-01-02")
+	// 当天文件已有 2000 字节的历史(今天上半程写的)。
+	if err := os.WriteFile(filepath.Join(dir, today+".jsonl"), bytes.Repeat([]byte("x"), 2000), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	Init(dir)
+	mu.RLock()
+	seeded := dayBytes
+	mu.RUnlock()
+	if seeded != 2000 {
+		t.Fatalf("前置:Init 播种 dayBytes = %d, want 2000", seeded)
+	}
+	Record(Route{Result: "重启后第一条"})
+	mu.RLock()
+	got := dayBytes
+	mu.RUnlock()
+	// 播种的 2000 必须还在账上（本条记录自己的字节再往上加）。旧形状会清成
+	// 0 起算,这里就只剩本条记录的字节量级。
+	if got < 2000 {
+		t.Fatalf("重启后首条记录把播种的 dayBytes 清掉了(只剩 %d),播种的 2000 必须保留", got)
+	}
+}
+
+// 同一条路的第二段:首条记录是**历史时刻**、随后回到今天 —— 轮转锚点跟着
+// 首条走了,但今天回到 `day > lastPruneDay` 时也不得清掉播种(播种日基线
+// seededDay 挡住它)。
+func TestBackdatedFirstRecordKeepsTodaySeeding(t *testing.T) {
+	dir := t.TempDir()
+	today := time.Now().UTC()
+	yesterday := today.AddDate(0, 0, -1)
+	todayFile := filepath.Join(dir, today.Format("2006-01-02")+".jsonl")
+	if err := os.WriteFile(todayFile, bytes.Repeat([]byte("x"), 1500), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	Init(dir)
+	Record(Route{Result: "历史", At: yesterday.UnixMilli()})
+	Record(Route{Result: "今天", At: today.UnixMilli()})
+	mu.RLock()
+	got := dayBytes
+	mu.RUnlock()
+	if got < 1500 {
+		t.Fatalf("回到播种日后 dayBytes = %d, 播种的 1500 必须保留", got)
+	}
+}
+
+// 反向钉住:真正跨入**晚于播种日**的一天,清账照旧(不能因为修播种把每日
+// 重置整个砍掉 —— 那会让昨天的 32MB 挂到今天,新的一天全程静默停写)。
+func TestTrueDayAdvanceStillClearsSeededAccount(t *testing.T) {
+	dir := t.TempDir()
+	Init(dir)
+	yesterday := time.Now().UTC().AddDate(0, 0, -1)
+	mu.Lock()
+	seededDay = yesterday.Format("2006-01-02")
+	lastPruneDay = yesterday.Format("2006-01-02")
+	dayBytes = 5000
+	writeOff = true
+	consecFails = maxConsecFails
+	mu.Unlock()
+	Record(Route{Result: "跨天"})
+	mu.RLock()
+	gotBytes, off, fails := dayBytes, writeOff, consecFails
+	mu.RUnlock()
+	// 账被清过：只剩本条记录自己的字节（< 播种值 5000），保险丝与停写位归零。
+	if gotBytes >= 5000 || off || fails != 0 {
+		t.Fatalf("真跨天必须清账: dayBytes=%d writeOff=%v consecFails=%d", gotBytes, off, fails)
+	}
+}
+
+// 第八轮 R3 低-2:Init 漏重置 consecFails,残留计数跨 Init 带进新目录,两次
+// 偶发失败就提前熔断。生产只启动一次不可达,测试可达。
+func TestInitResetsConsecFails(t *testing.T) {
+	dir := t.TempDir()
+	Init(dir)
+	mu.Lock()
+	consecFails = maxConsecFails - 1
+	mu.Unlock()
+	Init(dir) // 重启/换目录
+	mu.RLock()
+	got := consecFails
+	mu.RUnlock()
+	if got != 0 {
+		t.Fatalf("Init 后 consecFails = %d, want 0(不得跨目录继承熔断计数)", got)
 	}
 }

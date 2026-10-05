@@ -31,13 +31,6 @@ import (
 )
 
 const (
-	// subFetchBudget 是订阅拉取的总预算,照抄 src/index.js:412 的
-	// AbortSignal.timeout(180_000)。单源 20s × 两轮 × 12 个出口可以远超它,
-	// 所以必须有总闸:否则一次全网抖动会把重建拖成几分钟。
-	subFetchBudget = 180 * time.Second
-	// subExitClientTimeout 不再声明(审计 O6):一个从未被读的预算常量比一个
-	// 没接线的旋钮更糟 —— 单源超时实际由 sub.attemptTimeout(20s)与上面的
-	// subFetchBudget 总闸决定。
 	// subRetryDelay / subRetryLimit 照抄 src/index.js:461-469 的补偿重试。
 	subRetryDelay = 20 * time.Second
 	subRetryLimit = 2
@@ -58,6 +51,13 @@ const (
 	catalogNodeTimeoutMS   = 20000
 	catalogDirectTimeoutMS = 12000
 )
+
+// subFetchBudget 是订阅拉取的总预算,照抄 src/index.js:412 的
+// AbortSignal.timeout(180_000)。单源 20s × 两轮 × 12 个出口可以远超它,
+// 所以必须有总闸:否则一次全网抖动会把重建拖成几分钟。
+// 是 var 而非 const 只为测试可收缩(app_opening_test.go 把它钳到毫秒级,验证
+// 总闸真的接在 sub.Fetch 上;八审 M8),生产代码不得改写。
+var subFetchBudget = 180 * time.Second
 
 // catalogBox 持有当前一代模型目录。engine 的 State 回调每轮路由读一次它,
 // 所以目录换代对在途请求是不可见的 —— 它们用旧的一代跑完。
@@ -104,6 +104,14 @@ func (p *Parts) Rebuild(ctx context.Context) error {
 	if p.rebuilding {
 		p.rebuildQueued = true
 		p.rebuildMu.Unlock()
+		// 八审 L11:关停窗口里的「已排队补跑」是谎报。面板动作跑在 lifeCtx 上
+		// (rebuildOnce 的关停短路注释),ctx 已取消意味着下面循环 :132 的关停
+		// 检查注定把这一手丢弃 —— 哨兵承诺的「已排队,会补跑」永远不会兑现,
+		// 而调用方(面板/托盘)把哨兵按已受理的提示处理。此时必须回普通错误,
+		// 不能回哨兵。
+		if cerr := ctx.Err(); cerr != nil {
+			return fmt.Errorf("app: 关停中,排队的一轮重建未执行: %w", cerr)
+		}
 		return errRebuildQueued
 	}
 	p.rebuilding = true
@@ -321,6 +329,91 @@ func (p *Parts) fetchSubscriptions(ctx context.Context, settings Settings) ([]pa
 		clean = append(clean, sanitized)
 	}
 	return clean, present, nil, dropped
+}
+
+// openingSubscription 是 Load 第 6.5 步的 goroutine 体:开机后台拉一轮订阅,
+// 结果记进 lastCheck/lastRebuild,并按订阅成员资格整理池子。firstFetch 的
+// close 与 bootWG.Done 仍归 goroutine 的 defer 管,本方法不碰。
+//
+// 八审 M8:拉取段此前是内联副本(裸 ctx + 注册表全量拨号出口 + 自抄一份
+// 过滤/清洗),与周期轮的 fetchSubscriptions 三处漂移:
+//   - 没有 subFetchBudget 总闸:订阅源挂死时这一轮跟着挂死,bootJoin 只是不再
+//     等它,goroutine 照烧 12 出口 × 20s × 源数;
+//   - 出口不筛活:死出口逐一烧满 attemptTimeout —— 正是 subExits 注释里写明
+//     不做的形状;
+//   - 过滤/清洗逻辑第二份拷贝,改一处漏一处。
+//
+// 现在整段复用 fetchSubscriptions:开场轮与周期轮对「订阅拉取」只有落点不同
+// —— 这里把结果记进开机账本并按成员资格整理池子,周期轮走 rebuildOnce。
+func (p *Parts) openingSubscription(ctx context.Context, cur Settings) {
+	if len(cur.SubURLs) == 0 {
+		logger.Info(fmt.Sprintf("[app] 未配置订阅或全部拉取失败 — 使用注册表历史节点（%d 个）；注册表为空则以纯直连兜底模式启动", p.Registry.Len()))
+		p.setRebuildResult(0, 0, 0, nil)
+		return
+	}
+	clean, present, ferr, dropped := p.fetchSubscriptions(ctx, cur)
+	if ferr != nil {
+		p.setRebuildResult(0, 0, 0, ferr)
+		return
+	}
+	// 成员资格跟随订阅(1.3.0):拉取成功后,不在**任何源**里的节点
+	// 删干净(注册表 + 健康行,零记录)。删除判定对原始源算 —— 被
+	// 用户地区选择过滤掉的节点仍在订阅里,不删。
+	for _, o := range p.Registry.All() {
+		if !present[o.Tag] {
+			_ = p.Registry.Remove(o.Tag)
+			p.Health.Forget(o.Tag)
+		}
+	}
+	// 落盘前复核 ctx(生命周期审计 #3):sub.Fetch 是网络等待,这期间 Load
+	// 可能已因端口占用而失败,fail() 会 cancel() 让 ctx 进入取消态。Fetch
+	// 在取消前恰好成功返回时,旧的写法照样往下走 —— reg.Flush 会把这一轮
+	// 订阅结果写进注册表文件,而进程随即退出:一次**从未成功启动**的运行
+	// 在磁盘上留下了注册表,下次开机继承它。joinBoot 只保证「返回之后不再
+	// 写」,管不了「失败之后仍在写」。取消的一轮什么都不写:池子原样留给
+	// 下一次真正的开机。
+	if ctx.Err() != nil {
+		logger.Info("[app] 开机订阅已完成拉取但启动已中止 — 本轮不写注册表,池子保持磁盘现状")
+		return
+	}
+	merged := p.Registry.Merge(clean)
+	// 健康感知淘汰(与周期 Rebuild 同口径):开场时健康表刚 Load,rank 快照有效。
+	// 查不到行的新 tag 显式给中间档 3(与 rebuild.go 同一裁决,理由见彼处注释)。
+	ranks := p.Health.EvictRank()
+	evicted := p.Registry.EnforceCapRanked(registry.PoolCap, func(tag string) int {
+		if v, ok := ranks[tag]; ok {
+			return v
+		}
+		return 3
+	})
+	for _, tag := range evicted {
+		// 池子外的节点不该留健康行:D-C1 —— Forget 掉,否则被淘汰者的行
+		// 永远留在 node-health.json(PruneStale 只在探测轮里跑,这里不补
+		// 就没有回收点)。
+		p.Health.Forget(tag)
+	}
+	if err := p.Registry.Flush(); err != nil {
+		logger.Warn(fmt.Sprintf("[app] 注册表落盘失败: %v", err))
+	}
+	syncAdded, syncRemoved, serr := p.Host.SyncOutbounds(p.Registry.All())
+	if serr == nil && (syncAdded != 0 || syncRemoved != 0) {
+		// 出站换了代:旧代 client 里绑的是上一代的拨号闭包(O3)。零增删
+		// 的 sync 是纯 no-op(SyncOutbounds 对已存在的 tag 不 Remove 不
+		// 重建,旧 client 的拨号闭包依然有效),换代只会白扔全部出口的
+		// 温热连接池 —— 与 noteEgressChanged 注释声明的语义一致。
+		p.noteEgressChanged()
+	}
+	if dropped > 0 {
+		logger.Warn(fmt.Sprintf("[app] 订阅里有 %d 个节点 sing-box 无法使用（非法 uuid / 不认的 cipher / 未知传输），未入池", dropped))
+	}
+	if serr != nil {
+		logger.Warn(fmt.Sprintf("[app] 热插出站失败: %v", serr))
+		p.setRebuildResult(syncAdded, syncRemoved, dropped, serr)
+		return
+	}
+	p.setRebuildResult(syncAdded, syncRemoved, dropped, nil)
+	logger.Info(fmt.Sprintf("[app] 订阅：合并 %d 个出口（新增 %d，淘汰 %d），池内现有 %d 个（热插 %d，撤下 %d）",
+		len(clean), merged, len(evicted), p.Registry.Len(), syncAdded, syncRemoved))
 }
 
 // subExits 是拉订阅时可以借用的出口。只取健康表判活的节点,且最多

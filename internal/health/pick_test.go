@@ -445,7 +445,7 @@ func TestFillPoolSnapshotKeepsEveryTagExactlyOnce(t *testing.T) {
 		t.Fatalf("第一段 nodes = %+v, want 只有 n3", snap.nodes)
 	}
 	// 第二段:整体重取。
-	h.fillPoolSnapshot(snap, now, pool)
+	h.fillPoolSnapshot(snap, now, pool, "n3")
 	if got := len(snap.nodes); got != len(pool) {
 		t.Fatalf("fill 后 nodes = %d, want %d(空 tag 节点不得被跳过)", got, len(pool))
 	}
@@ -474,7 +474,7 @@ func TestFillPoolSnapshotKeepsEveryTagExactlyOnce(t *testing.T) {
 	if len(snap2.nodes) != 0 {
 		t.Fatalf("sticky 不在池里时第一段 nodes = %d, want 0", len(snap2.nodes))
 	}
-	h2.fillPoolSnapshot(snap2, now, pool)
+	h2.fillPoolSnapshot(snap2, now, pool, "nX")
 	if got := len(snap2.nodes); got != len(pool) {
 		t.Fatalf("fill 后 nodes = %d, want %d(空 tag 节点被 skip=\"\" 吃掉了)", got, len(pool))
 	}
@@ -510,5 +510,31 @@ func TestPickSnapshotWithoutStickyTakesTheWholePoolAtOnce(t *testing.T) {
 	}
 	if seen[""] != 1 {
 		t.Fatalf("空 tag 节点出现 %d 次, want 1", seen[""])
+	}
+}
+
+// 八审 L5:fill 重取必须把 ownSticky 原样透传给 pickAggLocked —— busy 的
+// 语义是「别的会话占着这个 IP」,第一段已把 own hold 排除在外;fill 若传
+// "",own sticky 的 hold 会被算成外部负载,同一请求走没走 fill,busy 口径
+// 漂移一档,own sticky 与同 IP 邻居的排序跟着位移。
+func TestFillPoolSnapshotExcludesOwnStickyHoldFromBusy(t *testing.T) {
+	h := newPickFixture(t)
+	now := time.Now().UnixMilli()
+	pool := pickPool("n1", "n3")
+	// own 会话锚在 n1;另一个会话锚在 n3(不同 IP)。
+	h.NoteSticky("s-own", "n1", false)
+	h.NoteSticky("s-other", "n3", false)
+
+	snap := h.pickSnapshot(now, "n1", pool)
+	if len(snap.nodes) != 1 || snap.nodes[0].tag != "n1" {
+		t.Fatalf("第一段 nodes = %+v, want 只有 n1", snap.nodes)
+	}
+	h.fillPoolSnapshot(snap, now, pool, "n1")
+
+	if got := snap.busy[pickIPs["n3"]]; got != 1 {
+		t.Fatalf("busy[别的会话的 IP] = %d, want 1(外来 hold 照算)", got)
+	}
+	if got := snap.busy[pickIPs["n1"]]; got != 0 {
+		t.Fatalf("busy[own sticky 的 IP] = %d, want 0(own hold 不得算成外部负载)", got)
 	}
 }

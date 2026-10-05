@@ -93,6 +93,11 @@ var (
 	consecFails  int
 	lastPruneDay string
 	dayBytes     int64
+	// seededDay 是 Init 播种 dayBytes 时所在的 UTC 日（dir 非空时恒非空）。
+	// Record 的跨天清账用它当基线：只有真正跨入**晚于播种日**的一天才清
+	// dayBytes/writeOff/consecFails，否则「重启后回到播种当天」的任何记录
+	// 序列都会把按盘播种的账清掉（第八轮 R3 中-1）。
+	seededDay string
 	// writeMu 把磁盘 I/O 挪出 mu:Record 曾全程持 mu 做 open/write/close,
 	// Recent(面板轮询)与所有 Record 在同一把锁上排队 —— 轮询高峰时路由
 	// 记录要等 I/O。mu 只保护内存状态与配额账,写按到达序在 writeMu 下
@@ -110,6 +115,8 @@ func Init(d string) {
 	lastPruneDay = ""
 	dayBytes = 0
 	writeOff = false
+	consecFails = 0
+	seededDay = ""
 	ring = nil
 	if d == "" {
 		dir = ""
@@ -126,6 +133,8 @@ func Init(d string) {
 	if fi, err := os.Stat(filepath.Join(d, today+".jsonl")); err == nil {
 		dayBytes = fi.Size()
 	}
+	// 播种日基线:此后 Record 的「真跨天」判定以此为锚（见 Record 内注释）。
+	seededDay = today
 }
 
 // Record appends one decision. It has no error return on purpose.
@@ -159,22 +168,38 @@ func Record(r Route) {
 	// 上游回放、调用方显式给历史时刻)会把 lastPruneDay 拉回旧日期,并把
 	// dayBytes/writeOff/consecFails 一起清零 —— 反复在两天之间交替的 At 能
 	// 把 32MB/天的配额账无限重置(写的是不同日名的文件,所以连不上限都不撞)。
-	// 生产不可达(唯一调用点的 At ≡ nowMS()),但账本不该有一条「历史时刻
-	// 即清零今日配额」的路。历史日的记录照旧写它自己那天的文件,只是不再
-	// 参与轮转判定,字节仍记在当前轮转日账上(保守口径,见下方 F7)。
-	if dir != "" && (lastPruneDay == "" || day > lastPruneDay) {
-		pruneLocked(day)
-		lastPruneDay = day
-		// 每日字节配额与保险丝按天重置。不重置配额的话,昨天攒下的计数会把
-		// 今天提前顶到 32MB 上限,整个新的一天都静默停写。
-		//
-		// consecFails 必须一起清:跨天块过去只清 writeOff/dayBytes 漏清它,
-		// 于是某个坏天熔满 5 次后计数永远挂着,此后**每天** 1 次瞬时抖动
-		// (AV 扫一下盘)就立刻重新熔掉一整天 —— 「一次抖动不丢一天」只对
-		// 首个坏天成立的回归(第六轮审计 F6)。
-		dayBytes = 0
-		writeOff = false
-		consecFails = 0
+	// 历史日的记录照旧写它自己那天的文件,只是不再参与轮转判定,字节仍记在
+	// 当前轮转日账上(保守口径,见下方 F7)。
+	//
+	// 清账还要再过一道 seededDay 闸(第八轮 R3 中-1):Init 会按**当天文件
+	// 的实际大小**播种 dayBytes(重启后同一天还能再写满 32MB 的契约),而
+	// 旧形状里 `lastPruneDay == ""`(重启后首条记录)分支无条件清账,把播种
+	// 变成死代码 —— 同一天内崩溃循环,当日文件每次重启都重新拿满 32MB 配额,
+	// 无界。现在拆成三段:首条记录只落轮转锚点+触发一次 prune(清旧日文件
+	// 的职责不能丢);真前进才清账;且清账要求越过播种日 —— 「首条是历史
+	// 时刻、随后回到今天」的序列也保得住播种。
+	if dir != "" {
+		switch {
+		case lastPruneDay == "":
+			pruneLocked(day)
+			lastPruneDay = day
+		case day > lastPruneDay:
+			pruneLocked(day)
+			lastPruneDay = day
+			// 每日字节配额与保险丝按天重置。不重置配额的话,昨天攒下的计数会把
+			// 今天提前顶到 32MB 上限,整个新的一天都静默停写。
+			//
+			// consecFails 必须一起清:跨天块过去只清 writeOff/dayBytes 漏清它,
+			// 于是某个坏天熔满 5 次后计数永远挂着,此后**每天** 1 次瞬时抖动
+			// (AV 扫一下盘)就立刻重新熔掉一整天 —— 「一次抖动不丢一天」只对
+			// 首个坏天成立的回归(第六轮审计 F6)。Init 现在也自行清它(重启
+			// 不该继承上一个目录的熔断计数)。
+			if day > seededDay {
+				dayBytes = 0
+				writeOff = false
+				consecFails = 0
+			}
+		}
 	}
 	d := dir
 	off := writeOff

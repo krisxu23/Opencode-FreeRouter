@@ -679,7 +679,7 @@ func (p *Parts) probeTierModel(ctx context.Context, tag string) string {
 	model := health.RegionProbeModel
 	wire := upstream.WireFor(model)
 	body := tierPingBody(model, wire)
-	upstream.ApplyFingerprint(body, wire == upstream.WireResponses)
+	upstream.ApplyFingerprint(body, wire)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return ""

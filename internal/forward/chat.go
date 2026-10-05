@@ -508,6 +508,9 @@ func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[strin
 	// 按数组下标归并的客户端(LiteLLM/LangChain 等)会产出稀疏数组。
 	seenToolStart := map[int]bool{}
 	toolOrdinal := map[int]int{}
+	// 该 slot 的 function.name 是否已上过线:首帧名字为空(先参后名的反常帧序)
+	// 时,晚到名字只补一次,后续帧继续吞(第八轮 R4 低-2)。
+	toolNameSent := map[int]bool{}
 	nextToolIndex := 0
 	forwarded := false
 
@@ -557,6 +560,9 @@ func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[strin
 				seenToolStart[c.Index] = true
 				toolOrdinal[c.Index] = nextToolIndex
 				nextToolIndex++
+				if c.ToolName != "" {
+					toolNameSent[c.Index] = true
+				}
 				stream.send(chunkFrame{
 					ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 					Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{ToolCalls: []toolCallDelta{{
@@ -568,9 +574,22 @@ func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[strin
 				return nil
 			}
 			if c.ToolArguments != "" {
-				// 已发过增量的 block-end 完整帧:忽略。js 的 onChunk 没有这个
-				// 分支(增量已经把 arguments 拼齐了),转发层同样必须忽略它 ——
-				// 否则同一个 tool call 会被发两遍,SDK 会当成两个调用。
+				// 已发过增量的 block-end 完整帧:参数忽略(增量已拼齐,重发会让
+				// SDK 当成两个调用)。但晚到的名字要补:先参后名的上游把 name 只
+				// 放在收尾帧,旧形状整帧吞掉,客户端拿到 Name:"" 的调用无法执行。
+				// OpenAI 线允许后续 delta 只带 function.name。
+				if c.ToolName != "" && !toolNameSent[c.Index] {
+					toolNameSent[c.Index] = true
+					start()
+					forwarded = true
+					stream.send(chunkFrame{
+						ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
+						Choices: []chunkChoice{{Index: 0, Delta: chunkDelta{ToolCalls: []toolCallDelta{{
+							Index:    toolOrdinal[c.Index],
+							Function: &toolFuncDelta{Name: c.ToolName, Arguments: ""},
+						}}}}},
+					})
+				}
 				return nil
 			}
 			start()
@@ -584,6 +603,13 @@ func (s *Server) chatCompletionStream(w *writer, r *http.Request, body map[strin
 			if first {
 				entry.ID = c.ToolID
 				entry.Function = &toolFuncDelta{Name: c.ToolName, Arguments: ""}
+				if c.ToolName != "" {
+					toolNameSent[c.Index] = true
+				}
+			} else if c.ToolName != "" && !toolNameSent[c.Index] {
+				// 增量帧上的晚到名字(同上:先参后名),补一发 name-only delta。
+				entry.Function = &toolFuncDelta{Name: c.ToolName, Arguments: ""}
+				toolNameSent[c.Index] = true
 			}
 			stream.send(chunkFrame{
 				ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
@@ -890,6 +916,13 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 				return nil
 			}
 			sendCreated()
+			// 思考项还开着:文本必须另开 message item。旧形状只在 function_call
+			// 处清两项,text↔reasoning 交错(Anthropic interleaved thinking)时
+			// B 段正文挂回 A 段的 message item:文本不丢,但线序与创建序交叉,
+			// 严格状态机客户端把内容挂错 item(第八轮 R4 中-3)。
+			if curReasoning != nil {
+				curMessage, curReasoning = nil, nil
+			}
 			it := curMessage
 			if it == nil {
 				it = openItem("message", "msg_"+itoa(nextItemIdx))
@@ -912,6 +945,10 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 				return nil
 			}
 			sendCreated()
+			// 文本项还开着:推理另开 reasoning item(对称同上)。
+			if curMessage != nil {
+				curMessage, curReasoning = nil, nil
+			}
 			it := curReasoning
 			if it == nil {
 				it = openItem("reasoning", "rs_"+itoa(nextItemIdx))
@@ -954,7 +991,13 @@ func (s *Server) responsesStream(w *writer, r *http.Request, openAI map[string]a
 			}
 			if c.ToolArguments != "" {
 				// block-end:增量已经拼齐就忽略;零参调用(整段参数随
-				// block-end 到达)在这里一次发完。
+				// block-end 到达)在这里一次发完。晚到的名字(先参后名:首帧
+				// 增量为空名、name 只随收尾帧到)补进 item 快照 —— added 事件
+				// 已按空名字发出收不回来,done/completed 按 it.name 重建,
+				// 至少要带真名(第八轮 R4 低-2)。
+				if it.name == "" && c.ToolName != "" {
+					it.name = c.ToolName
+				}
 				if it.text.Len() > 0 {
 					return nil
 				}

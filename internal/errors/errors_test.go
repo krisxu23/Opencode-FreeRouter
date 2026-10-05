@@ -264,3 +264,18 @@ func TestCodeOfSeesWrappedFailure(t *testing.T) {
 		t.Fatalf("CodeOf(wrapped plain) = %q, want \"\"", got)
 	}
 }
+
+// 八审 L1:"Retry-After: NaN" 旧行为会把出口冷却成 int64 最小负数 ——
+// ParseFloat("NaN") 不报错,NaN 过掉 <=0 和 >=600 两个比较,int64(NaN*1000)
+// 在 amd64 上是负最小值。NaN 与 ±Inf 的分界:NaN 一律当「没有提示」返回 0;
+// +Inf 数值上确已越过封顶,照 1e18 同款处理给 retryAfterMaxMS。
+func TestRetryAfterRejectsNaN(t *testing.T) {
+	for _, h := range []string{"NaN", "nan", "-NaN", "NAN"} {
+		if got := RetryAfter(h); got != 0 {
+			t.Fatalf("RetryAfter(%q) = %d, want 0(NaN 不是提示,更不是负退避)", h, got)
+		}
+	}
+	if got := RetryAfter("+Inf"); got != retryAfterMaxMS {
+		t.Fatalf("RetryAfter(+Inf) = %d, want %d(越顶照封顶)", got, retryAfterMaxMS)
+	}
+}

@@ -807,6 +807,17 @@ func TestConcurrentPickAndNotesDoNotRace(t *testing.T) {
 		h.NoteCooldown(tags[i], 0)
 		pinCoolUntil(h, tags[i], 1)
 	}
+	// 八审 L6:sweepQuota 的删除循环在这个测试里**零执行** —— 循环内的
+	// NoteQuota 每轮把 LastQuotaAt 续到当下,quotaMark(天级)之内永远
+	// 不过期,四个删除循环里最复杂的一条(快照收集+短锁重验)从未被 -race
+	// 照到。白盒拨一行「过期配额」进去:独立 tag,写侧循环不碰它。
+	h.NoteQuota("qdead")
+	h.mu.Lock()
+	if r, ok := h.nodes["qdead"]; ok {
+		r.LastQuotaAt = 1
+		h.nodes["qdead"] = r // nodes 是值 map,改完必须写回(pinStickyAt 那套指针写法在这里不适用)
+	}
+	h.mu.Unlock()
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)
@@ -829,6 +840,9 @@ func TestConcurrentPickAndNotesDoNotRace(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+	if _, ok := h.quotaTags["qdead"]; ok {
+		t.Fatal("过期的 quota 记号没被 commitPickSweep 删掉 —— sweepQuota 删除循环仍然零执行")
+	}
 }
 
 // pinStickyAt / pinCoolUntil 把 sticky/cool 行的时间戳拨到过期。同文件顶部的

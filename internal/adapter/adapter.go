@@ -117,7 +117,7 @@ func (a *Adapter) BuildBody(req Request) (*PrebuiltBody, error) {
 	if err != nil {
 		return nil, err
 	}
-	renames := upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
+	renames := upstream.ApplyFingerprint(body, a.deps.Wire)
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -176,7 +176,7 @@ func (a *Adapter) Complete(ctx context.Context, req Request, onChunk func(Delta)
 		if err != nil {
 			return Result{}, err
 		}
-		renames = upstream.ApplyFingerprint(body, a.deps.Wire == upstream.WireResponses)
+		renames = upstream.ApplyFingerprint(body, a.deps.Wire)
 		payload, err = json.Marshal(body)
 		if err != nil {
 			return Result{}, err
@@ -236,7 +236,7 @@ func (a *Adapter) exchange(ctx context.Context, t *turn, s *sink) (Result, error
 		if resp.StatusCode == http.StatusBadRequest && upstream.IsStaleReasoningReference(string(raw)) {
 			if upstream.StripStaleReasoningInputs(t.body) {
 				return a.replay(ctx, t, s, resp.StatusCode, raw,
-					errors.RetryAfter(resp.Header.Get("Retry-After")))
+					errors.RetryAfter(resp.Header.Get("Retry-After")), rerr)
 			}
 		}
 		return s.result(), classifyErrorBody(resp.StatusCode, raw, rerr,
@@ -294,8 +294,10 @@ func idleOrPassthrough(err error) error {
 
 // replay 把剥过字段的 body 重发**一次**(js http.js:128-136)。重放又被拒时按
 // 重放的响应分类,不再剥第二次;重放连传输都没走通时回落**原始** 400 的分类
-// —— 第二条重试连不上,不改变第一条失败的形状。
-func (a *Adapter) replay(ctx context.Context, t *turn, s *sink, status int, raw []byte, retryAfter int64) (Result, error) {
+// —— 第二条重试连不上,不改变第一条失败的形状。原始 400 的**读错误**随
+// readErr 一起带回(第八轮 R4 低-2:走 errors.Classify 的旧形状把它丢了,
+// 「截断的 400 + 重放又失败」会被判成 SERVER 而不是 TRANSPORT)。
+func (a *Adapter) replay(ctx context.Context, t *turn, s *sink, status int, raw []byte, retryAfter int64, readErr error) (Result, error) {
 	payload, err := json.Marshal(t.body)
 	if err != nil {
 		return s.result(), err
@@ -315,8 +317,9 @@ func (a *Adapter) replay(ctx context.Context, t *turn, s *sink, status int, raw 
 			return s.result(), errors.Failure{Code: check.CodeTimeout, Message: err.Error(), Retryable: true}
 		}
 		// 其余传输失败回落**原始** 400 的分类:第二条重试连不上,不改变第一条
-		// 失败的形状。
-		return s.result(), errors.Classify(status, raw, retryAfter)
+		// 失败的形状。分类走 classifyErrorBody 而不是裸 errors.Classify ——
+		// 原始 400 的读错误(截断)也是判决输入之一。
+		return s.result(), classifyErrorBody(status, raw, readErr, retryAfter)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -517,10 +520,24 @@ func bodyReadFailure(err error) error {
 }
 
 // readSSE 逐事件喂 feed;[DONE] 与非 JSON 帧在 feed 的入口被跳过。
+//
+// ReadSSE 的失败有三种,出路不同(第八轮 R4 中-1):feed 回调的拒绝(客户端
+// 断开、sink 写失败)原样上交 —— 那不是传输故障,冷却/换出口都不该发生;
+// ErrEventTooLarge 是协议哨兵,引擎自己认;剩下的流中段**读取**故障(连接
+// 断)才过 bodyReadFailure 归 TRANSPORT —— 裸透传的旧形状把它掉进引擎的
+// SERVER 兜底:可重试但永不冷却,且裸错串直进流内 error 帧,而同一事实在
+// 响应头阶段(readReply 的 head 读取)= TRANSPORT。两条路径就此对齐。
+// ErrIdleTimeout 经 ReadError.Unwrap 仍被 bodyReadFailure 认出并原样放行,
+// 由调用方的 idleOrPassthrough 翻成 TIMEOUT。
 func (a *Adapter) readSSE(r io.Reader, t *turn, s *sink) error {
-	return stream.ReadSSE(r, func(ev stream.Event) error {
+	err := stream.ReadSSE(r, func(ev stream.Event) error {
 		return a.feed(t, []byte(ev.Data), 0, s)
 	})
+	var re *stream.ReadError
+	if err != nil && stderrors.As(err, &re) {
+		return bodyReadFailure(err)
+	}
+	return err
 }
 
 // readJSON 消费非流式的整包回复(js http.js:157-170 的 JSON 分支)。usage 的

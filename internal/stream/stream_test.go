@@ -356,3 +356,30 @@ func TestScanUsageDetectsContentBlockStart(t *testing.T) {
 		t.Fatal("content_block_start 应判为内容")
 	}
 }
+
+// errRead 是读到哪里都报同一个错的 Reader:流中段断连的形状。
+type errRead struct{ err error }
+
+func (e errRead) Read([]byte) (int, error) { return 0, e.err }
+
+// TestReadSSEWrapsReaderFailures 钉第八轮 R4 中-1 的包侧一半:流中段的**读取**
+// 故障必须包成 *ReadError,调用方才分得清「该冷却的传输故障」与「不该冷却的
+// 回调拒绝」。Unwrap 保留原始错误(errors.Is 对 ErrIdleTimeout 之类照常成立),
+// 回调错误则原样上交、绝不包装。
+func TestReadSSEWrapsReaderFailures(t *testing.T) {
+	sentinel := errors.New("dial broke")
+	r := io.MultiReader(strings.NewReader("data: {\"a\":1}\n\n"), errRead{sentinel})
+	err := ReadSSE(r, func(Event) error { return nil })
+	var re *ReadError
+	if !errors.As(err, &re) {
+		t.Fatalf("ReadSSE err = %v, want *ReadError", err)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("ReadError 必须经 Unwrap 保留原始错误: %v", err)
+	}
+	cbErr := errors.New("client gone")
+	err = ReadSSE(strings.NewReader("data: x\n\n"), func(Event) error { return cbErr })
+	if errors.As(err, &re) || !errors.Is(err, cbErr) {
+		t.Fatalf("回调错误不得被包成 ReadError: %v", err)
+	}
+}

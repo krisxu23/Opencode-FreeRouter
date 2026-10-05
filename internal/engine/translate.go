@@ -392,6 +392,13 @@ func foldChunks(c Chunk, into *Outcome) (FinishReason, bool) {
 			// 是它,追加分支因此也是它的正式通道,不只是兜底。
 			for i := range into.ToolCalls {
 				if c.ToolID != "" && into.ToolCalls[i].ID == c.ToolID {
+					// 命中即保持原条目(增量已把 arguments 拼齐,JS 的命中
+					// 分支什么都不做);但反常帧序(先参后名)时 block-end 是
+					// 名字的唯一携带帧 —— 旧形状整帧吞掉,条目 Name 恒空,
+					// 非流式回包给客户端一个无法执行的调用(第八轮 R4 低-2)。
+					if into.ToolCalls[i].Name == "" && c.ToolName != "" {
+						into.ToolCalls[i].Name = c.ToolName
+					}
 					return FinishStop, true
 				}
 			}

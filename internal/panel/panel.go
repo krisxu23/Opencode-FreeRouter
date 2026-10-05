@@ -451,9 +451,11 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 			writeText(w, http.StatusNotImplemented, "probe action is not wired")
 			return
 		}
-		// force is what the button means: probe now, do not answer from
-		// the result cache. Without it a click right after an automatic
-		// round would be a no-op. 异步受理下唯一的同步错误是 already-running:
+		// force 是保留参数:探测没有「结果缓存」,每次点击都经 nudge 通道
+		// 现场触发一轮热区复检+冷区扫描,不会因为刚跑过自动轮而变成 no-op
+		// —— 三个「立即探测」按钮本来就是同一动作。仍收 force 是为了 API
+		// 形状稳定;将来若引入「刚探过就短路」的缓存,非 force 语义在这里接。
+		// 异步受理下唯一的同步错误是 already-running:
 		// 那是客户端冲突(409),不是服务端故障 —— 500 会诱导调用方把
 		// 「别重试」当故障去重试。
 		if err := s.deps.Actions.ProbeNow(r.Context(), true); err != nil {

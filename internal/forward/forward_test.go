@@ -1627,3 +1627,141 @@ func TestEmptyBodyIsStillAValidEmptyMapAfterReadFull(t *testing.T) {
 		t.Fatalf("got = %v, want 空 map", got)
 	}
 }
+
+// TestResponsesStreamInterleavedThinkingKeepsItemOrder 钉第八轮 R4 中-3:
+// reasoning→text→reasoning→text(Anthropic interleaved thinking)时,第二段
+// 正文必须另开 message item(反向同理)。旧形状只在 function_call 处清两项,
+// B 段正文挂回 A 段的 message item:文本不丢,但线序与创建序交叉,严格状态机
+// 客户端把内容挂错 item。
+func TestResponsesStreamInterleavedThinkingKeepsItemOrder(t *testing.T) {
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		for _, c := range []engine.Chunk{
+			{Kind: engine.ChunkReasoning, Text: "R1"},
+			{Kind: engine.ChunkText, Text: "A"},
+			{Kind: engine.ChunkReasoning, Text: "R2"},
+			{Kind: engine.ChunkText, Text: "B"},
+		} {
+			if err := onChunk(c); err != nil {
+				return engine.Outcome{}, err
+			}
+		}
+		return engine.Outcome{Text: "AB"}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/responses", auth(), `{"model":"m","stream":true}`)
+	evs := responsesSSEEvents(t, body)
+
+	var kinds []string
+	deltaByItem := map[string]string{}
+	for _, ev := range evs {
+		switch ev["type"] {
+		case "response.output_item.added":
+			kinds = append(kinds, ev["item"].(map[string]any)["type"].(string))
+		case "response.output_text.delta":
+			deltaByItem[ev["item_id"].(string)] += ev["delta"].(string)
+		}
+	}
+	want := []string{"reasoning", "message", "reasoning", "message"}
+	if len(kinds) != len(want) {
+		t.Fatalf("added 项 = %v, want %v(text↔reasoning 交叉时必须各开各项)", kinds, want)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Fatalf("added 顺序 = %v, want %v", kinds, want)
+		}
+	}
+	var texts []string
+	for _, ev := range evs {
+		if ev["type"] != "response.output_item.added" {
+			continue
+		}
+		it := ev["item"].(map[string]any)
+		if it["type"] != "message" {
+			continue
+		}
+		texts = append(texts, deltaByItem[it["id"].(string)])
+	}
+	if len(texts) != 2 || texts[0] != "A" || texts[1] != "B" {
+		t.Fatalf("两段正文的归属 = %v, want [A B](B 段挂回了 A 段的 item)", texts)
+	}
+}
+
+// TestChatStreamLateToolNameIsSupplemented 钉第八轮 R4 低-2(chat 线):先参
+// 后名的反常帧序 —— 增量帧行参无名,name 只随 block-end 到。旧形状把 block-end
+// 整帧吞掉,客户端拿到 Name:"" 的调用无法执行;修法补一发 name-only delta
+// (OpenAI 线允许后续 delta 只带 function.name)。
+func TestChatStreamLateToolNameIsSupplemented(t *testing.T) {
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		for _, c := range []engine.Chunk{
+			{Kind: engine.ChunkToolCallDelta, Index: 0, ToolID: "c1", ToolName: "", ToolDelta: `{"q"`},
+			{Kind: engine.ChunkToolCallDelta, Index: 0, ToolID: "c1", ToolName: "", ToolDelta: `:"x"}`},
+			{Kind: engine.ChunkToolCallDelta, Index: 0, ToolID: "c1", ToolName: "search", ToolArguments: `{"q":"x"}`},
+		} {
+			if err := onChunk(c); err != nil {
+				return engine.Outcome{}, err
+			}
+		}
+		return engine.Outcome{ToolCalls: []engine.ToolCall{{ID: "c1", Name: "search", Arguments: `{"q":"x"}`}}}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/chat/completions", auth(), `{"model":"m","stream":true}`)
+	names := 0
+	for _, ev := range sseFrames(t, body) {
+		if ev["object"] != "chat.completion.chunk" {
+			continue
+		}
+		ch, _ := ev["choices"].([]any)
+		for _, c := range ch {
+			d, _ := c.(map[string]any)["delta"].(map[string]any)
+			tcs, _ := d["tool_calls"].([]any)
+			for _, tc := range tcs {
+				fn, _ := tc.(map[string]any)["function"].(map[string]any)
+				if n, ok := fn["name"].(string); ok && n != "" {
+					names++
+					if n != "search" {
+						t.Fatalf("晚到名字 = %q, want search", n)
+					}
+				}
+			}
+		}
+	}
+	if names == 0 {
+		t.Fatalf("block-end 上的晚到名字被整帧吞掉:流上没有任何 name 非空的 tool_calls delta")
+	}
+}
+
+// TestResponsesStreamLateToolNameReachesDone 钉第八轮 R4 低-2(responses 线):
+// added 事件按首帧(空名)发出收不回来,但 done/completed 按 item 快照重建,
+// 晚到的名字必须补进快照。
+func TestResponsesStreamLateToolNameReachesDone(t *testing.T) {
+	st := newStub()
+	st.complete = func(_ context.Context, _ engine.Request, onChunk func(engine.Chunk) error) (engine.Outcome, error) {
+		for _, c := range []engine.Chunk{
+			{Kind: engine.ChunkToolCallDelta, Index: 0, ToolID: "c1", ToolName: "", ToolDelta: `{"q":"x"}`},
+			{Kind: engine.ChunkToolCallDelta, Index: 0, ToolID: "c1", ToolName: "search", ToolArguments: `{"q":"x"}`},
+		} {
+			if err := onChunk(c); err != nil {
+				return engine.Outcome{}, err
+			}
+		}
+		return engine.Outcome{ToolCalls: []engine.ToolCall{{ID: "c1", Name: "search", Arguments: `{"q":"x"}`}}}, nil
+	}
+	ts := st.serve(t)
+	_, body := do(t, ts, http.MethodPost, "/v1/responses", auth(), `{"model":"m","stream":true}`)
+	for _, ev := range responsesSSEEvents(t, body) {
+		if ev["type"] != "response.output_item.done" {
+			continue
+		}
+		it, _ := ev["item"].(map[string]any)
+		if it["type"] != "function_call" {
+			continue
+		}
+		if it["name"] != "search" {
+			t.Fatalf("function_call.done.name = %v, want search(晚到名字必须进 item 快照)", it["name"])
+		}
+		return
+	}
+	t.Fatalf("没有 function_call 的 done 事件")
+}

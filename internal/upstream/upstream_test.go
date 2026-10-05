@@ -250,7 +250,7 @@ func TestHeaderOverrideKeysAreLowercased(t *testing.T) {
 // 抄 src/upstream.js:351-352,参数是空 object 形状。
 func TestApplyFingerprintAppendsTheDecoy(t *testing.T) {
 	body := map[string]any{"model": "m", "messages": []any{}, "tools": []any{}}
-	renames := ApplyFingerprint(body, false)
+	renames := ApplyFingerprint(body, WireChat)
 	tools, _ := body["tools"].([]any)
 	if len(tools) != 2 {
 		t.Fatalf("tools = %d entries, want 2 decoys: %v", len(tools), tools)
@@ -282,7 +282,7 @@ func TestApplyFingerprintCanonicalisesCase(t *testing.T) {
 	body := map[string]any{"tools": []any{
 		map[string]any{"type": "function", "function": map[string]any{"name": "Bash", "parameters": map[string]any{}}},
 	}}
-	renames := ApplyFingerprint(body, false)
+	renames := ApplyFingerprint(body, WireChat)
 	tools, _ := body["tools"].([]any)
 	tm, _ := tools[0].(map[string]any)
 	fn, _ := tm["function"].(map[string]any)
@@ -300,7 +300,7 @@ func TestApplyFingerprintCanonicalisesCase(t *testing.T) {
 	}
 	orig := map[string]any{"type": "function", "function": map[string]any{"name": "Bash"}}
 	b2 := map[string]any{"tools": []any{orig}}
-	ApplyFingerprint(b2, false)
+	ApplyFingerprint(b2, WireChat)
 	if orig["function"].(map[string]any)["name"] != "Bash" {
 		t.Fatal("caller's tool map was mutated in place")
 	}
@@ -313,7 +313,7 @@ func TestApplyFingerprintDropsDuplicates(t *testing.T) {
 		map[string]any{"type": "function", "function": map[string]any{"name": "bash"}},
 		map[string]any{"type": "function", "function": map[string]any{"name": "Bash"}},
 	}}
-	renames := ApplyFingerprint(body, false)
+	renames := ApplyFingerprint(body, WireChat)
 	if got := toolNamesOf(body); !reflect.DeepEqual(got, []string{"bash", "read"}) {
 		t.Fatalf("names = %v, want [bash read](Bash 整条丢弃 + read 诱饵)", got)
 	}
@@ -326,24 +326,24 @@ func TestApplyFingerprintDropsDuplicates(t *testing.T) {
 // flat 补 "auto";非 flat 仅在调用方零工具时补 "none"。
 func TestApplyFingerprintToolChoice(t *testing.T) {
 	chatEmpty := map[string]any{"tools": []any{}}
-	ApplyFingerprint(chatEmpty, false)
+	ApplyFingerprint(chatEmpty, WireChat)
 	if chatEmpty["tool_choice"] != "none" {
 		t.Fatalf("chat without tools: tool_choice = %v, want none", chatEmpty["tool_choice"])
 	}
 	chatWithTools := map[string]any{"tools": []any{
 		map[string]any{"type": "function", "function": map[string]any{"name": "glob"}},
 	}}
-	ApplyFingerprint(chatWithTools, false)
+	ApplyFingerprint(chatWithTools, WireChat)
 	if _, ok := chatWithTools["tool_choice"]; ok {
 		t.Fatal("chat with caller tools must not set tool_choice")
 	}
 	flatEmpty := map[string]any{"tools": []any{}}
-	ApplyFingerprint(flatEmpty, true)
+	ApplyFingerprint(flatEmpty, WireResponses)
 	if flatEmpty["tool_choice"] != "auto" {
 		t.Fatalf("flat: tool_choice = %v, want auto", flatEmpty["tool_choice"])
 	}
 	kept := map[string]any{"tools": []any{}, "tool_choice": "required"}
-	ApplyFingerprint(kept, true)
+	ApplyFingerprint(kept, WireResponses)
 	if kept["tool_choice"] != "required" {
 		t.Fatalf("existing tool_choice was overwritten: %v", kept["tool_choice"])
 	}
@@ -357,7 +357,7 @@ func TestApplyFingerprintPassesOtherToolsThrough(t *testing.T) {
 		map[string]any{"type": "function", "function": map[string]any{"name": "glob", "parameters": map[string]any{}}},
 		map[string]any{"type": "function", "function": map[string]any{"name": "grep", "parameters": map[string]any{}}},
 	}}
-	ApplyFingerprint(body, false)
+	ApplyFingerprint(body, WireChat)
 	if got := toolNamesOf(body); !reflect.DeepEqual(got, []string{"glob", "grep", "bash", "read"}) {
 		t.Fatalf("names = %v", got)
 	}
@@ -538,7 +538,7 @@ func (t testWireTool) Renamed(name string) any { t.name = name; return t }
 // 声明的工具还会被两个诱饵整份覆盖。
 func TestApplyFingerprintAcceptsStructTools(t *testing.T) {
 	body := map[string]any{"tools": []any{testWireTool{name: "Bash"}}}
-	renames := ApplyFingerprint(body, false)
+	renames := ApplyFingerprint(body, WireChat)
 	tools, _ := body["tools"].([]any)
 	if len(tools) != 2 {
 		t.Fatalf("tools = %v, want 调用方的工具 + 一个 read 诱饵", tools)
@@ -570,4 +570,38 @@ func toolNamesOf(body map[string]any) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// TestApplyFingerprintMessagesWireShape 钉第八轮 R4 中-2:messages(Anthropic)
+// 线的诱饵必须是 {name, description, input_schema},tool_choice 不得写成
+// 字符串 —— 旧实现只有 flat 二态,messages 线拿到的是 chat 形状诱饵 +
+// tool_choice:"none",生产没炸只是因为上游宽容。
+func TestApplyFingerprintMessagesWireShape(t *testing.T) {
+	body := map[string]any{"tools": []any{}}
+	ApplyFingerprint(body, WireMessages)
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != len(RequiredTools) {
+		t.Fatalf("messages 线应补齐 %v 个诱饵, got %#v", RequiredTools, body["tools"])
+	}
+	for i, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("tool %d: 形状不是 map: %#v", i, raw)
+		}
+		if _, has := tool["function"]; has {
+			t.Fatalf("tool %d: chat 形状的 function 键漏进了 messages 线: %#v", i, tool)
+		}
+		if _, has := tool["parameters"]; has {
+			t.Fatalf("tool %d: responses 形状的 parameters 键漏进了 messages 线: %#v", i, tool)
+		}
+		if _, has := tool["input_schema"]; !has {
+			t.Fatalf("tool %d: 缺 input_schema: %#v", i, tool)
+		}
+		if tool["name"] != RequiredTools[i] {
+			t.Fatalf("tool %d: name = %v, want %v", i, tool["name"], RequiredTools[i])
+		}
+	}
+	if _, has := body["tool_choice"]; has {
+		t.Fatalf("messages 线不得写 tool_choice(Anthropic 没有字符串形状): %#v", body["tool_choice"])
+	}
 }

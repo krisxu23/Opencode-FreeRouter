@@ -149,7 +149,7 @@ func (h *Health) Pick(req PickRequest) *Picked {
 		// pickSnapshot 已经给了全量同刻快照,这里什么都不补 —— 过去无条件调
 		// fill 会让无 sticky 的请求白拷两份(表一趟、行一趟),且两趟不同刻。
 		if req.StickyNode != "" {
-			h.fillPoolSnapshot(snap, now, req.Pool)
+			h.fillPoolSnapshot(snap, now, req.Pool, req.StickyNode)
 		}
 		want = make([]string, 0, len(req.Countries))
 		seen := map[string]bool{}
@@ -331,13 +331,18 @@ func (h *Health) appendPoolLocked(snap *pickSnap, now int64, pool []PoolNode) {
 //     时 skip 是零值 "",于是池中 tag 为空的节点被一起静默跳过、从候选里消失
 //     (tag 由 app.go 直接透传 Registry,未校验非空)。
 //
+// ownSticky 必须原样透传给 pickAggLocked(八审 L5):busy 的语义是「别的会话
+// 占着这个 IP」,第一段已把 own hold 排除在外;fill 若传 "",own sticky 的
+// hold 会被算成外部负载 —— 同一请求走没走 fill,busy 口径漂移一档,own
+// sticky 与同 IP 邻居的排序跟着位移。
+//
 // sweep 列表也必须整体替换,不能只覆盖 busy 表:它们与三张表同刻同源,
 // 混着两份会导致 commitPickSweep 漏删或多删(漏删由下一轮补,多删会误清
 // 新鲜的 cool/busy 记号)。
-func (h *Health) fillPoolSnapshot(snap *pickSnap, now int64, pool []PoolNode) {
+func (h *Health) fillPoolSnapshot(snap *pickSnap, now int64, pool []PoolNode, ownSticky string) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	fresh := h.pickAggLocked(now, "")
+	fresh := h.pickAggLocked(now, ownSticky)
 	fresh.nodes = snap.nodes[:0]
 	h.appendPoolLocked(fresh, now, pool)
 	*snap = *fresh

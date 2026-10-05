@@ -176,3 +176,45 @@ func TestParseNodeUriStripsIPv6BracketsWithoutFiltering(t *testing.T) {
 		t.Fatalf("type/port = %q/%d, want ssh/22", o.Type, o.ServerPort)
 	}
 }
+
+// TestUnroutableCatchesMappedHexSpellings 钉第八轮 R5 中-1：::ffff: 前缀剥除
+// 之后只按点分十进制正则重跑，于是同一内网地址的十六进制组写法
+// （::ffff:7f00:1 = 127.0.0.1、::ffff:a9fe:0100 = 169.254.169.254）与全展开
+// 前缀（0:0:0:0:0:ffff:…）全都被当公网放行 —— 而它们都是 Go 拨号栈照收的
+// 合法字面量，一条恶意订阅就能拿网关当内网触探器。
+func TestUnroutableCatchesMappedHexSpellings(t *testing.T) {
+	for _, s := range []string{
+		"::ffff:7f00:1",            // = 127.0.0.1
+		"::FFFF:7F00:1",            // 大写：输入先小写化，同样必须拦
+		"0:0:0:0:0:ffff:127.0.0.1", // 全展开前缀 = ::ffff:127.0.0.1
+		"::ffff:a9fe:0100",         // = 169.254.169.254（云元数据）
+		"::ffff:a9fe:1",            // 组内前导零可省
+		"::ffff:0a00:0001",         // = 10.0.0.1
+		"::ffff:c0a8:0101",         // = 192.168.1.1
+		"::ffff:ac10:0a05",         // = 172.16.10.5
+		"::ffff:fe80:1",            // = fe80::1 的mapped 拼法（link-local）
+	} {
+		if !IsUnroutableServer(s) {
+			t.Errorf("IsUnroutableServer(%q) = false，想要 true（内网字面量的合法拼写）", s)
+		}
+	}
+}
+
+// 公网字面量与其 mapped 拼法必须照旧放行 —— 兜底只做并集，不收敛。
+func TestUnroutableSparesPublicLiteralsIncludingMapped(t *testing.T) {
+	for _, s := range []string{
+		"8.8.8.8",
+		"1.1.1.1",
+		"2606:4700::6810:84e5",
+		"2001:4860:4860::8888",
+		"::ffff:8.8.8.8",
+		"::ffff:806:808", // = 8.6.8.8 的十六进制组拼法，公网
+		"fe8-proxy.example",
+		"example.com",
+		"",
+	} {
+		if IsUnroutableServer(s) {
+			t.Errorf("IsUnroutableServer(%q) = true，想要 false", s)
+		}
+	}
+}
